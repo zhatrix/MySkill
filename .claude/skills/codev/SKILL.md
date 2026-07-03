@@ -55,17 +55,20 @@ for c in codex gemini reasonix qoderclicn opencode codebuddy; do
 done
 # 探测 timeout 二进制（macOS 原生无 timeout，只有装了 coreutils 才有 gtimeout）
 TO=$(command -v timeout || command -v gtimeout || true)
-TP="${TO:+$TO 600}"      # 安全网 600s，空值安全（$TO 为空 → 前缀为空串）
 echo "timeout -> ${TO:-MISSING}"
+# 统一超时封装：用【函数】而非变量前缀。zsh 不对无引号变量做词拆分，
+# `$TP cmd`（TP="/path/timeout 600"）会被当成名为「timeout 600」的单个文件执行 → 必失败（本机 shell 是 zsh）。
+# run() 用 "$@" 传参，bash/zsh 通用；函数不跨 Bash 调用继承，故每个独立调用内都要就地重新定义。
+run() { if [ -n "$TO" ]; then "$TO" 600 "$@"; else "$@"; fi; }
 ```
 
 - 只把标 `OK` 的 agent 列入后续可选项。
-- 后续所有 agent 命令统一用 `$TP <cmd>`。600s 只是**兜底真正卡死的进程**的安全网，不是常规上限——
-  常规靠**后台执行**（通用机制 C）让慢模型跑完。**切勿**写成 `$TO 600 <cmd>`：`$TO` 为空时会把 `600`
-  当命令执行；用 `$TP`（为空时整段安全展开为空）。
-- 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时 `$TP` 为空、
-  命令裸跑，靠 Bash 工具自身 timeout 兜底。**注意**：裸跑时非原生只读 agent 卡死会导致后置快照
-  核对跑不到，因此 `$TP` 缺失时优先只让非原生 agent 处理提示词文本、不接触工作区。
+- 后续所有 agent 命令统一用 `run <cmd>`（上面的函数）。600s 只是**兜底真正卡死的进程**的安全网，不是
+  常规上限——常规靠**后台执行**（通用机制 C）让慢模型跑完。**切勿**用 `$TP <cmd>` 变量前缀：zsh 不做词
+  拆分会把整串当一个命令名（本机 shell 就是 zsh，实测每个调用都 exit 127）；`run` 用 `"$@"` 传参，两壳都对。
+- 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时 `run` 退化为裸跑
+  （`$TO` 为空），靠 Bash 工具自身 timeout 兜底。**注意**：裸跑时非原生只读 agent 卡死会导致后置快照
+  核对跑不到，因此 `$TO` 缺失时优先只让非原生 agent 处理提示词文本、不接触工作区。
 - 若一个都没有：停下，告诉用户"未检测到任何外部 agent CLI"，并给出安装指引
   （见 `references/agents.md` 顶部），然后退出。
 - 若只有 1 个可用：跳过 AskUserQuestion 的选择步骤，直接用它，但提示用户
@@ -107,7 +110,8 @@ echo "timeout -> ${TO:-MISSING}"
 
 **A1. 调用哪些 agent**（给推荐组合）：
 - brainstorm 默认推荐：`gemini`（大上下文发散）+ `reasonix`（低成本快速）+ `codex`（严谨挑刺）
-- review 默认推荐：`codex`（深度审查）+ `qoderclicn`（代码评审，稳定）+ `codebuddy`。
+- review 默认推荐：`codex`（深度审查）+ `qoderclicn`（代码评审，稳定）+ `codebuddy`
+  （中文评审；但**本机常空输出/超时**，见 agents.md——选它要有被自动跳过的预期，可用 `reasonix` 替补）。
 - challenge 默认推荐：`codex` + `gemini`
 - consult 默认推荐：用户指定的那个；未指定则给 2 个推荐
 选项里明确写出"将调用 N 个外部 agent（消耗各自额度）"。只列 Step 0 中 `OK` 的 agent。用户可增减。
@@ -144,24 +148,29 @@ echo "timeout -> ${TO:-MISSING}"
 **启动**：每个选中 agent 用**独立的 Bash 工具调用**、设 `run_in_background: true` 发出（同一条消息发多个
 即并行）。后台任务**不受前台 300s 工具超时上限**约束，慢模型能跑完；完成时你会收到通知，再读其输出。
 
-**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量**（`$TP/$PROMPT/$TMPOUT/$BASE`
-全为空）。因此**输出走确定性字面路径**（不能用随机 `mktemp`，否则收到完成通知时你不知道去哪读），且
-`TO/TP` 在调用内**就地定义**。骨架（把 `reasonix` 那行换成 agents.md 里目标 agent 的精确命令即可）：
+**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量/函数**（`$TO/$PROMPT/$BASE`
+和 `run()` 全为空/未定义）。因此**输出走确定性字面路径**（不能用随机 `mktemp`，否则收到完成通知时你不知道
+去哪读），且 `TO`/`run()` 在调用内**就地定义**。骨架（把 `reasonix` 那行换成 agents.md 里目标 agent 的精确命令即可）：
 ```bash
 A=reasonix                                                     # agent 名
 OUT=/tmp/codev-out-$A.txt; ERR=/tmp/codev-err-$A.txt           # 确定性路径：完成后你按此读
 PROMPT=/tmp/codev-prompt-$A.txt                                # 提示词文件（前一步已写好，字面路径）
-TO=$(command -v timeout || command -v gtimeout || true); TP="${TO:+$TO 600}"
+umask 077                                                      # 输出含 diff/可能密钥 → 仅本人可读，别 644
+TO=$(command -v timeout || command -v gtimeout || true)
+run() { if [ -n "$TO" ]; then "$TO" 600 "$@"; else "$@"; fi; } # bash/zsh 通用；别用 $TP 变量前缀
 echo "▶ $A 启动（medium）"                                     # D 的启动行
-[ -z "$TP" ] && echo "⚠️ 无 timeout：后台无兜底会永久挂起 → 改前台串行或先 brew install coreutils"
-SBOX=$(mktemp -d -t codev-sbox)                                # 非原生只读 agent：隔离空目录只喂文本
-( cd "$SBOX" && $TP reasonix run "$(cat "$PROMPT")" --effort medium < /dev/null > "$OUT" 2>"$ERR" )
-rm -rf "$SBOX"; echo "✔ $A 完成 exit=$?"
+if [ -z "$TO" ]; then                                          # 无 timeout：后台裸跑会永久挂起 → 跳过
+  echo "⏭ $A 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"; exit 0
+fi
+SBOX=$(mktemp -d -t codev-sbox.XXXXXX)                         # 非原生只读 agent：隔离空目录只喂文本
+( cd "$SBOX" && run reasonix run "$(cat "$PROMPT")" --effort medium < /dev/null > "$OUT" 2>"$ERR" ); RC=$?
+[ -n "$SBOX" ] && rm -rf "$SBOX"                               # 空值守卫，防 mktemp 失败时 rm -rf ""
+echo "✔ $A 完成 exit=$RC"                                      # 捕【agent】退出码，不是 rm 的（超时=124 才不丢）
 ```
 - **推理强度默认 `medium`**（防慢）；发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（只发相关 diff/
   文件，别把无关内容全塞进去——越大越慢越易超时）；
-- **`$TP` 为空（无 timeout）时不要后台裸跑**——后台既无前台工具超时、又无 `timeout` 兜底 = 永久挂起。
-  改前台串行（至少有工具超时），或提示装 coreutils；
+- **`$TO` 为空（无 timeout）时不要后台裸跑**——后台既无前台工具超时、又无 `timeout` 兜底 = 永久挂起。
+  上面骨架已在 `$TO` 为空时 `exit 0` 跳过该 agent；确要它参与就改前台串行（至少有工具超时）或装 coreutils；
 - **只读隔离**：codex/gemini 原生只读可并行、无需 sandbox；reasonix/qoderclicn/opencode/codebuddy 用上面
   的 `SBOX` 空目录只喂文本（见 agents.md (a)/(b)）。
 
@@ -241,13 +250,18 @@ rm -rf "$SBOX"; echo "✔ $A 完成 exit=$?"
 3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**（tracked diff **+ 上面纳入的未跟踪
    文件内容**），不能只扫 `git diff`，否则未跟踪文件里的密钥会绕过：
    ```bash
-   { git diff "$BASE"; git ls-files --others --exclude-standard -z | xargs -0 -r cat 2>/dev/null; } \
-     | grep -inE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16})'
-   # 注：BSD xargs 无 -r 时改用  ... | { xargs -0 cat 2>/dev/null || true; }
+   [ -z "$BASE" ] && { echo "BASE 未定义，拒绝扫描（会误把范围当成 working-vs-index）"; exit 1; }
+   { git diff "$BASE"
+     # BSD/macOS xargs 无 GNU 的 -r/--no-run-if-empty（`xargs -0 -r` 会 illegal option 直接失败、
+     # 未跟踪文件整段不参与扫描）；用 `|| true` 吞空输入，`cat --` 防 `-` 开头文件名被当选项。
+     git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; }
+   } | grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'
+   # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    ```
    命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围；未命中再继续。
 4. 并行发出（B/C）：
-   - `codex` 用原生 `codex review … -s read-only --base "$BASE"`（见 agents.md）；
+   - `codex` 用原生 `codex review --base "$BASE"`（**无 `-s`/`-C`、且不能带自定义 prompt**，须从仓库
+     cwd 内跑；`--base`/`--commit`/`--uncommitted` 三选一指定评审范围，详见 agents.md）；
    - 其它 agent 用 prompts.md 的 **review 模板** + `git diff "$BASE"` 内容（经上面扫描后）。
 5. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）+ **PASS/FAIL 门禁**。
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
