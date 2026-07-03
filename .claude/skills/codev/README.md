@@ -151,8 +151,14 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 codev/
 ├── README.md              # 本文件：使用文档
 ├── SKILL.md               # 给 Claude 执行的主规范（流程 / 铁律 / 通用机制 A–F）
+├── bin/
+│   └── codev-lib.sh       # 共享 shell 函数库：timeout 封装 / 沙盒 / 输出捕获 / RC 上报 / 探测
 └── references/
     ├── agents.md          # 每个 agent 的精确调用命令、鉴权、只读策略、失败处理
     ├── prompts.md         # 发给外部 agent 的提示词模板（含文件系统边界）
     └── synthesis.md       # 跨模型综合、一致性矩阵、PASS/FAIL 门禁规则
 ```
+
+> **`bin/codev-lib.sh`**：调用外部 agent 的公共底座。Step 0 会把它暂存到 `/tmp/codev-lib.sh`，之后每个
+> 后台调用 `source` 一行即可拿到 `codev_bg_native` / `codev_bg_sandboxed` 等函数——超时封装、隔离空目录、
+> 退出码/超时的显式上报都集中在这一处，改一次全局生效。参考 gstack 的 `bin/gstack-codex-probe` 做法。

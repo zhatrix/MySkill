@@ -50,25 +50,21 @@ allowed-tools:
 ## Step 0 — 探测可用 agent
 
 ```bash
-for c in codex gemini reasonix qoderclicn opencode codebuddy; do
-  if command -v "$c" >/dev/null 2>&1; then echo "OK   $c"; else echo "MISS $c"; fi
-done
-# 探测 timeout 二进制（macOS 原生无 timeout，只有装了 coreutils 才有 gtimeout）
-TO=$(command -v timeout || command -v gtimeout || true)
-echo "timeout -> ${TO:-MISSING}"
-# 统一超时封装：用【函数】而非变量前缀。zsh 不对无引号变量做词拆分，
-# `$TP cmd`（TP="/path/timeout 600"）会被当成名为「timeout 600」的单个文件执行 → 必失败（本机 shell 是 zsh）。
-# run() 用 "$@" 传参，bash/zsh 通用；函数不跨 Bash 调用继承，故每个独立调用内都要就地重新定义。
-run() { if [ -n "$TO" ]; then "$TO" 600 "$@"; else "$@"; fi; }
+# 暂存【共享函数库】到确定性字面路径：后台是独立 shell、不继承变量/函数，靠字面路径 source 拿到它。
+# <SKILL_DIR> 用本 skill 头部给出的 "Base directory" 字面替换（如 /Users/…/.claude/skills/codev）。
+cp "<SKILL_DIR>/bin/codev-lib.sh" /tmp/codev-lib.sh
+source /tmp/codev-lib.sh
+codev_probe        # 列出 OK/MISS 的 agent + timeout 状态（库函数说明见 references/agents.md）
 ```
 
 - 只把标 `OK` 的 agent 列入后续可选项。
-- 后续所有 agent 命令统一用 `run <cmd>`（上面的函数）。600s 只是**兜底真正卡死的进程**的安全网，不是
-  常规上限——常规靠**后台执行**（通用机制 C）让慢模型跑完。**切勿**用 `$TP <cmd>` 变量前缀：zsh 不做词
-  拆分会把整串当一个命令名（本机 shell 就是 zsh，实测每个调用都 exit 127）；`run` 用 `"$@"` 传参，两壳都对。
-- 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时 `run` 退化为裸跑
-  （`$TO` 为空），靠 Bash 工具自身 timeout 兜底。**注意**：裸跑时非原生只读 agent 卡死会导致后置快照
-  核对跑不到，因此 `$TO` 缺失时优先只让非原生 agent 处理提示词文本、不接触工作区。
+- 后续所有 agent 调用统一走库函数 `codev_bg_sandboxed` / `codev_bg_native`（内部用 `codev_run` 封装
+  timeout）。600s 只是**兜底真正卡死的进程**的安全网，不是常规上限——常规靠**后台执行**（通用机制 C）
+  让慢模型跑完。**切勿**用 `$TP <cmd>` 变量前缀：zsh 不做词拆分会把整串当一个命令名（本机 shell 就是
+  zsh，实测每个调用都 exit 127）；库里的 `codev_run` 用 `"$@"` 传参，bash/zsh 都对。
+- 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时库函数会
+  **自动跳过该 agent**（后台无兜底 = 永久挂起）并提示改前台串行。**注意**：`$TO` 缺失时优先只让非原生
+  只读 agent 处理提示词文本、不接触工作区。
 - 若一个都没有：停下，告诉用户"未检测到任何外部 agent CLI"，并给出安装指引
   （见 `references/agents.md` 顶部），然后退出。
 - 若只有 1 个可用：跳过 AskUserQuestion 的选择步骤，直接用它，但提示用户
@@ -148,48 +144,47 @@ run() { if [ -n "$TO" ]; then "$TO" 600 "$@"; else "$@"; fi; }
 **启动**：每个选中 agent 用**独立的 Bash 工具调用**、设 `run_in_background: true` 发出（同一条消息发多个
 即并行）。后台任务**不受前台 300s 工具超时上限**约束，慢模型能跑完；完成时你会收到通知，再读其输出。
 
-**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量/函数**（`$TO/$PROMPT/$BASE`
-和 `run()` 全为空/未定义）。因此**输出走确定性字面路径**（不能用随机 `mktemp`，否则收到完成通知时你不知道
-去哪读），且 `TO`/`run()` 在调用内**就地定义**。骨架（把 `reasonix` 那行换成 agents.md 里目标 agent 的精确命令即可）：
+**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量/函数**。因此每个调用开头
+`source /tmp/codev-lib.sh`（Step 0 已暂存到该字面路径）拿回全部库函数，输出也走**确定性字面路径**
+`/tmp/codev-out-<agent>.txt`（收到完成通知时你按此读；不能用随机 `mktemp`）。骨架简化为「source + 一行」：
 ```bash
-A=reasonix                                                     # agent 名
-OUT=/tmp/codev-out-$A.txt; ERR=/tmp/codev-err-$A.txt           # 确定性路径：完成后你按此读
-PROMPT=/tmp/codev-prompt-$A.txt                                # 提示词文件（前一步已写好，字面路径）
-umask 077                                                      # 输出含 diff/可能密钥 → 仅本人可读，别 644
-TO=$(command -v timeout || command -v gtimeout || true)
-run() { if [ -n "$TO" ]; then "$TO" 600 "$@"; else "$@"; fi; } # bash/zsh 通用；别用 $TP 变量前缀
-echo "▶ $A 启动（medium）"                                     # D 的启动行
-if [ -z "$TO" ]; then                                          # 无 timeout：后台裸跑会永久挂起 → 跳过
-  echo "⏭ $A 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"; exit 0
-fi
-SBOX=$(mktemp -d -t codev-sbox.XXXXXX)                         # 非原生只读 agent：隔离空目录只喂文本
-( cd "$SBOX" && run reasonix run "$(cat "$PROMPT")" --effort medium < /dev/null > "$OUT" 2>"$ERR" ); RC=$?
-[ -n "$SBOX" ] && rm -rf "$SBOX"                               # 空值守卫，防 mktemp 失败时 rm -rf ""
-echo "✔ $A 完成 exit=$RC"                                      # 捕【agent】退出码，不是 rm 的（超时=124 才不丢）
+# —— 非原生只读 agent（reasonix/qoderclicn/opencode/codebuddy）：隔离空目录只喂文本 ——
+source /tmp/codev-lib.sh
+PROMPT=/tmp/codev-prompt-reasonix.txt                          # 提示词文件（前一步已写好，字面路径）
+codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
+# 首参是 agent 标签，其后是该 agent 的完整命令 argv（换成 agents.md 里目标 agent 的精确命令即可）。
+# 库函数自动：umask 077 / ▶启动行 / 无-timeout 跳过 / mktemp 空目录 / 捕 agent 退出码(非 rm) / ✔或⚠️上报。
+
+# —— 原生只读 agent（codex/gemini）：无需沙盒，在仓库根跑 ——
+source /tmp/codev-lib.sh
+cd "$(git rev-parse --show-toplevel)"
+PROMPT=/tmp/codev-prompt-codex.txt
+codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort="medium"'
 ```
 - **推理强度默认 `medium`**（防慢）；发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（只发相关 diff/
   文件，别把无关内容全塞进去——越大越慢越易超时）；
-- **`$TO` 为空（无 timeout）时不要后台裸跑**——后台既无前台工具超时、又无 `timeout` 兜底 = 永久挂起。
-  上面骨架已在 `$TO` 为空时 `exit 0` 跳过该 agent；确要它参与就改前台串行（至少有工具超时）或装 coreutils；
-- **只读隔离**：codex/gemini 原生只读可并行、无需 sandbox；reasonix/qoderclicn/opencode/codebuddy 用上面
-  的 `SBOX` 空目录只喂文本（见 agents.md (a)/(b)）。
+- **无 timeout 时**：`codev_bg_*` 会自动跳过该 agent（后台裸跑=永久挂起）；确要它参与就改前台串行或装 coreutils；
+- **只读隔离**：codex/gemini 用 `codev_bg_native`（原生只读，可并行）；reasonix/qoderclicn/opencode/codebuddy
+  用 `codev_bg_sandboxed`（空目录只喂文本，见 agents.md (a)/(b)）；
+- **兜底**：若 `/tmp/codev-lib.sh` 不存在（Step 0 未暂存成功），退回把库函数体内联进调用（见 `bin/codev-lib.sh`）。
 
-**收集**：收到完成通知 → 读该 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（不是 `$TMPOUT`，它已
-失效）；超时(124)/报错/空输出 → 不阻塞其它，按 agents.md 话术跳过并如实告知。实时盯用 `Monitor` 跟踪该
-字面路径（见 D）。
+**收集**：收到完成通知 → 读该 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`；`codev_report`
+已在任务 stdout 里把结果翻成 `✔ 完成` / `⏭ 超时跳过` / `⚠️ 非零退出 exit=N`（含 stderr 头几行），据此
+判断是否有效，超时/报错/空输出 → 不阻塞其它、如实告知。实时盯用 `Monitor` 跟踪该字面路径（见 D）。
 
 ### D. 运行时显示（当前 agent / 模型 / 交互内容）
 让用户始终知道"现在谁在跑、用什么模型、在聊什么"：
 运行时显示由两部分实现：**你（Claude）在发起/收到通知时打印状态板** + 后台任务自身 stdout 的
-`▶/✔` 行。二者结合让用户看到进度。
+`▶/✔/⏭/⚠️` 行（由库函数 `codev_bg_*` / `codev_report` 打印）。二者结合让用户看到进度。
 1. **启动即报**：发出这批后台调用的同时，你打印一次状态清单，每 agent 一行：
    `▶ codex（模型 GPT）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式把"范围"写成该 agent 关注面）。
 2. **实时交互内容**（可选）：想盯某个慢 agent，用 `Monitor`（已在 allowed-tools）跟踪它的**字面输出
    路径** `/tmp/codev-out-<agent>.txt`，它随文件新增行推事件、随进程结束自动停。**不要**用 `tail -f` 起
    后台任务（不自然结束、制造悬挂进程）；只想瞄一眼就用有界的 `tail -n 20 /tmp/codev-out-<agent>.txt`。
    （不为监控给 codex 加 `--json`——那样正文变 JSONL、E 的逐字呈现会展示机器码；监控只看纯文本流水。）
-3. **完成即翻牌**：收到某 agent 完成通知后，把它那行更新为 `✔ codex 完成` 或 `⏭ reasonix 跳过（超时）`；
-   **token/用时能取到才加** `（tokens N｜用时 Ss）`（仅 codex 可靠取 token，取不到就省略括号，别编造）。
+3. **完成即翻牌**：收到某 agent 完成通知后，把它那行更新为 `✔ codex 完成` / `⏭ reasonix 跳过（超时）` /
+   `⚠️ opencode 非零退出`（与 `codev_report` 打印的一致）；**token/用时能取到才加** `（tokens N｜用时 Ss）`
+   （仅 codex 可靠取 token，取不到就省略括号，别编造）。
 4. 全部结束后进入 E 的**逐字呈现**。运行时显示只给"过程感"，不替代最终逐字原文。
 
 ### E. 忠实呈现
@@ -201,7 +196,7 @@ echo "✔ $A 完成 exit=$RC"                                      # 捕【agent
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ tokens: <n> ｜ 用时: <s>s
 ```
 
-（逐字呈现的正文取自各 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（`$TMPOUT` 在新调用里已失效）。
+（逐字呈现的正文取自各 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（库函数写入的确定性路径）。
 `tokens` 仅 codex 可靠取到——`grep -i "tokens used" /tmp/codev-err-<agent>.txt`；其余 agent 取不到就**省略
 该字段**，不要编造。`用时` 可用 shell 计时或省略。）
 
@@ -260,9 +255,11 @@ echo "✔ $A 完成 exit=$RC"                                      # 捕【agent
    ```
    命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围；未命中再继续。
 4. 并行发出（B/C）：
-   - `codex` 用原生 `codex review --base "$BASE"`（**无 `-s`/`-C`、且不能带自定义 prompt**，须从仓库
-     cwd 内跑；`--base`/`--commit`/`--uncommitted` 三选一指定评审范围，详见 agents.md）；
-   - 其它 agent 用 prompts.md 的 **review 模板** + `git diff "$BASE"` 内容（经上面扫描后）。
+   - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**：prompt 里含文件系统边界 +
+     "请自己跑 `git diff <BASE>...HEAD` 只评审这些改动 + 关注点"，从而**不带 `--base`/`--commit`**（避开
+     `[PROMPT]` 与它们的 argv 互斥）、也**不带 `-s`/`-C`**（review 不认这俩），须从仓库根跑。这样保住了
+     自定义关注点（详见 agents.md）；
+   - 其它 agent 用 prompts.md 的 **review 模板** + `git diff "$BASE"` 内容（经上面扫描后），走 `codev_bg_sandboxed`。
 5. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）+ **PASS/FAIL 门禁**。
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
    一致率。
