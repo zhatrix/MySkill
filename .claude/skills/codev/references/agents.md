@@ -6,7 +6,7 @@
 - **codex**（OpenAI）：装后 `codex login`，或设 `$OPENAI_API_KEY` / `$CODEX_API_KEY`。
 - **gemini**（Google）：装后首次交互登录，或设 `$GEMINI_API_KEY`。
 - **reasonix**（DeepSeek）：`reasonix setup` 配 API key。
-- **qodercli / codebuddy**：各自账号交互登录。
+- **qoderclicn / codebuddy**：各自账号交互登录。
 - **opencode**：`opencode auth` 配置 providers。
 - **timeout**：macOS 无原生 `timeout`，`brew install coreutils` 装 `gtimeout`。
 
@@ -20,13 +20,14 @@
 把 `240` 当命令执行）。Step 0 探测后按下式生成前缀：
 ```bash
 TO=$(command -v timeout || command -v gtimeout || true)
-TP="${TO:+$TO 240}"        # $TO 非空 → "…/timeout 240"；为空 → 空串，命令裸跑
-TP300="${TO:+$TO 300}"     # codex review 用 300s
+TP="${TO:+$TO 600}"        # 安全网 600s；$TO 为空 → 空串，命令裸跑
 ```
-命令里统一写 `$TP <cmd> …`（review 用 `$TP300`）。`$TO` 为空则整段安全展开为空。
+命令里统一写 `$TP <cmd> …`。600s 只兜底真正卡死的进程——**慢模型靠后台执行**（Bash `run_in_background`）
+跑完，不受前台工具超时约束，别再用短 timeout 前台阻塞（那正是 reasonix/codebuddy 常被误杀的原因）。
+`$TO` 为空则整段安全展开为空。
 
 > ⚠️ **变量不跨 Bash 调用**：并行 fan-out 时每个 agent 是**独立的 Bash 工具调用 = 独立 shell**，
-> Step 0 里的 `$TO/$TP/$TP300/$PROMPT/$TMPOUT/$TMPERR` **不会**带到后续调用。mktemp 生成的**文件**
+> Step 0 里的 `$TO/$TP/$PROMPT/$TMPOUT/$TMPERR/$BASE` **不会**带到后续调用。mktemp 生成的**文件**
 > 在磁盘上持久，但**变量**不持久。所以每个并行 Bash 调用内要么重新定义这些变量、要么直接写**字面
 > 路径**（如 `/tmp/codev-prompt-xxxx.txt`）。下文命令用 `$VAR` 只是示意，落地时按此规则展开。
 
@@ -50,9 +51,13 @@ TMPERR=$(mktemp -t codev-err-<agent>)   # 保存 stderr，读 token/诊断
 失败/空输出判定要综合 **exit code + stdout + stderr** 三者，别只看 stdout 是否为空；
 若 stdout 为空但 stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 stderr"。
 
-非原生只读 agent（reasonix / qodercli / opencode / codebuddy）调用前后**强制**快照核对。
-核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户待评审
-的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。
+非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置二选一：
+- **(a) 首选：隔离空目录只喂文本**（见下方 SANDBOX 模板）——cwd 是空目录，够不到仓库，从根本上免风险。
+  此时**不必逐 agent 快照**，只需在**整批 fan-out 前后各做一次全局** `git status --porcelain` 兜底核对。
+- **(b) 确需在真实仓库 cwd 跑**：则**必须逐 agent 前后快照核对 + 串行**（并行无法归因、会互相污染）。
+
+无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
+待评审的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。下面片段用于 (b)：
 ```bash
 SNAP=$(git status --porcelain)          # 调用前快照（含未跟踪文件）
 # … 调用 agent …
@@ -69,7 +74,7 @@ fi
   在隔离空目录里跑**（首选：它们只需要提示词文本，不必访问工作区）。隔离模板：
   ```bash
   SANDBOX=$(mktemp -d -t codev-sbox); ( cd "$SANDBOX" && $TP reasonix run "$(cat "$PROMPT")" \
-    --effort high < /dev/null > "$TMPOUT" 2>"$TMPERR" ); rm -rf "$SANDBOX"
+    --effort medium < /dev/null > "$TMPOUT" 2>"$TMPERR" ); rm -rf "$SANDBOX"
   ```
   这样 agent 的 cwd 是空目录，够不到真实仓库，从根本上免掉快照/污染问题。
 - **快照盲区**：`git status --porcelain` 检测不到**已存在的未跟踪文件的内容**被改（前后都是 `??` 同名）。
@@ -86,7 +91,7 @@ fi
   $TP codex exec "$(cat "$PROMPT")" \
     -C "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
     -s read-only \
-    -c 'model_reasoning_effort="high"' \
+    -c 'model_reasoning_effort="medium"' \
     < /dev/null > "$TMPOUT" 2>"$TMPERR"
   ```
   默认**不加 `--json`**——JSONL（推理轨迹/工具调用事件流）不适合"逐字呈现"给用户；仅当明确要
@@ -94,14 +99,15 @@ fi
   加 `--skip-git-repo-check`。
 - **代码评审（原生）**：
   ```bash
-  $TP300 codex review "$(cat "$PROMPT")" \
+  $TP codex review "$(cat "$PROMPT")" \
     -C "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
     -s read-only --base "$BASE" \
-    -c 'model_reasoning_effort="high"' < /dev/null > "$TMPOUT" 2>"$TMPERR"
+    -c 'model_reasoning_effort="medium"' < /dev/null > "$TMPOUT" 2>"$TMPERR"
   ```
 - **只读保证**：`-s read-only` 为**原生只读沙盒**，最可靠——**exec 和 review 都必须带上**
   （漏了 review 就不再是只读，与下方只读表不符）。
-- **推理强度**：默认 `high`；`--xhigh` 时 `-c 'model_reasoning_effort="xhigh"'`；consult 可降 `medium` 提速。
+- **推理强度**：默认 `medium`（防慢/防超时）；复杂任务或用户要更深升 `high`；`--xhigh` 才用
+  `-c 'model_reasoning_effort="xhigh"'`。升档前提醒会更慢。
 - **鉴权**：需 `codex login`，或环境变量 `$CODEX_API_KEY` / `$OPENAI_API_KEY`，或
   `~/.codex/auth.json` 存在。缺失时提示：`codex login`。
 - **成本**：`grep -i "tokens used" "$TMPERR"`（大小写不敏感）。
@@ -125,27 +131,29 @@ fi
 
 - **调用**：
   ```bash
-  $TP reasonix run "$(cat "$PROMPT")" --effort high < /dev/null > "$TMPOUT" 2>"$TMPERR"
+  $TP reasonix run "$(cat "$PROMPT")" --effort medium < /dev/null > "$TMPOUT" 2>"$TMPERR"
   ```
   可选 `--budget <usd>` 设美元上限、`-m <id>` 指定模型（如 deepseek-v4-flash）。
+  **默认 `medium`**：`high`/`max` + 大提示词是 reasonix 最常超时的组合，需要更深再升，并配合后台执行。
 - **只读保证**：**无原生只读旗标** → 必须在提示词里强约束"禁止修改任何文件，只输出文本"，
-  且不给它 auto-approve。调用前后可 `git status` 核对无改动。
-- **推理强度**：`--effort low|medium|high|max`；默认 `high`，`--xhigh` 用 `max`。
+  且不给它 auto-approve。**首选隔离空目录只喂文本 (a)**；确需在真实仓库 cwd 跑则**必须**逐次前后
+  `git status` 快照核对 (b)（见顶部只读保障 (a)/(b)）。
+- **推理强度**：`--effort low|medium|high|max`；默认 `medium`，`--xhigh` 用 `max`。
 - **鉴权**：`reasonix setup` 配置 API key。
 - **角色**：低成本、高性价比推理，适合快速多方案头脑风暴。
 
-## qodercli — Qoder
+## qoderclicn — Qoder
 
 - **调用**：
   ```bash
-  $TP qodercli -p "$(cat "$PROMPT")" --reasoning-effort high \
+  $TP qoderclicn -p "$(cat "$PROMPT")" --reasoning-effort medium \
     --tools "" < /dev/null > "$TMPOUT" 2>"$TMPERR"
   ```
   `--tools ""` 禁用全部内置工具（纯问答，硬保证不动文件）——非原生只读 agent 建议默认带上；
   可选 `-m <model>`。
 - **只读保证**：`-p` 非交互 + 提示词强约束；如需更硬，加 `--tools ""` 禁工具。
   不要用 `--dangerously-skip-permissions` / `--permission-mode bypass_permissions`。
-- **推理强度**：`--reasoning-effort`；`--xhigh` 用 `max`。
+- **推理强度**：`--reasoning-effort`；默认 `medium`，`--xhigh` 用 `max`。
 - **鉴权**：Qoder 账号登录。`--list-models` 可查可用模型。
 - **角色**：代码理解、评审。
 
@@ -182,8 +190,8 @@ fi
 
 ## 失败 / 超时 / 空输出处理（统一话术）
 
-- **超时**（timeout 返回 124）：告知"<agent> 超过超时上限（多数 240s、codex review 300s）未返回，
-  已跳过。可能是模型 API 卡顿或提示过长；可重试或缩短输入。"
+- **超时**（timeout 返回 124，即撞到 600s 安全网）：先确认是否**已用后台执行**——前台短超时误杀是
+  最常见原因。仍超时则告知"<agent> 超过 600s 未返回，已跳过。可降推理强度到 medium/精简提示词后重试。"
 - **鉴权失败**：给出对应登录命令，跳过该 agent，继续其余。
 - **空输出**：跳过并说明（见 codebuddy 条）。
 - **任一 agent 失败都不阻塞其它**；最终综合时注明"本轮实际参与的 agent：X、Y（Z 已跳过）"。
@@ -195,7 +203,7 @@ fi
 | codex | ✅ `-s read-only` | — |
 | gemini | ✅ `--approval-mode plan` | — |
 | reasonix | ❌ | ✅ 必须 |
-| qodercli | 半（`--tools ""`） | ✅ |
+| qoderclicn | 半（`--tools ""`） | ✅ |
 | opencode | 半（`--agent`） | ✅ |
 | codebuddy | ❌ | ✅ 必须 |
 

@@ -2,7 +2,7 @@
 name: codev
 description: >
   多 agent 协作开发编排器。在开发全流程中调用外部 agent CLI（codex / gemini /
-  reasonix / qodercli / opencode / codebuddy，各自背后是不同大模型）做方案头脑风暴、
+  reasonix / qoderclicn / opencode / codebuddy，各自背后是不同大模型）做方案头脑风暴、
   代码评审、对抗式挑战与跨模型综合，用不同模型的多样性提升产出质量、减少 bug 与遗漏。
   Claude 始终是唯一的编码执行者，外部 agent 一律以只读"顾问团"身份被调用。
   触发场景：用户说"多 agent 评审 / 第二意见 / 头脑风暴 / 跨模型 / 让 codex 挑刺 /
@@ -16,6 +16,7 @@ allowed-tools:
   - Glob
   - Grep
   - AskUserQuestion
+  - Monitor
 ---
 
 # codev — 多 agent 协作开发
@@ -28,10 +29,11 @@ allowed-tools:
 **铁律**
 - Claude 是**唯一改文件的人**。外部 agent 一律**只读**运行，只输出方案 / 评审 / 质疑，
   绝不让它们改仓库文件。**只读靠双重保障**：能用原生只读旗标的用旗标（codex `-s read-only`、
-  gemini `--approval-mode plan`）；无原生只读的（reasonix / codebuddy / qodercli / opencode）
-  除提示词强约束外，**必须**在调用前后用 `git status --porcelain` 快照核对，发现新增/改动即
-  停下、把差异逐字上报用户由其处置（**不自动回滚**，以免误删用户未提交的工作；见 `agents.md`
-  只读风险总结）。
+  gemini `--approval-mode plan`）；无完整原生只读的（reasonix / codebuddy 完全无；qoderclicn `--tools ""`、
+  opencode `--agent` 为半原生）按运行位置二选一：**(a) 首选——隔离空目录只喂提示词文本**（cwd 是空目录，够不到仓库，从根本上
+  免风险；此时只需 fan-out **整体**前后各做一次全局 `git status --porcelain` 兜底核对，不必逐 agent 快照）；
+  **(b) 确需在真实仓库 cwd 跑——则必须逐 agent 前后快照核对 + 串行**。发现改动即停下、逐字上报用户由其
+  处置（**不自动回滚**，以免误删用户未提交的工作；见 `agents.md` 只读风险总结）。
 - 外部 agent 的输出**逐字呈现**给用户，不总结、不裁剪、不美化。清楚标注来源与模型。
 - 每个要 fan-out（并行调多个外部 agent）的节点，先用 AskUserQuestion 让用户确认调用哪些
   agent（给推荐组合），因为这会消耗各自账号的额度。
@@ -48,18 +50,19 @@ allowed-tools:
 ## Step 0 — 探测可用 agent
 
 ```bash
-for c in codex gemini reasonix qodercli opencode codebuddy; do
+for c in codex gemini reasonix qoderclicn opencode codebuddy; do
   if command -v "$c" >/dev/null 2>&1; then echo "OK   $c"; else echo "MISS $c"; fi
 done
 # 探测 timeout 二进制（macOS 原生无 timeout，只有装了 coreutils 才有 gtimeout）
 TO=$(command -v timeout || command -v gtimeout || true)
-TP="${TO:+$TO 240}"; TP300="${TO:+$TO 300}"      # 空值安全：$TO 为空 → 前缀为空串
+TP="${TO:+$TO 600}"      # 安全网 600s，空值安全（$TO 为空 → 前缀为空串）
 echo "timeout -> ${TO:-MISSING}"
 ```
 
 - 只把标 `OK` 的 agent 列入后续可选项。
-- 后续所有 agent 命令统一用 `$TP <cmd>`（codex review 用 `$TP300`）。**切勿**写成 `$TO 240 <cmd>`：
-  `$TO` 为空时会退化成把 `240` 当命令执行。用 `$TP`（为空时整段安全展开为空）。
+- 后续所有 agent 命令统一用 `$TP <cmd>`。600s 只是**兜底真正卡死的进程**的安全网，不是常规上限——
+  常规靠**后台执行**（通用机制 C）让慢模型跑完。**切勿**写成 `$TO 600 <cmd>`：`$TO` 为空时会把 `600`
+  当命令执行；用 `$TP`（为空时整段安全展开为空）。
 - 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时 `$TP` 为空、
   命令裸跑，靠 Bash 工具自身 timeout 兜底。**注意**：裸跑时非原生只读 agent 卡死会导致后置快照
   核对跑不到，因此 `$TP` 缺失时优先只让非原生 agent 处理提示词文本、不接触工作区。
@@ -89,25 +92,44 @@ echo "timeout -> ${TO:-MISSING}"
 2. 有改动 → AskUserQuestion：A) 评审这些改动 B) 对抗式挑战 C) 我自己描述需求。
 3. 无改动 → 问用户："想让 codev 做什么？（头脑风暴新需求 / 评审 / 咨询）"
 
-**推理强度覆盖**：若用户输入含 `--xhigh`，从提示词里剔除该词，并对**支持推理强度旗标的 agent**
-用最高档（codex `xhigh`、reasonix/qodercli `max`）。gemini/opencode/codebuddy 无此旗标，静默忽略
-即可。否则用各模式默认强度（见 agents.md）。
+**推理强度（默认 medium，防超时）**：**高推理强度 + 大提示词是超时的主因**，默认一律用 `medium`
+（有旗标的 codex/reasonix/qoderclicn 才生效；gemini/opencode/codebuddy 无推理强度旗标，用其默认，D 的
+状态行"强度"字段留空或写"默认"）。仅当任务确实复杂或用户要更深时升 `high`；用户输入含 `--xhigh` 才对
+支持的 agent 用最高档（codex `xhigh`、reasonix/qoderclicn `max`），并从提示词剔除该词。
+**升强度前提醒用户会更慢、更易触发超时**。
 
 ---
 
 ## 通用机制（所有 fan-out 模式共用）
 
-### A. 选 agent（AskUserQuestion）
-在任何要并行调用外部 agent 的节点，先给**推荐组合**让用户确认：
+### A. 选 agent + 选分工模式（AskUserQuestion）
+在任何要并行调用外部 agent 的节点，先用 AskUserQuestion 让用户确认**两件事**：
 
+**A1. 调用哪些 agent**（给推荐组合）：
 - brainstorm 默认推荐：`gemini`（大上下文发散）+ `reasonix`（低成本快速）+ `codex`（严谨挑刺）
-- review 默认推荐：`codex`（深度审查）+ `qodercli`（代码评审，稳定）。想要中文语境可再加
-  `codebuddy`，但它常出现空输出（见 agents.md），不作默认第二意见。
+- review 默认推荐：`codex`（深度审查）+ `qoderclicn`（代码评审，稳定）+ `codebuddy`。
 - challenge 默认推荐：`codex` + `gemini`
 - consult 默认推荐：用户指定的那个；未指定则给 2 个推荐
+选项里明确写出"将调用 N 个外部 agent（消耗各自额度）"。只列 Step 0 中 `OK` 的 agent。用户可增减。
 
-选项里明确写出"将调用 N 个外部 agent（消耗各自额度）"。只列 Step 0 中 `OK` 的 agent。
-用户可增减。
+**A2. 分工模式**（两选一）：
+- **全量模式（默认，交叉验证强）**：每个 agent 都评审/处理**全部内容**。多模型重叠覆盖，最能暴露
+  盲区；综合时出一致性矩阵（都发现/多数/仅 1）。代价：更多 token、更慢。
+- **分工模式（省额度、快）**：给每个 agent 分配**各自的关注面**，只看自己那块。例如 review 时
+  `codex`→架构/数据库/测试、`reasonix`→UI/交互/逻辑、`opencode`→其余（错误处理/依赖/构建等）。范围由 Claude
+  按 agent 特长和改动内容划分并在提示词里写明（见 prompts.md 的"评审范围"段）。代价：无重叠交叉
+  验证，综合时按**范围拼合**而非一致性矩阵，某块只有一个模型看过要标注置信度有限。
+
+分工划分示例（可按实际内容调整）：
+- **review**：codex=架构/数据库/并发；reasonix=UI/交互/文案；gemini=跨模块影响/大局；
+  qoderclicn=错误处理/边界；opencode=依赖/构建/配置。
+- **challenge**：按攻击面分（输入/边界、并发/竞态、错误处理/回滚、资源/性能）。
+- **brainstorm / consult**：无天然代码切面，按**视角**分——codex=技术选型/实现；gemini=整体架构/取舍；
+  reasonix=风险与失败模式；（产品/UX 视角可派给 gemini）。
+
+- **默认与少 agent**：AskUserQuestion 里**全量为预选项**，用户跳过/超时按全量走。**参与 agent < 3 时分工
+  收益不大**（每面只 1 个模型看、又无交叉），直接建议全量；N=2 若坚持分工，就二分（如 codex=架构/数据库/
+  并发/错误处理，qoderclicn=UI/交互/依赖/构建）。
 
 ### B. 文件系统边界
 发给**每个**外部 agent 的提示词都必须前置 `references/prompts.md` 里的"文件系统边界"段落
@@ -115,26 +137,53 @@ echo "timeout -> ${TO:-MISSING}"
 **不**笼统禁止仓库内同名目录，业务代码若在 `agents/` 属正常评审对象；只看仓库代码；**禁止修改任何
 文件，只输出评审/建议**）。
 
-### C. 并行调用
-把选中 agent 的调用命令放在**同一条消息里的多个 Bash 工具调用**中并行发出。每条命令：
-- 用 `references/agents.md` 里对应 agent 的**精确命令 + 只读参数**；
-- **提示词写入临时文件**，命令用 `"$(cat "$PROMPT")"` 引用——绝不把 diff/需求原文内联进命令行
-  （防 shell 注入 + 防超 `ARG_MAX`）；发送前先 `wc -c "$PROMPT"`，过大时先按文件筛选或让用户确认范围；
-- 用 `$TP …`（Step 0 生成的空值安全前缀；review 用 `$TP300`）包裹；**Bash 工具的 `timeout` 参数
-  恒设为内层的 1.1 倍以上**：内层 240s → Bash 工具传 `"timeout": 264000`；codex review 内层 300s →
-  `"timeout": 330000`。避免外层先杀导致拿不到内层的 124 退出码；
-- stdout→`$TMPOUT`（逐字呈现）、stderr→`$TMPERR`（读 token/诊断），每 agent 独立文件；stdin `< /dev/null`。
-- **只读隔离**：原生只读的 codex/gemini 可放心并行；非原生只读的 reasonix/qodercli/opencode/codebuddy
-  在并行下快照无法归因、且会互相污染工作区 → 让它们**只处理提示词文本、不接触真实仓库目录**
-  （首选），否则改为串行并各自前后快照核对（见 agents.md）。
+### C. 并行调用（后台执行，避免超时）
+> 经验：慢模型（reasonix/codebuddy 等）在**前台被 `timeout 240` 卡死**——用户直接手调这些 CLI 从不
+> 超时，是本 skill 自己的短超时 + 高推理强度 + 超大提示词共同造成的。因此**默认后台执行**。
 
-- **变量不跨调用**：每个并行 Bash 调用是独立 shell，Step 0/前置步骤里的 `$TP/$TP300/$PROMPT/$TMPOUT/
-  $TMPERR/$BASE` 等**不会**带过来；每个调用内需重新定义这些变量，或直接用**字面值**（mktemp 生成的
-  文件路径、解析好的 base commit SHA）。文件在磁盘持久，变量不持久。
+**启动**：每个选中 agent 用**独立的 Bash 工具调用**、设 `run_in_background: true` 发出（同一条消息发多个
+即并行）。后台任务**不受前台 300s 工具超时上限**约束，慢模型能跑完；完成时你会收到通知，再读其输出。
 
-某个 agent 超时 / 报错 / 无输出：不阻塞其它，按 agents.md 的话术跳过并如实告知用户。
+**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量**（`$TP/$PROMPT/$TMPOUT/$BASE`
+全为空）。因此**输出走确定性字面路径**（不能用随机 `mktemp`，否则收到完成通知时你不知道去哪读），且
+`TO/TP` 在调用内**就地定义**。骨架（把 `reasonix` 那行换成 agents.md 里目标 agent 的精确命令即可）：
+```bash
+A=reasonix                                                     # agent 名
+OUT=/tmp/codev-out-$A.txt; ERR=/tmp/codev-err-$A.txt           # 确定性路径：完成后你按此读
+PROMPT=/tmp/codev-prompt-$A.txt                                # 提示词文件（前一步已写好，字面路径）
+TO=$(command -v timeout || command -v gtimeout || true); TP="${TO:+$TO 600}"
+echo "▶ $A 启动（medium）"                                     # D 的启动行
+[ -z "$TP" ] && echo "⚠️ 无 timeout：后台无兜底会永久挂起 → 改前台串行或先 brew install coreutils"
+SBOX=$(mktemp -d -t codev-sbox)                                # 非原生只读 agent：隔离空目录只喂文本
+( cd "$SBOX" && $TP reasonix run "$(cat "$PROMPT")" --effort medium < /dev/null > "$OUT" 2>"$ERR" )
+rm -rf "$SBOX"; echo "✔ $A 完成 exit=$?"
+```
+- **推理强度默认 `medium`**（防慢）；发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（只发相关 diff/
+  文件，别把无关内容全塞进去——越大越慢越易超时）；
+- **`$TP` 为空（无 timeout）时不要后台裸跑**——后台既无前台工具超时、又无 `timeout` 兜底 = 永久挂起。
+  改前台串行（至少有工具超时），或提示装 coreutils；
+- **只读隔离**：codex/gemini 原生只读可并行、无需 sandbox；reasonix/qoderclicn/opencode/codebuddy 用上面
+  的 `SBOX` 空目录只喂文本（见 agents.md (a)/(b)）。
 
-### D. 忠实呈现
+**收集**：收到完成通知 → 读该 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（不是 `$TMPOUT`，它已
+失效）；超时(124)/报错/空输出 → 不阻塞其它，按 agents.md 话术跳过并如实告知。实时盯用 `Monitor` 跟踪该
+字面路径（见 D）。
+
+### D. 运行时显示（当前 agent / 模型 / 交互内容）
+让用户始终知道"现在谁在跑、用什么模型、在聊什么"：
+运行时显示由两部分实现：**你（Claude）在发起/收到通知时打印状态板** + 后台任务自身 stdout 的
+`▶/✔` 行。二者结合让用户看到进度。
+1. **启动即报**：发出这批后台调用的同时，你打印一次状态清单，每 agent 一行：
+   `▶ codex（模型 GPT）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式把"范围"写成该 agent 关注面）。
+2. **实时交互内容**（可选）：想盯某个慢 agent，用 `Monitor`（已在 allowed-tools）跟踪它的**字面输出
+   路径** `/tmp/codev-out-<agent>.txt`，它随文件新增行推事件、随进程结束自动停。**不要**用 `tail -f` 起
+   后台任务（不自然结束、制造悬挂进程）；只想瞄一眼就用有界的 `tail -n 20 /tmp/codev-out-<agent>.txt`。
+   （不为监控给 codex 加 `--json`——那样正文变 JSONL、E 的逐字呈现会展示机器码；监控只看纯文本流水。）
+3. **完成即翻牌**：收到某 agent 完成通知后，把它那行更新为 `✔ codex 完成` 或 `⏭ reasonix 跳过（超时）`；
+   **token/用时能取到才加** `（tokens N｜用时 Ss）`（仅 codex 可靠取 token，取不到就省略括号，别编造）。
+4. 全部结束后进入 E 的**逐字呈现**。运行时显示只给"过程感"，不替代最终逐字原文。
+
+### E. 忠实呈现
 每个 agent 的原始输出用分隔框逐字呈现：
 
 ```
@@ -143,13 +192,15 @@ echo "timeout -> ${TO:-MISSING}"
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ tokens: <n> ｜ 用时: <s>s
 ```
 
-（逐字呈现的正文取自各 agent 的 `$TMPOUT`。`tokens` 仅 codex 可靠取到——`grep -i "tokens used" "$TMPERR"`；
-其余 agent 取不到就**省略该字段**，不要编造。`用时` 可用 shell 计时或省略。）
+（逐字呈现的正文取自各 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（`$TMPOUT` 在新调用里已失效）。
+`tokens` 仅 codex 可靠取到——`grep -i "tokens used" /tmp/codev-err-<agent>.txt`；其余 agent 取不到就**省略
+该字段**，不要编造。`用时` 可用 shell 计时或省略。）
 
-### E. 跨模型综合
+### F. 跨模型综合
 所有 agent 返回后，按 `references/synthesis.md`：
-- 一致性矩阵：哪些结论"都发现 / 多数发现 / 仅某 agent 发现"；
-- Claude 给最终判断（哪些采纳、哪些存疑、为什么）；
+- **全量模式**：一致性矩阵（都发现 / 多数发现 / 仅某 agent 发现）+ Claude 裁决（采纳/存疑/驳回）；
+- **分工模式**：按**关注面拼合**各 agent 结论（不做一致性矩阵，因无重叠），某块只有一个模型看过要
+  标注"置信有限、无交叉验证"；
 - review 模式额外给 **PASS / FAIL 门禁**（出现 P1/critical 即 FAIL）。
 
 ---
@@ -160,7 +211,7 @@ echo "timeout -> ${TO:-MISSING}"
 2. 选 agent（通用机制 A）。
 3. 并行发出（通用机制 B/C），用 prompts.md 的 **brainstorm 模板**：把需求 + Claude 的 v0
    方案发给每个 agent，要求它**独立给出自己的方案，并指出 v0 的风险/更好的替代**。
-4. 忠实呈现（D）→ 跨模型综合（E）：合并成一份带**取舍表 + 风险清单 + 推荐方案**的方案文档。
+4. 运行时显示（D）→ 忠实呈现（E）→ 跨模型综合（F）：合并成一份带**取舍表 + 风险清单 + 推荐方案**的方案文档。
 5. 问用户是否把方案写入文件（如 `docs/方案-<主题>.md`）。写文件由 Claude 执行：先 `mkdir -p docs`，
    并对 `<主题>` 做 sanitize（空格→`-`，去掉 `/ : *` 等非法字符）再拼文件名。
 
@@ -178,8 +229,9 @@ echo "timeout -> ${TO:-MISSING}"
    git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1 \
      || { echo "base 无效（初始提交/浅克隆？）"; exit 1; }   # 停下：让用户指定 base，或改用 git diff --root HEAD
    ```
-   （`exit 1` 后必须停下询问用户，别静默继续。）确认 `git diff "$BASE"` 或未跟踪文件非空；两者皆空则
-   告知"无改动可评审"并退出。**未跟踪新文件**也要纳入，用 NUL 分隔安全枚举（防文件名含空格/换行/前导 `-`）：
+   **`exit 1`（base 无效）时你必须停下、用 AskUserQuestion 让用户指定 base 或确认改用 `git diff --root HEAD`，
+   不得把非零退出当普通错误静默继续、在错误 base 上评审。** 确认 `git diff "$BASE"` 或未跟踪文件非空；
+   两者皆空则告知"无改动可评审"并退出。**未跟踪新文件**也要纳入，用 NUL 分隔安全枚举（防文件名含空格/换行/前导 `-`）：
    ```bash
    git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
      git diff --no-index -- /dev/null "$f"      # 或直接附文件内容，提示词里标注"新增未跟踪文件"
@@ -189,14 +241,15 @@ echo "timeout -> ${TO:-MISSING}"
 3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**（tracked diff **+ 上面纳入的未跟踪
    文件内容**），不能只扫 `git diff`，否则未跟踪文件里的密钥会绕过：
    ```bash
-   { git diff "$BASE"; git ls-files --others --exclude-standard -z | xargs -0 cat 2>/dev/null; } \
-     | grep -inE '(api[_-]?key|secret|password|passwd|token|credential|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16})'
+   { git diff "$BASE"; git ls-files --others --exclude-standard -z | xargs -0 -r cat 2>/dev/null; } \
+     | grep -inE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16})'
+   # 注：BSD xargs 无 -r 时改用  ... | { xargs -0 cat 2>/dev/null || true; }
    ```
    命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围；未命中再继续。
 4. 并行发出（B/C）：
    - `codex` 用原生 `codex review … -s read-only --base "$BASE"`（见 agents.md）；
    - 其它 agent 用 prompts.md 的 **review 模板** + `git diff "$BASE"` 内容（经上面扫描后）。
-5. 忠实呈现（D）→ 综合（E）+ **PASS/FAIL 门禁**。
+5. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）+ **PASS/FAIL 门禁**。
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
    一致率。
 7. 询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
@@ -207,14 +260,14 @@ echo "timeout -> ${TO:-MISSING}"
 2. 选 agent（A）。
 3. 并行发出（B/C），用 prompts.md 的 **challenge 模板**：指令 agent "扮演对手，尽力找出会
    让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。
-4. 忠实呈现（D）→ 综合（E）：汇成"攻击面清单"，标注哪些是真问题、哪些已被现有代码处理。
+4. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：汇成"攻击面清单"，标注哪些是真问题、哪些已被现有代码处理。
 5. 询问是否让 Claude 针对确认的漏洞补测试/加固。
 
 ## Step 2D — consult（咨询汇总）
 
 1. 若用户点名了 agent 就用它；否则选 agent（A，默认 2 个）。
 2. 并行发出（B/C），用 prompts.md 的 **consult 模板**：转述用户问题。
-3. 忠实呈现（D）→ 综合（E）：给出各 agent 观点 + Claude 的收敛结论。
+3. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：给出各 agent 观点 + Claude 的收敛结论。
 
 ## Step 2E — 全流程（默认）
 
@@ -223,7 +276,7 @@ echo "timeout -> ${TO:-MISSING}"
 2. **编码**：Claude 按方案与 CLAUDE.md 规范实现（Flutter 记得 build_runner / dart-define；
    新增引用立即查 import）。
 3. **review**（Step 2B）→ 若 FAIL，Claude 修复后可再跑一轮。
-4. **synthesize**：输出最终小结（做了什么、外部 agent 的关键贡献、遗留项）。
+4. **最终小结**（wrap-up，区别于 F 的"跨模型综合"）：输出做了什么、外部 agent 的关键贡献、遗留项。
 
 ---
 
