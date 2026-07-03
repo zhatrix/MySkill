@@ -159,6 +159,8 @@ codev/
     └── synthesis.md       # 跨模型综合、一致性矩阵、PASS/FAIL 门禁规则
 ```
 
-> **`bin/codev-lib.sh`**：调用外部 agent 的公共底座。Step 0 会把它暂存到 `/tmp/codev-lib.sh`，之后每个
-> 后台调用 `source` 一行即可拿到 `codev_bg_native` / `codev_bg_sandboxed` 等函数——超时封装、隔离空目录、
-> 退出码/超时的显式上报都集中在这一处，改一次全局生效。参考 gstack 的 `bin/gstack-codex-probe` 做法。
+> **`bin/codev-lib.sh`**：调用外部 agent 的公共底座。Step 0 会建一个**本次会话专属目录**
+> （`mktemp -d`）并把它拷进去，之后每个后台调用 `CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"`
+> 一行即可拿到 `codev_bg_native` / `codev_bg_sandboxed` 等函数——超时封装、隔离空目录、退出码/超时的
+> 显式上报都集中在这一处，改一次全局生效。输出走会话目录（而非固定 `/tmp/codev-*`），避免并发的两个
+> `/codev` run 互相覆盖、清理误删。参考 gstack 的 `bin/gstack-codex-probe` 做法。

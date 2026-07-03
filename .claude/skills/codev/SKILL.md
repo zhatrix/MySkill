@@ -50,11 +50,17 @@ allowed-tools:
 ## Step 0 — 探测可用 agent
 
 ```bash
-# 暂存【共享函数库】到确定性字面路径：后台是独立 shell、不继承变量/函数，靠字面路径 source 拿到它。
-# <SKILL_DIR> 用本 skill 头部给出的 "Base directory" 字面替换（如 /Users/…/.claude/skills/codev）。
-cp "<SKILL_DIR>/bin/codev-lib.sh" /tmp/codev-lib.sh
-source /tmp/codev-lib.sh
-codev_probe        # 列出 OK/MISS 的 agent + timeout 状态（库函数说明见 references/agents.md）
+# 建【本次会话专属目录】并把共享函数库拷进去：后台是独立 shell、不继承变量/函数，靠字面路径 source
+# 拿到它。per-session 目录（而非固定 /tmp/codev-*）避免并发的两个 /codev run 互相覆盖输出、以及
+# 收尾清理误删对方文件。<SKILL_DIR> 用本 skill 头部给出的 "Base directory" 字面替换。
+CODEV_DIR=$(mktemp -d -t codev.XXXXXX) || { echo "FATAL: 无法建会话目录"; exit 1; }
+export CODEV_DIR
+cp "<SKILL_DIR>/bin/codev-lib.sh" "$CODEV_DIR/codev-lib.sh" \
+  || { echo "FATAL: codev-lib.sh 未找到——检查 <SKILL_DIR> 是否已替换成头部 Base directory 字面值"; exit 1; }
+chmod 600 "$CODEV_DIR/codev-lib.sh"
+source "$CODEV_DIR/codev-lib.sh" || { echo "FATAL: source 库失败"; exit 1; }
+echo "会话目录：$CODEV_DIR"   # ← 记住这个字面路径：后续每个后台调用都用它 source 库、读输出
+codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAILED）+ timeout 状态（见 agents.md）
 ```
 
 - 只把标 `OK` 的 agent 列入后续可选项。
@@ -144,33 +150,35 @@ codev_probe        # 列出 OK/MISS 的 agent + timeout 状态（库函数说明
 **启动**：每个选中 agent 用**独立的 Bash 工具调用**、设 `run_in_background: true` 发出（同一条消息发多个
 即并行）。后台任务**不受前台 300s 工具超时上限**约束，慢模型能跑完；完成时你会收到通知，再读其输出。
 
-**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量/函数**。因此每个调用开头
-`source /tmp/codev-lib.sh`（Step 0 已暂存到该字面路径）拿回全部库函数，输出也走**确定性字面路径**
-`/tmp/codev-out-<agent>.txt`（收到完成通知时你按此读；不能用随机 `mktemp`）。骨架简化为「source + 一行」：
+**关键：每个后台调用必须自包含**——后台是独立 shell，**不继承任何变量/函数**。因此每个调用开头先
+`CODEV_DIR=<会话目录>`（用 Step 0 打印的**字面路径**替换，如 `/tmp/codev.AbC123`）再
+`source "$CODEV_DIR/codev-lib.sh"` 拿回全部库函数；输出也走会话目录内的**字面路径**
+`$CODEV_DIR/codev-out-<agent>.txt`（收到完成通知时你按此读；不能用随机 `mktemp`）。骨架「设 CODEV_DIR + source + 一行」：
 ```bash
 # —— 非原生只读 agent（reasonix/qoderclicn/opencode/codebuddy）：隔离空目录只喂文本 ——
-source /tmp/codev-lib.sh
-PROMPT=/tmp/codev-prompt-reasonix.txt                          # 提示词文件（前一步已写好，字面路径）
+CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"    # <会话目录> = Step 0 打印的字面路径
+PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"            # 提示词文件（前一步已写好）
 codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
 # 首参是 agent 标签，其后是该 agent 的完整命令 argv（换成 agents.md 里目标 agent 的精确命令即可）。
-# 库函数自动：umask 077 / ▶启动行 / 无-timeout 跳过 / mktemp 空目录 / 捕 agent 退出码(非 rm) / ✔或⚠️上报。
+# 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 空目录 / umask 077(子shell内) / 捕 agent 退出码 / ✔或⚠️上报。
 
 # —— 原生只读 agent（codex/gemini）：无需沙盒，在仓库根跑 ——
-source /tmp/codev-lib.sh
+CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
 cd "$(git rev-parse --show-toplevel)"
-PROMPT=/tmp/codev-prompt-codex.txt
+PROMPT="$CODEV_DIR/codev-prompt-codex.txt"
 codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort="medium"'
 ```
 - **推理强度默认 `medium`**（防慢）；发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（只发相关 diff/
   文件，别把无关内容全塞进去——越大越慢越易超时）；
-- **无 timeout 时**：`codev_bg_*` 会自动跳过该 agent（后台裸跑=永久挂起）；确要它参与就改前台串行或装 coreutils；
+- **无 timeout 时**：`codev_bg_*` 会自动跳过该 agent（后台裸跑=永久挂起）并清空其旧输出文件；确要它参与就改前台串行或装 coreutils；
 - **只读隔离**：codex/gemini 用 `codev_bg_native`（原生只读，可并行）；reasonix/qoderclicn/opencode/codebuddy
   用 `codev_bg_sandboxed`（空目录只喂文本，见 agents.md (a)/(b)）；
-- **兜底**：若 `/tmp/codev-lib.sh` 不存在（Step 0 未暂存成功），退回把库函数体内联进调用（见 `bin/codev-lib.sh`）。
+- **库缺失即中止**：Step 0 的 `cp`/`source` 已带 `|| exit 1`，库拷贝失败会直接停下报错（不再"手抄内联"——
+  98 行库靠人肉内联极易出错）。若真遇到，检查 `<SKILL_DIR>` 是否替换成头部 Base directory 字面值后重跑 Step 0。
 
-**收集**：收到完成通知 → 读该 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`；`codev_report`
-已在任务 stdout 里把结果翻成 `✔ 完成` / `⏭ 超时跳过` / `⚠️ 非零退出 exit=N`（含 stderr 头几行），据此
-判断是否有效，超时/报错/空输出 → 不阻塞其它、如实告知。实时盯用 `Monitor` 跟踪该字面路径（见 D）。
+**收集**：收到完成通知 → 读该 agent 的**字面输出路径** `$CODEV_DIR/codev-out-<agent>.txt`（会话目录内）；
+`codev_report` 已在任务 stdout 里把结果翻成 `✔ 完成` / `⏭ 超时跳过` / `⚠️ 非零退出 exit=N`（含 stderr 头几行），
+据此判断是否有效，超时/报错/空输出 → 不阻塞其它、如实告知。实时盯用 `Monitor` 跟踪该字面路径（见 D）。
 
 ### D. 运行时显示（当前 agent / 模型 / 交互内容）
 让用户始终知道"现在谁在跑、用什么模型、在聊什么"：
@@ -179,8 +187,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 1. **启动即报**：发出这批后台调用的同时，你打印一次状态清单，每 agent 一行：
    `▶ codex（模型 GPT）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式把"范围"写成该 agent 关注面）。
 2. **实时交互内容**（可选）：想盯某个慢 agent，用 `Monitor`（已在 allowed-tools）跟踪它的**字面输出
-   路径** `/tmp/codev-out-<agent>.txt`，它随文件新增行推事件、随进程结束自动停。**不要**用 `tail -f` 起
-   后台任务（不自然结束、制造悬挂进程）；只想瞄一眼就用有界的 `tail -n 20 /tmp/codev-out-<agent>.txt`。
+   路径** `$CODEV_DIR/codev-out-<agent>.txt`，它随文件新增行推事件、随进程结束自动停。**不要**用 `tail -f` 起
+   后台任务（不自然结束、制造悬挂进程）；只想瞄一眼就用有界的 `tail -n 20 "$CODEV_DIR/codev-out-<agent>.txt"`。
    （不为监控给 codex 加 `--json`——那样正文变 JSONL、E 的逐字呈现会展示机器码；监控只看纯文本流水。）
 3. **完成即翻牌**：收到某 agent 完成通知后，把它那行更新为 `✔ codex 完成` / `⏭ reasonix 跳过（超时）` /
    `⚠️ opencode 非零退出`（与 `codev_report` 打印的一致）；**token/用时能取到才加** `（tokens N｜用时 Ss）`
@@ -196,8 +204,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ tokens: <n> ｜ 用时: <s>s
 ```
 
-（逐字呈现的正文取自各 agent 的**字面输出路径** `/tmp/codev-out-<agent>.txt`（库函数写入的确定性路径）。
-`tokens` 仅 codex 可靠取到——`grep -i "tokens used" /tmp/codev-err-<agent>.txt`；其余 agent 取不到就**省略
+（逐字呈现的正文取自各 agent 的**字面输出路径** `$CODEV_DIR/codev-out-<agent>.txt`（库函数写入的会话目录路径）。
+`tokens` 仅 codex 可靠取到——`grep -i "tokens used" "$CODEV_DIR/codev-err-<agent>.txt"`；其余 agent 取不到就**省略
 该字段**，不要编造。`用时` 可用 shell 计时或省略。）
 
 ### F. 跨模型综合

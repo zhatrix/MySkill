@@ -18,40 +18,44 @@
 
 ## 共享函数库 `bin/codev-lib.sh`（所有调用的公共底座）
 
-重复样板（timeout 封装、沙盒、输出捕获、RC 上报）都收进 `bin/codev-lib.sh`，**Step 0 暂存到
-`/tmp/codev-lib.sh`**，每个（含后台）调用开头 `source /tmp/codev-lib.sh` 即拿到全部函数。
+重复样板（timeout 封装、沙盒、输出捕获、RC 上报）都收进 `bin/codev-lib.sh`，**Step 0 建【会话专属目录】
+`CODEV_DIR=$(mktemp -d -t codev.XXXXXX)` 并把库拷进去**，每个（含后台）调用开头
+`CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"` 即拿到全部函数。
 > ⚠️ **变量/函数不跨 Bash 调用**：并行 fan-out 每个 agent 是**独立 Bash 调用 = 独立 shell**，变量/函数
-> 都不继承——所以靠**每次 source 库**拿回函数、**输出走字面路径** `/tmp/codev-out-<agent>.txt`。
+> 都不继承——所以靠**每次 source 库 + 重设 CODEV_DIR 字面值**拿回函数与路径、**输出走会话目录内字面路径**
+> `$CODEV_DIR/codev-out-<agent>.txt`。per-session 目录避免并发 run 互相覆盖、清理误删（旧版固定 `/tmp/codev-*` 会）。
 
 | 函数 | 作用 |
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
-| `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`umask 077` + `mktemp` 隔离空目录 + 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
-| `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑。 |
+| `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离空目录（含 `umask 077`，收进子 shell 不外泄）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
+| `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行 + **非零退出显式上报**（124→超时跳过；≠0→`⚠️ exit=N`+stderr 头 5 行；0→`✔`）。防"无输出"被误判成模型卡死。 |
-| `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。 |
-| `codev_probe` | Step 0 探测：列 OK/MISS agent + timeout 状态。 |
+| `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
+| `codev_probe` | Step 0 探测：列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
 600s 只兜底真正卡死的进程——**慢模型靠后台执行**（Bash `run_in_background`）跑完，不受前台工具超时约束。
-库的卫生规则见文件头注释（不 `set -e/-u`、不改 IFS/PATH、前缀 `codev_`/`CODEV_`、POSIX-ish 兼容 zsh）。
-下文各 agent 用 `codev_bg_*` 一行式给出精确命令。
+库的卫生规则见文件头注释（不 `set -e/-u`、不改 IFS/PATH、`umask` 收进子 shell、前缀 `codev_`/`CODEV_`、
+bash/zsh 通用——注意 `local` 非 POSIX，仅保证这两个 shell）。下文各 agent 用 `codev_bg_*` 一行式给出精确命令。
 
 **提示词一律走文件，禁止内联进命令行**——把完整提示词写入临时文件，命令里用
 `"$(cat "$PROMPT")"` 引用。**绝不**把 `git diff`/用户需求原文直接拼进 `"<完整提示词>"`：
 diff 里的 `$(...)`、反引号会被 shell 展开（注入）。
 ```bash
-PROMPT=$(mktemp -t codev-prompt)   # 用 cat > "$PROMPT" <<'EOF' 写入（单引号 EOF 防展开）
+PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$PROMPT" <<'EOF' 写入（单引号 EOF 防展开）
 ```
-> ⚠️ **mktemp 模板**：macOS/BSD `mktemp` 只替换**结尾**的 X，`mktemp /tmp/foo-XXXXXX.txt` 会原样
-> 生成 `foo-XXXXXX.txt`（非随机、并行相撞）。一律用 `mktemp -t codev-<role>` 形式。
+> 提示词文件放 `$CODEV_DIR`（会话目录）内、按 agent 命名，与库写的 out/err 同处，收尾 `rm -rf "$CODEV_DIR"` 一并清。
+> 若临时另建文件，注意 macOS/BSD `mktemp` 只替换**结尾**的 X（`mktemp /tmp/foo-XXXXXX.txt` 原样生成、并行相撞），
+> 一律用 `mktemp -t codev-<role>` 形式。
 > **注意**：`"$(cat "$PROMPT")"` 只解决注入，**不能**避免 `ARG_MAX`（内容仍作 argv）。防 ARG_MAX 要靠
 > 阈值：发送前 `wc -c "$PROMPT"`，超大（如 > 100KB）就按文件筛选/缩小范围，或改用支持 stdin 的 CLI。
 
-**输出路径由库统一管理**：`codev_bg_*` 把 stdout/stderr 写到**确定性字面路径**
-`/tmp/codev-out-<agent>.txt` / `/tmp/codev-err-<agent>.txt`（后台独立 shell 靠字面路径读，不用随机
-`mktemp` 变量——否则收到完成通知时不知去哪读）。提示词文件 `PROMPT` 仍走文件（上一段）。
-收尾清理：完成呈现后 `rm -f /tmp/codev-prompt-*.txt /tmp/codev-out-*.txt /tmp/codev-err-*.txt`（或告知用户保留）。
+**输出路径由库统一管理**：`codev_bg_*` 把 stdout/stderr 写到**会话目录内字面路径**
+`$CODEV_DIR/codev-out-<agent>.txt` / `$CODEV_DIR/codev-err-<agent>.txt`（后台独立 shell 靠字面路径读，
+不用随机 `mktemp` 变量——否则收到完成通知时不知去哪读；`CODEV_DIR` 每次调用用字面值重设）。提示词文件
+`PROMPT` 放同一会话目录（`$CODEV_DIR/codev-prompt-<agent>.txt`）。
+收尾清理：完成呈现后直接 `rm -rf "$CODEV_DIR"`（整个会话目录一并删，不用通配 glob，故不会误删并发 run 的文件；或告知用户保留）。
 失败/空输出判定综合 **exit code + stdout + stderr** 三者（`codev_report` 已据此翻牌）；若 stdout 为空但
 stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 stderr"。
 
@@ -78,8 +82,8 @@ fi
   在隔离空目录里跑**（首选：它们只需要提示词文本，不必访问工作区）。隔离由库函数 `codev_bg_sandboxed`
   实现（`umask 077` + `mktemp -d` 空目录 + 捕 agent 退出码 + 无 timeout 跳过）：
   ```bash
-  source /tmp/codev-lib.sh
-  PROMPT=/tmp/codev-prompt-reasonix.txt
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"
   codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
   ```
   这样 agent 的 cwd 是空目录，够不到真实仓库，从根本上免掉快照/污染问题。**但空目录只是纵深防御的
@@ -98,7 +102,7 @@ fi
 
 - **咨询 / 头脑风暴 / 挑战 / 通用提问**（默认纯文本，便于逐字呈现）：
   ```bash
-  source /tmp/codev-lib.sh; cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   codev_bg_native codex codex exec "$(cat "$PROMPT")" -s read-only -c 'model_reasoning_effort="medium"'
   ```
   （`codex exec` 接受 `-C`/`-s`；因已 `cd` 进仓库根，`-C` 可省。）默认**不加 `--json`**——JSONL（推理
@@ -113,23 +117,25 @@ fi
   argv 互斥、又**保住自定义关注点**（比"无 prompt"版强）。prompt 里含文件系统边界 + 一句
   "请运行 `git diff <base>...HEAD`（拿不到就 `git diff <base>`）只评审这些改动 + <关注点>"：
   ```bash
-  source /tmp/codev-lib.sh; cd "$(git rev-parse --show-toplevel)"
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel)"
   # PROMPT 内含边界 + “跑 git diff <BASE>...HEAD 只评审这些改动”（<BASE> 写字面值，如 HEAD~1）
   codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort="medium"'
   ```
+  实测已验证：`codex review [PROMPT]` 确会读取仓库/执行 `git diff` 并产出**带真实文件:行号**的 diff-grounded
+  评审（本 skill 自评时 codex 精确引用了改动行，非幻觉），故 gstack 式取范围可行、无需退回 `--base`。
   （若无需自定义关注点，也可退回选择器式 `codex review --base <字面值>`——但那样不能再带 `[PROMPT]`。）
 - **推理强度**：默认 `medium`（防慢/防超时）；复杂任务或用户要更深升 `high`；`--xhigh` 才用
   `-c 'model_reasoning_effort="xhigh"'`。升档前提醒会更慢。
 - **鉴权**：需 `codex login`，或环境变量 `$CODEX_API_KEY` / `$OPENAI_API_KEY`，或
   `~/.codex/auth.json` 存在。缺失时提示：`codex login`。
-- **成本**：`grep -i "tokens used" /tmp/codev-err-codex.txt`（大小写不敏感）。
+- **成本**：`grep -i "tokens used" "$CODEV_DIR/codev-err-codex.txt"`（大小写不敏感）。
 - **角色**：严谨、对抗式挑刺、深度代码审查（"200 IQ 直男工程师"式第二意见）。
 
 ## gemini — Google Gemini
 
 - **调用**（原生只读，用 `codev_bg_native`；环境变量走 `env`）：
   ```bash
-  source /tmp/codev-lib.sh; cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   codev_bg_native gemini env GEMINI_CLI_TRUST_WORKSPACE=true gemini -p "$(cat "$PROMPT")" --approval-mode plan
   ```
   可选 `-m <model>` 指定模型（建议显式指定以固定评审质量，如 `-m gemini-2.5-pro`）。
@@ -143,7 +149,7 @@ fi
 
 - **调用**（非原生只读，用 `codev_bg_sandboxed` 隔离空目录）：
   ```bash
-  source /tmp/codev-lib.sh
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
   ```
   可选 `--budget <usd>` 设美元上限、`-m <id>` 指定模型（如 deepseek-v4-flash）。
@@ -159,7 +165,7 @@ fi
 
 - **调用**（非原生只读，用 `codev_bg_sandboxed`）：
   ```bash
-  source /tmp/codev-lib.sh
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   codev_bg_sandboxed qoderclicn qoderclicn -p "$(cat "$PROMPT")" --reasoning-effort medium --tools ""
   ```
   `--tools ""` 禁用全部内置工具（纯问答，硬保证不动文件）——非原生只读 agent 建议默认带上；
@@ -174,7 +180,7 @@ fi
 
 - **调用**（非原生只读，用 `codev_bg_sandboxed`）：
   ```bash
-  source /tmp/codev-lib.sh
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   codev_bg_sandboxed opencode opencode run "$(cat "$PROMPT")"
   ```
   默认纯文本便于逐字呈现；`--format json` 输出事件流（可读性差，仅需解析时用）。
@@ -189,7 +195,7 @@ fi
 
 - **调用**（非原生只读，用 `codev_bg_sandboxed`）：
   ```bash
-  source /tmp/codev-lib.sh
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   codev_bg_sandboxed codebuddy codebuddy -p "$(cat "$PROMPT")"
   ```
 - **只读保证**：`-p` 非交互 + 提示词强约束 + 隔离空目录（非原生只读）；
