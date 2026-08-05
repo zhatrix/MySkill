@@ -29,7 +29,7 @@
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
 | `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离沙盒（含 `umask 077`，收进子 shell 不外泄）+ **默认铺一份只读仓库副本 `./repo`**（见下）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
-| `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo`，**每会话只做一次**。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁 2 分钟后回收。 |
+| `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo`，**每会话只做一次**。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
 | `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行 + **非零退出显式上报**（124→超时跳过；≠0→`⚠️ exit=N`+stderr 头 5 行；0→`✔`）。防"无输出"被误判成模型卡死。 |
@@ -115,14 +115,30 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 体积闸门：默认 `CODEV_MAX_COPY_KB=102400`（100MB，只统计将被拷的文件，`.gitignore` 排除的
 `node_modules`/构建产物天然不计入）；超了自动退回空目录模式并在 `▶` 行标出。
 
+**副本里被主动剔除的两类东西**（都是实测出的真实逃逸通道，不是防御性冗余）：
+
+1. **tracked 符号链接** —— `find -type l -delete`。tar 原样保留链接，若仓库有指向仓库外绝对路径的
+   tracked symlink，agent 经 `./repo/link` 就能读到沙盒外的真实文件；更糟的是**能写穿**：实测
+   `chmod -R a-w` 之后 `echo X > repo/link` 仍然成功改掉了链接目标的真实文件（`chmod` 只改 symlink
+   自身的权限位，不保护目标）。那会直接击穿"写入只落在副本上"这条主防线。
+2. **submodule 的内部文件** —— `tar --no-recursion`。`git ls-files` 对 submodule 只输出一个
+   mode 160000 的**目录路径**，tar 收到目录默认会递归整个已初始化 submodule，连 submodule 自己的
+   untracked、以及被它 `.gitignore` 忽略的文件都一起打包（实测 `sub/untracked_secret.txt` 进了包）。
+   加 `--no-recursion` 后目录项只建空目录、不下钻；普通文件因 `ls-files` 已逐个列出，不受影响。
+
+密钥过滤是**两道**：tar 的 `--exclude`（大小写敏感）+ 解包后一轮 `-iname` 大小写不敏感清扫
+（挡 `.ENV`、`UPPER.KEY` 这类变体，实测 `--exclude` 确实漏它们）。两道都只认**文件名**，
+挡不住硬编码在源码里的密钥 —— Step 2B 的 secret 扫描仍然必须做。
+
 ### 母本 + clone：每会话只 tar 一次
 
 N 个 agent 各自全量 tar 一遍很浪费。现在改成**母本 + 写时复制 clone**：
 - `codev_repo_master` 把工作区铺成母本 `$CODEV_DIR/codev-master-repo`，**每会话只做一次**；
 - `codev_repo_copy` 用 `cp -c`（APFS **clonefile**）从母本给每个 agent clone 一份。
 
-实测（55MB / 2000 文件，6 个 agent）：旧的"每 agent 全量 tar" 5.80s → 新的"1 次 tar + 6 次 clone" 3.47s；
-APFS 下 clone 共享数据块，磁盘几乎不额外增长。
+实测（55MB / 2000 文件，6 个 agent）：旧的"每 agent 全量 tar" 5.06s → 新的"1 次 tar + 6 次 clone" 2.72s。
+APFS clone 共享数据块：额外 5 份副本的**真实**磁盘增量仅 6MB（`df` 实测；`du` 会虚报 ~280MB，
+它数不出共享块，所以别用 `du` 判断副本占了多少盘）。
 
 **为什么是 clone 而不是硬链接共享同一份**：硬链接是同一个 inode，任一 agent 若绕过 `chmod a-w`
 改了文件，会**串到所有 agent 和母本**；clonefile 是写时复制，改动只落在自己那份。
@@ -131,7 +147,7 @@ APFS 下 clone 共享数据块，磁盘几乎不额外增长。
 
 **并发正确性**：fan-out 时 N 个 agent 是 N 个独立 shell、会同时进 `codev_repo_master`。
 用 `mkdir` 原子锁（抢到的铺、其余等着复用）+ `.partial` 目录原子改名（中途被杀不会留下半个仓库
-被下次误当"已铺好"）+ 陈旧锁 2 分钟后回收（持锁进程被杀时不至于让后续 agent 白等满 300s）。
+被下次误当"已铺好"）+ 陈旧锁回收（持锁进程被杀时不至于让后续 agent 白等满 300s）：先用 `kill -0` 判持锁者是否存活，**活锁不回收**（否则会偷走仍在写母本的进程的锁，两个 builder 同时解 tar → 母本交错/截断，波及全部 agent）；mtime 只作 PID 丢失时的兜底，`-mmin +2` 实际语义是 **≥3 分钟**（find 按整分钟截断）。
 实测 6 个真并发 agent 全部读到正确内容、只生成一个母本、无锁/半成品残留。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户

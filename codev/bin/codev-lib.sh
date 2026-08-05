@@ -63,15 +63,19 @@ codev_report() {
 # Step 2B 的 secret 扫描仍然必须做。仓库确实敏感就用 CODEV_SANDBOX_MODE=text 退回只喂文本。
 # 返回 0=已铺好，1=跳过（非 git 仓库 / 超体积闸门 / 拷贝失败），由调用方退回 text 模式。
 # 【每会话只 tar 一次】：母本铺在会话目录里，各 agent 的沙盒从母本 clone（见 codev_repo_copy）。
-# 否则 N 个 agent = N 次全量 tar，大仓库上很浪费（实测 20MB/1000 文件 × 4 agent ≈ 1.5s，
-# clone 只需 0.4s，且 APFS 下 clone 共享数据块、几乎不占额外磁盘）。
+# 否则 N 个 agent = N 次全量 tar，大仓库上很浪费。实测 55MB / 2000 文件 / 6 agent：
+# 「6 次全量 tar」5.06s → 「1 次 tar + 6 次 clone」2.72s；且 APFS clone 共享数据块——
+# 额外 5 份副本的真实磁盘增量仅 6MB（df 实测；du 会虚报 ~280MB，它数不出共享块）。
 CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 
 # codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（只做一次，已存在就直接复用）。
 # 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
 codev_repo_master() {
   [ -d "$CODEV_MASTER" ] && return 0        # 已铺好，复用
-  local root sz lock="$CODEV_MASTER.lock" waited=0
+  # holder 必须在这里【一次性】声明：写成循环体内的 `local holder` 会在 zsh 下每轮打印
+  # 「holder=<pid>」污染输出——zsh 未设 TYPESET_SILENT 时，对【已存在】的变量再执行不带赋值的
+  # local/typeset 会显示它的当前值（实测等待循环每秒吐一行）。bash 无此行为。
+  local root sz holder lock="$CODEV_MASTER.lock" waited=0
   # 【并发护栏】fan-out 时 N 个 agent 是 N 个独立 shell、会同时进到这里。没有锁的话它们会
   # 同时往同一个母本目录 tar，解出交错/截断的文件（agent 读到半个文件比读不到更糟）。
   # mkdir 是原子的：抢到的铺母本，没抢到的等它铺完再复用。
@@ -79,15 +83,27 @@ codev_repo_master() {
     [ -d "$CODEV_MASTER" ] && return 0      # 别人铺好了，直接用
     # 【陈旧锁回收】持锁进程可能已被杀（前台超时/Ctrl-C），锁却留着。不回收的话本会话
     # 后续每个 agent 都要白等满 300s 再退回 text 模式（等于副本功能静默失效）。
-    # 超 2 分钟仍在的锁判定为死锁：正常铺母本远快于此（55MB/2000 文件实测 ~1s）。
+    # 判活【先看 PID 再看 mtime】：只凭 mtime 会偷走活锁——铺母本在慢盘/接近闸门的大仓上
+    # 可能真的超过阈值，此时持锁者还在写，回收方却删掉它的锁和 .partial，两个进程同时往
+    # 同一个 .partial 解 tar → 母本交错/截断（波及全部 agent）。`kill -0` 判进程是否还在。
+    # 注意 -mmin +2 因 find 按整分钟截断，实际语义是【≥3 分钟】，仅作为 PID 丢失时的兜底。
     if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
-      rm -rf "$lock" "$CODEV_MASTER.partial"   # 连同半成品一起清掉，重新铺
-      continue
+      holder=$(cat "$lock/pid" 2>/dev/null)
+      # 持锁者还活着就不回收，继续等——宁可等满 300s 退回 text，也不能让两个 builder 并存。
+      if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        :
+      else
+        # 确认已死：把 .partial 改名再删，避免旧持锁者的 mv 恰好发布半成品。
+        mv "$CODEV_MASTER.partial" "$CODEV_MASTER.partial.dead.$$" 2>/dev/null
+        rm -rf "$CODEV_MASTER.partial.dead.$$" "$lock"
+        continue
+      fi
     fi
     waited=$((waited+1))
     [ "$waited" -gt 300 ] && return 1       # 等超过 ~300s 判失败（母本再大也该好了），退回 text 模式
     sleep 1
   done
+  echo $$ > "$lock/pid" 2>/dev/null   # 记下持锁者，供上面的 kill -0 判活
   # 拿到锁了。下面用子 shell 包住全部工作，出口统一放锁——
   # 【不能】在中途直接 return：那样锁不会被删，同会话后续 agent 全卡死在上面的 until。
   local rc=0
@@ -100,6 +116,9 @@ codev_repo_master() {
     # cd 只作用于管道左段的子 shell，右段的 du 仍在原 cwd 解析相对路径 → 全部 No such file → 恒得 0，闸门形同虚设。
     sz=$( cd "$root" 2>/dev/null && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
           | { xargs -0 du -sk -- 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}' )
+    # 注：本机 xargs 空输入不执行命令（实测），故空仓库不会让 du 误measure整个 cwd；
+    # 但【别指望 `|| true` 挡这个】——它只吞退出码，不阻止命令被空跑。若移植到会空跑的
+    # xargs 版本上，需改成先判文件列表是否为空。
     [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && exit 1
     # 先解到 .partial 再原子改名：万一进程在解压中途被杀，留下的是 .partial，
     # 下次不会被 `[ -d "$CODEV_MASTER" ]` 误判成"已铺好"而让 agent 读到半个仓库。
@@ -109,18 +128,42 @@ codev_repo_master() {
     # --exclude 过滤明显的密钥载体：副本会被外部模型读取，凡进副本的内容都视同已发送出去。
     # （不用 grep 过滤文件名列表：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔，行为不一致；
     #   tar 的 --exclude 在 GNU tar / bsdtar 上都支持，更稳。）
-    ( cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
-        | tar -cf - --null -T - \
-            --exclude='.env' --exclude='*.env' --exclude='.env.*' \
+    # ⚠️ --no-recursion 是【必须的】：git ls-files 对 submodule 只输出一个 mode 160000 的
+    # 目录路径（如 `sub`），tar 收到目录默认会【递归整个已初始化 submodule】——连 submodule
+    # 自己的 untracked / 被它 .gitignore 忽略的文件一起打包（实测 sub/untracked_secret.txt
+    # 进了包）。那既违反"tracked + 未忽略 untracked"的内容约定，也可能把私密数据发给外部模型。
+    # 加了它，目录项只建空目录、不下钻；普通文件因 ls-files 已逐个列出，不受影响（实测）。
+    ( set -o pipefail 2>/dev/null   # 让左段 git/tar 的失败也能传出去，不被右段 tar -xf 的 0 掩盖
+      cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+        | tar -cf - --null -T - --no-recursion \
+            --exclude='.env' --exclude='*.env' --exclude='.env.*' --exclude='.envrc' \
             --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
             --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
             --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
+            --exclude='*credentials*' --exclude='*.tfvars' --exclude='*.tfstate' --exclude='*.tfstate.*' \
             --exclude='.git' \
-        ) 2>/dev/null | ( cd "$CODEV_MASTER.partial" && tar -xf - ) \
+        | ( cd "$CODEV_MASTER.partial" && tar -xf - ) ) 2>/dev/null \
       || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
+    # 【P1 修复：symlink 穿透】tar 原样保留 tracked symlink。若仓库含指向仓库外的绝对路径
+    # 链接，agent 经 ./repo/link 就能读到沙盒外的真实文件；更糟的是【能写穿】——实测
+    # `chmod -R a-w` 之后 `echo X > repo/link` 仍成功改掉了真实目标（chmod 只改 symlink
+    # 自身权限位，不保护目标）。那会击穿"写入只落在副本上"这条主防线，故一律删掉链接。
+    # 大小写盲区：--exclude 的 fnmatch 大小写敏感（实测 UPPER.KEY / .ENV 不被排除），
+    # 故再用 -iname 做一轮大小写不敏感清扫兜底。
+    find "$CODEV_MASTER.partial" -type l -delete 2>/dev/null
+    find "$CODEV_MASTER.partial" \( -iname '.env' -o -iname '*.env' -o -iname '.env.*' \
+         -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.p12' \
+         -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '*.jks' -o -iname '.netrc' \
+         -o -iname '.npmrc' -o -iname '*credentials*' -o -iname '*.tfvars' \) -delete 2>/dev/null
+    # mv 前守卫：目标已存在时 `mv dir existingdir` 会把源【移进】目标里（实测 rc=0，
+    # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
+    [ -e "$CODEV_MASTER" ] && { rm -rf "$CODEV_MASTER.partial"; exit 0; }   # 别人已铺好，复用
     mv "$CODEV_MASTER.partial" "$CODEV_MASTER" || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
   ); rc=$?
-  rmdir "$lock" 2>/dev/null      # 放锁：无论上面成败都执行
+  # 放锁：无论上面成败都执行。用 rm -rf 而不是 rmdir——锁目录里有 pid 文件（非空），
+  # rmdir 会静默失败（实测：锁泄漏 → 同会话后续每个 agent 白等 300s 再退回 text 模式，
+  # 副本功能静默失效）。空值守卫防 CODEV_MASTER 意外为空时 rm -rf 打到 ".lock" 之外的东西。
+  [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
   return $rc
 }
 
@@ -132,9 +175,13 @@ codev_repo_copy() {
   # 非 APFS / 不支持 -c 的平台自动退回普通 cp -R（-c 失败时重试一次）。
   # 为什么不用硬链接共享一份：硬链接是【同一个 inode】，任一 agent 若绕过 chmod 改了文件，
   # 会串到所有 agent 和母本；clone 是写时复制，改动只落在自己那份。
+  # ⚠️ 回退前【必须】清掉残缺目标：`cp -c` 若在建好 $sbox/repo 之后才失败（ENOSPC、跨卷、
+  # 个别 inode 不支持 clonefile），紧接着的 `cp -R src dst`【dst 已存在】语义变成"拷进 dst 内部"
+  # → $sbox/repo/codev-master-repo/…，且 rc=0（实测）。agent 看到的 ./repo 布局全错、
+  # 提示词里承诺的路径全部失效，而 ▶ 行仍显示"只读仓库副本"，故障完全静默。
   cp -c -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null \
-    || cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null \
-    || return 1
+    || { rm -rf "$sbox/repo"; cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null; } \
+    || { rm -rf "$sbox/repo"; return 1; }   # 失败也自清理：否则 text 模式下会残留半个 repo
   chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
   return 0
 }
@@ -159,6 +206,9 @@ codev_bg_sandboxed() {
   if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
     mode="隔离沙盒 + 只读仓库副本 ./repo"
   else
+    # 兜底清残留：copy 失败路径已自清理，这里再保一手——否则 agent 被告知"空目录"，
+    # cwd 里却躺着半个 repo，它若发现了就会基于残缺代码评审（比看不到更糟）。
+    rm -rf "$sbox/repo" 2>/dev/null
     mode="隔离空目录（只喂提示词文本）"
   fi
   # 用 printf 传 $mode：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
@@ -201,15 +251,19 @@ codev_sbox_gc() {
   #    很容易超过 1 小时），且并发的另一个 /codev run 的会话目录同样匹配 —— 那样会删掉别人正在用的
   #    母本/提示词/输出。会话目录由 skill 收尾的 `rm -rf "$CODEV_DIR"` 负责（母本就在里面，一并清）；
   #    进程被杀漏下的由下面 24 小时那轮兜底。
-  for d in $(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 2>/dev/null); do
+  # 用 -print0 + read -d '' 而不是 `for d in $(find …)`：后者依赖词拆分，$TMPDIR 含空格/换行时
+  # 会把一个路径拆成多个删除目标（如 `/tmp/work dir/codev-sbox.x` → 试图删 `/tmp/work`）。
+  # （注：命令替换在 bash 和 zsh 下【都会】词拆分，这不是 zsh 特有问题——别被"zsh 不拆分"
+  #   的说法误导，那条只适用于未加引号的【变量】展开。）
+  while IFS= read -r -d '' d; do
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
-  done
+  done < <(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 -print0 2>/dev/null)
   # 会话目录（含母本，可能几十 MB）用 24 小时这档兜底：够长，不会撞上"用户慢慢看输出"或并发 run；
   # 且显式跳过【本次会话】自己的目录。
-  for d in $(find "$t" -maxdepth 1 -type d -name 'codev.*' -mmin +1440 2>/dev/null); do
+  while IFS= read -r -d '' d; do
     [ "$d" = "$CODEV_DIR" ] && continue
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
-  done
+  done < <(find "$t" -maxdepth 1 -type d -name 'codev.*' -mmin +1440 -print0 2>/dev/null)
   [ "$n" -gt 0 ] && echo "已清理 $n 个残留沙盒/会话目录（沙盒超 60 分钟、会话目录超 24 小时）"
   return 0
 }

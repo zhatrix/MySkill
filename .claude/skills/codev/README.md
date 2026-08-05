@@ -143,7 +143,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | `timeout -> MISSING` | 没装 coreutils，`brew install coreutils`；不装则慢 agent 会被跳过 |
 | 某 agent 超时被跳过 | 已默认后台+medium；仍超时可降强度/精简范围重试。不阻塞其它 agent |
 | codebuddy 无输出/超时 | 加 `--effort minimal --max-turns 12 --tools "Read,Glob,Grep"` 后实测已恢复正常（此前多半是放开全部工具+高 effort 导致兜圈）。仍不行则自动跳过 |
-| opencode 迟迟不返回 | 本机实测极慢（最小任务 15 分钟未返回），已按后台执行，常撞 600s 被跳过。当可选 agent 用，不阻塞综合 |
+| opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
 | 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟的 |
 | gemini 报网络错误 | 本机 gemini 偶发 503/fetch failed，属它自身网络问题，重试或换 agent |
@@ -181,10 +181,16 @@ codev/
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|
 | **沙盒级只读** | codex、gemini | CLI 自带进程级限制（`-s read-only` / `--approval-mode plan`） | 真实仓库根 |
-| **隔离沙盒** | reasonix、qoderclicn、opencode、codebuddy | 三层：沙盒 + 只读工具白名单 + 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+| **隔离沙盒** | qoderclicn、codebuddy、opencode | 沙盒 + 只读工具白名单/受限 agent + 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+| **隔离沙盒（仅沙盒兜底）** | reasonix | 只有沙盒 + 提示词边界——它**没有**可用的只读旗标（`--permission-mode plan` 非交互下报错退出） | 同上 |
 
 第二档的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
-并已排除 `.env*`、`*.pem`、`*.key`、`id_rsa*`、`.netrc` 等常见密钥文件。
+并已排除常见密钥文件：`.env` / `*.env` / `.env.*` / `.envrc`、`*.pem` / `*.key` / `*.p12` / `*.pfx`、
+`id_rsa*` / `id_dsa*` / `id_ecdsa*` / `id_ed25519*`、`*.keystore` / `*.jks`、`.netrc` / `.npmrc`、
+`*credentials*`、`*.tfvars` / `*.tfstate*`。因 tar 的 `--exclude` **大小写敏感**，解包后还会用
+大小写不敏感的 `-iname` 再扫一轮（挡 `.ENV`、`UPPER.KEY` 这类变体）。
+**tracked 符号链接一律删除**——它们能让 agent 经 `./repo/link` 读到、甚至写穿到沙盒外的真实文件
+（`chmod -R a-w` 只改链接自身权限位，不保护目标，实测可写穿）。
 
 **为什么给副本而不是空目录**：早期为了消灭越界写入风险，把这四个 agent 扔进空目录只喂提示词文本。
 风险是没了，但它们变成了**瞎子**——看不到 diff 之外的代码，遇到"这个不变量在别处成立吗""这个函数
@@ -201,8 +207,9 @@ codev/
 
 **每个 agent 拿到的是独立副本**：整个会话只铺一份"母本"，各 agent 从母本 `cp -c`
 （APFS 写时复制）clone 一份自己的。所以它们互不干扰——某个 agent 就算绕过只读权限改了文件，
-也只影响自己那份，其它 agent 和母本不受影响。实测 55MB/2000 文件、6 个 agent：
-比"每个 agent 各自全量拷" 5.80s → 3.47s，且磁盘几乎不额外增长。
+也只影响自己那份，其它 agent 和母本不受影响（实测改一份，另一份和母本都没变）。
+实测 55MB/2000 文件、6 个 agent：比"每个 agent 各自全量拷" 5.06s → 2.72s，
+额外 5 份副本真实只多占 6MB 磁盘（共享数据块，`du` 看不出来会虚报 ~280MB）。
 
 **为什么不用 `git worktree`**：worktree 检出的是一个**提交**，看不到你未提交的改动和未跟踪文件——
 而 review 默认评审的正是未提交改动，agent 会对着不一致的代码下结论。而且 worktree 与真仓库

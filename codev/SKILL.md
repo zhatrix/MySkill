@@ -172,6 +172,8 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 ```bash
 # —— 非原生只读 agent（reasonix/qoderclicn/opencode/codebuddy）：隔离沙盒 + ./repo 只读副本 ——
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"    # <会话目录> = Step 0 打印的字面路径
+cd "$(git rev-parse --show-toplevel)"   # 【必须】铺母本靠 cwd 定位仓库：后台 shell 的 cwd 不保证在仓库内，
+                                        # 漏了这行会静默退回空目录模式（agent 重新变瞎，且 ▶ 行才看得出来）
 PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"            # 提示词文件（前一步已写好，含「工作副本」段）
 codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
 # 首参是 agent 标签，其后是该 agent 的完整命令 argv（换成 agents.md 里目标 agent 的精确命令即可）。
