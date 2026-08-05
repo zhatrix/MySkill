@@ -29,11 +29,12 @@
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
 | `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离沙盒（含 `umask 077`，收进子 shell 不外泄）+ **默认铺一份只读仓库副本 `./repo`**（见下）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
-| `codev_repo_copy <sbox>` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`）拷成 `<sbox>/repo` 并 `chmod -R a-w`。非 git 仓库 / 超体积闸门 / 拷贝失败时返回 1，调用方自动退回空目录模式。 |
+| `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo`，**每会话只做一次**。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁 2 分钟后回收。 |
+| `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行 + **非零退出显式上报**（124→超时跳过；≠0→`⚠️ exit=N`+stderr 头 5 行；0→`✔`）。防"无输出"被误判成模型卡死。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_sbox_gc` | 清理 TMPDIR 里**超 60 分钟**的残留 `codev-sbox.*`（进程被杀时收尾跑不到会漏，沙盒里有整份仓库副本，会堆磁盘+留代码残迹）。60 分钟门槛远大于 600s 超时上限，不会误删并发 run 的活沙盒。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟**（沙盒天生短命，上限 600s，不会误删并发 run 的活沙盒）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
@@ -88,11 +89,50 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 它仍可用**绝对路径**读写沙盒外的东西（`cat /etc/...`、`cd ~/Project/...`）——空目录时代也一样挡不住。
 所以副本要**叠加**各 agent 的禁工具/只读旗标 + 提示词边界，三层一起用。
 
+### 为什么不用 `git worktree` / `git clone`（都实测过，别再走回头路）
+
+**`git worktree` 不行，两个硬伤**（实测确认）：
+1. **看不到未提交改动**。worktree 检出的是一个**提交**：把 `tracked.txt` 改成 `UNCOMMITTED EDIT`、
+   新建 `untracked.txt` 后建 worktree，里面是旧的 `committed` 内容、且**没有** untracked 文件。
+   而 `/codev review` 的默认场景恰恰是评审**未提交的工作区改动** → agent 会对着一份和被评审内容
+   不一致的代码下结论，比"看不到"更糟（自信地错）。要修就得先帮用户提交 WIP，那正是铁律禁止的副作用。
+2. **可写 + 共享真实 `.git`**。worktree 的 `.git` 文件指向 `<真仓库>/.git/worktrees/<name>`，
+   对象库是共享的。实测 agent 在 worktree 里 `git commit` 成功、该提交进了**真仓库**的对象库；
+   `branch -f` 当前分支被 git 拦住了，但**实测 agent 成功 `git branch -D` 删掉了真仓库里另一个
+   未被检出的分支**。对四个"无沙盒级只读保证、又有 shell 能力"的 agent，这是一条真实的写入通路。
+   现在的副本**不含 `.git`**，`git` 命令根本跑不起来，这条路不存在。
+
+**`git clone --no-hardlinks --local` 安全但同样只看得到已提交状态**（实测：clone 里是 `v1`、
+无 untracked 文件；agent 在 clone 里删分支/删文件，真仓库的分支、未提交改动、untracked 全部完好）。
+它的好处是 agent 能跑 `git log`/`git blame` 做历史考古 —— 若将来需要那个能力，可以作为**可选模式**
+补进来，但**不适合当默认**（看不到 WIP，且更慢更占地方）。
+
+一句话：worktree/clone 适合"让 agent 在某个提交上构建或跑测试"，不适合"让不可信 agent 评审脏状态"。
+
 **必须在提示词里告诉 agent 副本存在**（prompts.md 的「工作副本」段落），否则它不知道能读 `./repo`，
 副本白铺。
 
 体积闸门：默认 `CODEV_MAX_COPY_KB=102400`（100MB，只统计将被拷的文件，`.gitignore` 排除的
 `node_modules`/构建产物天然不计入）；超了自动退回空目录模式并在 `▶` 行标出。
+
+### 母本 + clone：每会话只 tar 一次
+
+N 个 agent 各自全量 tar 一遍很浪费。现在改成**母本 + 写时复制 clone**：
+- `codev_repo_master` 把工作区铺成母本 `$CODEV_DIR/codev-master-repo`，**每会话只做一次**；
+- `codev_repo_copy` 用 `cp -c`（APFS **clonefile**）从母本给每个 agent clone 一份。
+
+实测（55MB / 2000 文件，6 个 agent）：旧的"每 agent 全量 tar" 5.80s → 新的"1 次 tar + 6 次 clone" 3.47s；
+APFS 下 clone 共享数据块，磁盘几乎不额外增长。
+
+**为什么是 clone 而不是硬链接共享同一份**：硬链接是同一个 inode，任一 agent 若绕过 `chmod a-w`
+改了文件，会**串到所有 agent 和母本**；clonefile 是写时复制，改动只落在自己那份。
+实测：a4 把自己副本的 `SKILL.md` 从 344 行覆盖成 1 行后，a5 拿到的仍是 344 行、母本也完好。
+不支持 `cp -c` 的平台（非 APFS）自动退回 `cp -R`，语义一样、只是不共享块。
+
+**并发正确性**：fan-out 时 N 个 agent 是 N 个独立 shell、会同时进 `codev_repo_master`。
+用 `mkdir` 原子锁（抢到的铺、其余等着复用）+ `.partial` 目录原子改名（中途被杀不会留下半个仓库
+被下次误当"已铺好"）+ 陈旧锁 2 分钟后回收（持锁进程被杀时不至于让后续 agent 白等满 300s）。
+实测 6 个真并发 agent 全部读到正确内容、只生成一个母本、无锁/半成品残留。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
 待评审的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。下面片段用于 (b)：

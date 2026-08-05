@@ -62,30 +62,79 @@ codev_report() {
 # 凡进副本的内容都要当作"已经发出去了"。--exclude 只挡常见密钥文件名，挡不住硬编码在源码里的密钥——
 # Step 2B 的 secret 扫描仍然必须做。仓库确实敏感就用 CODEV_SANDBOX_MODE=text 退回只喂文本。
 # 返回 0=已铺好，1=跳过（非 git 仓库 / 超体积闸门 / 拷贝失败），由调用方退回 text 模式。
+# 【每会话只 tar 一次】：母本铺在会话目录里，各 agent 的沙盒从母本 clone（见 codev_repo_copy）。
+# 否则 N 个 agent = N 次全量 tar，大仓库上很浪费（实测 20MB/1000 文件 × 4 agent ≈ 1.5s，
+# clone 只需 0.4s，且 APFS 下 clone 共享数据块、几乎不占额外磁盘）。
+CODEV_MASTER="$CODEV_DIR/codev-master-repo"
+
+# codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（只做一次，已存在就直接复用）。
+# 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
+codev_repo_master() {
+  [ -d "$CODEV_MASTER" ] && return 0        # 已铺好，复用
+  local root sz lock="$CODEV_MASTER.lock" waited=0
+  # 【并发护栏】fan-out 时 N 个 agent 是 N 个独立 shell、会同时进到这里。没有锁的话它们会
+  # 同时往同一个母本目录 tar，解出交错/截断的文件（agent 读到半个文件比读不到更糟）。
+  # mkdir 是原子的：抢到的铺母本，没抢到的等它铺完再复用。
+  until mkdir "$lock" 2>/dev/null; do
+    [ -d "$CODEV_MASTER" ] && return 0      # 别人铺好了，直接用
+    # 【陈旧锁回收】持锁进程可能已被杀（前台超时/Ctrl-C），锁却留着。不回收的话本会话
+    # 后续每个 agent 都要白等满 300s 再退回 text 模式（等于副本功能静默失效）。
+    # 超 2 分钟仍在的锁判定为死锁：正常铺母本远快于此（55MB/2000 文件实测 ~1s）。
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+      rm -rf "$lock" "$CODEV_MASTER.partial"   # 连同半成品一起清掉，重新铺
+      continue
+    fi
+    waited=$((waited+1))
+    [ "$waited" -gt 300 ] && return 1       # 等超过 ~300s 判失败（母本再大也该好了），退回 text 模式
+    sleep 1
+  done
+  # 拿到锁了。下面用子 shell 包住全部工作，出口统一放锁——
+  # 【不能】在中途直接 return：那样锁不会被删，同会话后续 agent 全卡死在上面的 until。
+  local rc=0
+  (
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
+    [ -n "$root" ] || exit 1
+    # 体积闸门：只统计将被拷的文件（已被 .gitignore 排除的 node_modules/build 产物天然不计入）。
+    # BSD xargs 无 -r，用 `|| true` 吞空输入；du 可能被 xargs 分批多次调用，awk 累加即可。
+    # ⚠️ cd 必须在【整条管道之外】（即命令替换的子 shell 里）：若写成 `{ cd "$root" && git ls-files; } | xargs du`，
+    # cd 只作用于管道左段的子 shell，右段的 du 仍在原 cwd 解析相对路径 → 全部 No such file → 恒得 0，闸门形同虚设。
+    sz=$( cd "$root" 2>/dev/null && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+          | { xargs -0 du -sk -- 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}' )
+    [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && exit 1
+    # 先解到 .partial 再原子改名：万一进程在解压中途被杀，留下的是 .partial，
+    # 下次不会被 `[ -d "$CODEV_MASTER" ]` 误判成"已铺好"而让 agent 读到半个仓库。
+    rm -rf "$CODEV_MASTER.partial"
+    mkdir -p "$CODEV_MASTER.partial" || exit 1
+    # tar 按 cwd 相对路径打包，故必须先 cd 进仓库根；--null -T - 读 NUL 分隔文件名（含空格/换行也安全）。
+    # --exclude 过滤明显的密钥载体：副本会被外部模型读取，凡进副本的内容都视同已发送出去。
+    # （不用 grep 过滤文件名列表：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔，行为不一致；
+    #   tar 的 --exclude 在 GNU tar / bsdtar 上都支持，更稳。）
+    ( cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+        | tar -cf - --null -T - \
+            --exclude='.env' --exclude='*.env' --exclude='.env.*' \
+            --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
+            --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
+            --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
+            --exclude='.git' \
+        ) 2>/dev/null | ( cd "$CODEV_MASTER.partial" && tar -xf - ) \
+      || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
+    mv "$CODEV_MASTER.partial" "$CODEV_MASTER" || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
+  ); rc=$?
+  rmdir "$lock" 2>/dev/null      # 放锁：无论上面成败都执行
+  return $rc
+}
+
 codev_repo_copy() {
-  local sbox="$1" root sz
-  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-  [ -n "$root" ] || return 1
-  # 体积闸门：只统计将被拷的文件（已被 .gitignore 排除的 node_modules/build 产物天然不计入）。
-  # BSD xargs 无 -r，用 `|| true` 吞空输入；du 可能被 xargs 分批多次调用，awk 累加即可。
-  # ⚠️ cd 必须在【整条管道之外】（即命令替换的子 shell 里）：若写成 `{ cd "$root" && git ls-files; } | xargs du`，
-  # cd 只作用于管道左段的子 shell，右段的 du 仍在原 cwd 解析相对路径 → 全部 No such file → 恒得 0，闸门形同虚设。
-  sz=$( cd "$root" 2>/dev/null && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
-        | { xargs -0 du -sk -- 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}' )
-  [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && return 1
-  mkdir -p "$sbox/repo" || return 1
-  # tar 按 cwd 相对路径打包，故必须先 cd 进仓库根；--null -T - 读 NUL 分隔文件名（含空格/换行也安全）。
-  # --exclude 过滤明显的密钥载体：副本会被外部模型读取，凡进副本的内容都视同已发送出去。
-  # （不用 grep 过滤文件名列表：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔，行为不一致；
-  #   tar 的 --exclude 在 GNU tar / bsdtar 上都支持，更稳。）
-  ( cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
-      | tar -cf - --null -T - \
-          --exclude='.env' --exclude='*.env' --exclude='.env.*' \
-          --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
-          --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
-          --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
-          --exclude='.git' \
-      ) 2>/dev/null | ( cd "$sbox/repo" && tar -xf - ) || return 1
+  local sbox="$1"
+  codev_repo_master || return 1              # 母本（每会话只 tar 一次）
+  # 从母本给这个 agent 拷一份【独立】副本：`cp -c` 在 APFS 上走 clonefile（写时复制）——
+  # 秒级完成、几乎不占额外磁盘，但各 agent 之间【互不影响】（实测改 clone1 不影响母本和 clone2）。
+  # 非 APFS / 不支持 -c 的平台自动退回普通 cp -R（-c 失败时重试一次）。
+  # 为什么不用硬链接共享一份：硬链接是【同一个 inode】，任一 agent 若绕过 chmod 改了文件，
+  # 会串到所有 agent 和母本；clone 是写时复制，改动只落在自己那份。
+  cp -c -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null \
+    || cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null \
+    || return 1
   chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
   return 0
 }
@@ -147,10 +196,21 @@ codev_bg_native() {
 codev_sbox_gc() {
   local t="${TMPDIR:-/tmp}" d n=0
   # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
+  # 只扫【沙盒】：沙盒天生短命（单次 agent 调用，最长 600s），超 60 分钟必是死掉的。
+  # ⚠️ 【不要】把会话目录 codev.* 也按 60 分钟扫：会话目录是长命的（用户看完输出、讨论、再跑一轮
+  #    很容易超过 1 小时），且并发的另一个 /codev run 的会话目录同样匹配 —— 那样会删掉别人正在用的
+  #    母本/提示词/输出。会话目录由 skill 收尾的 `rm -rf "$CODEV_DIR"` 负责（母本就在里面，一并清）；
+  #    进程被杀漏下的由下面 24 小时那轮兜底。
   for d in $(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 2>/dev/null); do
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
   done
-  [ "$n" -gt 0 ] && echo "已清理 $n 个残留沙盒（超 60 分钟未回收）"
+  # 会话目录（含母本，可能几十 MB）用 24 小时这档兜底：够长，不会撞上"用户慢慢看输出"或并发 run；
+  # 且显式跳过【本次会话】自己的目录。
+  for d in $(find "$t" -maxdepth 1 -type d -name 'codev.*' -mmin +1440 2>/dev/null); do
+    [ "$d" = "$CODEV_DIR" ] && continue
+    chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "已清理 $n 个残留沙盒/会话目录（沙盒超 60 分钟、会话目录超 24 小时）"
   return 0
 }
 
