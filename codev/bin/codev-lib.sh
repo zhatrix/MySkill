@@ -17,15 +17,35 @@
 # timeout 二进制探测（macOS 原生无 timeout，装 coreutils 才有 gtimeout）。
 CODEV_TO=$(command -v timeout || command -v gtimeout || true)
 
-# 输出/库文件的基目录。默认 /tmp（向后兼容）；Step 0 会把它设成【本次会话专属目录】
-# （mktemp -d 建的 /tmp/codev.XXXX），每个后台调用开头用字面值 `CODEV_DIR=<会话目录>` 前置。
-# 好处：并发的两个 /codev run 不再互相覆盖 out/err，收尾 `rm -rf "$CODEV_DIR"` 也不会误删对方文件。
-CODEV_DIR="${CODEV_DIR:-/tmp}"
+# 输出/库文件的基目录 = 本次会话专属目录（Step 0 用 mktemp -d 建，每个后台调用开头用字面值
+# `CODEV_DIR=<会话目录>` 前置）。好处：并发的两个 /codev run 不互相覆盖 out/err，收尾
+# `rm -rf "$CODEV_DIR"` 也不会误删对方文件。
+# ⚠️ 【不再默认 /tmp】。原来写 `${CODEV_DIR:-/tmp}`，漏设时三个后果都很严重（均实测）：
+#   1) 母本变成固定的 /tmp/codev-master-repo，而 codev_repo_master 开头是【无条件复用】——
+#      在 repoA 跑完再去 repoB 跑，repoB 的 agent 看到的是 repoA 的代码（实测 repoB 的
+#      agent 只看到 secret_a.js、自己的 only_in_b.js 一个都没有）。既外泄 A 的代码，
+#      又让 B 的评审整个建立在错误的树上，而 ▶ 行仍显示"只读仓库副本"，完全静默。
+#   2) 文档里的收尾命令 `rm -rf "$CODEV_DIR"` 展开成 `rm -rf "/tmp"`（实测展开结果）。
+#   3) /tmp 是 1777，任何本地用户都能预先建好 /tmp/codev-master-repo 决定所有 agent 读到什么。
+# 故改为【未设置就报错退出】：宁可让调用方立刻失败，也不能静默走上以上任一条。
+if [ -z "${CODEV_DIR:-}" ]; then
+  echo "FATAL: codev-lib.sh 需要先设 CODEV_DIR（本次会话专属目录，见 SKILL.md Step 0）" >&2
+  echo "  正确用法：CODEV_DIR=<Step 0 打印的字面路径>; source \"\$CODEV_DIR/codev-lib.sh\"" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 # 沙盒模式：repo（默认，给只读仓库副本）| text（旧行为，纯空目录只喂提示词文本）。
 CODEV_SANDBOX_MODE="${CODEV_SANDBOX_MODE:-repo}"
 # 仓库副本体积闸门（KB）。超过就退回 text 模式，免得把巨型仓库整份拷进 /tmp。
-CODEV_MAX_COPY_KB="${CODEV_MAX_COPY_KB:-102400}"
+# 必须校验成纯数字：闸门判断是 `[ "$sz" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null`，非数字会让
+# test 语法失败 → 整个 && 链为假 → 闸门【静默失效】，把任意大的仓库整份拷走（实测 abc 与空串
+# 都直接放行）。故非法值一律退回默认并告警，不静默接受。
+case "${CODEV_MAX_COPY_KB:-}" in
+  '' ) CODEV_MAX_COPY_KB=102400 ;;
+  *[!0-9]* )
+    echo "⚠️ CODEV_MAX_COPY_KB='$CODEV_MAX_COPY_KB' 不是纯数字，已退回默认 102400 KB" >&2
+    CODEV_MAX_COPY_KB=102400 ;;
+esac
 
 # codev_run <cmd...> — 超时封装。取代 `$TP <cmd>` 变量前缀：
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
@@ -68,9 +88,30 @@ codev_report() {
 # 额外 5 份副本的真实磁盘增量仅 6MB（df 实测；du 会虚报 ~280MB，它数不出共享块）。
 CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 
+# codev_master_path — 把母本路径【按仓库根 + 工作区状态】区分开，回填 CODEV_MASTER。
+# 为什么需要：codev_repo_master 开头是无条件复用「母本已存在就直接用」。只要 CODEV_DIR 被复用
+# （漏设时的固定路径、或用户在同一会话里换仓库/改完代码再评一轮），复用就会给出【错的树】：
+#   - 跨仓库：repoB 的 agent 拿到 repoA 的母本（实测只看到 A 的文件、B 的一个都没有）；
+#   - 同仓库二轮：改完代码再 review，agent 仍读第一轮的快照，把已修的问题当现存报、
+#     新代码的缺陷全看不见（agents.md 里正是用这条理由否掉 git worktree 的）。
+# 做法：哈希「仓库根 + HEAD + 工作区改动摘要」。任一变化 → 换一个母本目录 → 自然重铺；
+# 没变化 → 命中同一个目录 → 保住"每会话只 tar 一次"的收益。
+codev_master_path() {
+  local root sig h
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  # 工作区签名：HEAD + `git status --porcelain` 摘要（含未跟踪/已暂存），足以捕捉"改了代码再评一轮"。
+  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$(git status --porcelain --untracked-files=all 2>/dev/null | cksum)"
+  # cksum 是 POSIX、bash/zsh/macOS/Linux 都有（不用 md5/sha1sum：前者 macOS 无 -r 之外差异、后者 macOS 没有）。
+  h=$(printf '%s' "$sig" | cksum | tr -cd '0-9')
+  CODEV_MASTER="$CODEV_DIR/codev-master-repo.${h:-0}"
+  return 0
+}
+
 # codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（只做一次，已存在就直接复用）。
 # 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
 codev_repo_master() {
+  codev_master_path || return 1     # 先按仓库+工作区状态定母本路径，避免复用到别的树
   [ -d "$CODEV_MASTER" ] && return 0        # 已铺好，复用
   # holder 必须在这里【一次性】声明：写成循环体内的 `local holder` 会在 zsh 下每轮打印
   # 「holder=<pid>」污染输出——zsh 未设 TYPESET_SILENT 时，对【已存在】的变量再执行不带赋值的
@@ -96,7 +137,10 @@ codev_repo_master() {
         # 确认已死：把 .partial 改名再删，避免旧持锁者的 mv 恰好发布半成品。
         mv "$CODEV_MASTER.partial" "$CODEV_MASTER.partial.dead.$$" 2>/dev/null
         rm -rf "$CODEV_MASTER.partial.dead.$$" "$lock"
-        continue
+        # 【不能 continue】：回收失败时（如会话目录不可写）锁还在，continue 会跳过下面的
+        # sleep 与 waited++ → 变成无 sleep 的忙等，把一个核吃满且永不退出（实测 timeout 124、
+        # spins 上万）。故这里【不跳过】计时与休眠，让它照常走满 300s 再退回 text 模式。
+        mkdir "$lock" 2>/dev/null && break     # 回收成功就立刻抢到锁，进入铺母本
       fi
     fi
     waited=$((waited+1))
@@ -133,8 +177,17 @@ codev_repo_master() {
     # 自己的 untracked / 被它 .gitignore 忽略的文件一起打包（实测 sub/untracked_secret.txt
     # 进了包）。那既违反"tracked + 未忽略 untracked"的内容约定，也可能把私密数据发给外部模型。
     # 加了它，目录项只建空目录、不下钻；普通文件因 ls-files 已逐个列出，不受影响（实测）。
+    # ⚠️ 必须把列表过滤成【当前真实存在的路径】再喂给 tar：`git ls-files` 列的是索引内容，
+    # 已删未提交的 tracked 文件（`git rm` 前的 ` D` 状态，review 场景最常见的改动之一）仍在列表里，
+    # tar 对它报 "Cannot stat" 并【整体退出非零】。配合上面的 pipefail，母本构建就此判失败 →
+    # 每个沙盒 agent 静默退回 text 模式、`./repo` 功能全废（实测：删一个 tracked 文件即触发，
+    # codev_repo_master rc=1、母本不存在）。bsdtar 不支持 --ignore-failed-read（实测 "not supported"），
+    # 故只能在管道里先筛。-e 对 broken symlink 为假，补 -L 保住它（symlink 稍后统一 -delete）。
     ( set -o pipefail 2>/dev/null   # 让左段 git/tar 的失败也能传出去，不被右段 tar -xf 的 0 掩盖
       cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+        | { while IFS= read -r -d '' f; do
+              { [ -e "$f" ] || [ -L "$f" ]; } && printf '%s\0' "$f"
+            done; } \
         | tar -cf - --null -T - --no-recursion \
             --exclude='.env' --exclude='*.env' --exclude='.env.*' --exclude='.envrc' \
             --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
@@ -151,18 +204,29 @@ codev_repo_master() {
     find "$CODEV_MASTER.partial" -type l -delete 2>/dev/null
     # 大小写盲区：--exclude 的 fnmatch 大小写敏感（实测 UPPER.KEY / .ENV 不被排除），
     # 故再用 -iname 做一轮大小写不敏感清扫兜底。
-    # ⚠️ 必须加 -type f，且 credentials 这类【无扩展名】的密钥文件只能在这里挡、不能进 tar 的
-    # --exclude：tar 的 --exclude 按【路径分量】匹配，会连目录一起挡掉——`*credentials*` 或
-    # 光秃秃的 `credentials` 都会整体吃掉 `src/credentials/` 目录（实测连不含密钥的 util.ts
-    # 一起没了，`--exclude=./credentials` 锚定也无效）。而 `find -type f` 天然匹配不到目录，
-    # 正好只删掉真的凭证文件。`credentials.go`、`credentials_manager.dart`、`src/credentials/`
-    # 这类合法源码在真实项目里极常见，误删会让 agent 对着缺文件的副本评审 → 假阳性。
-    # 宁可漏挡一个少见的密钥文件名（secret 扫描仍会兜），也不能删用户的源码。
-    find "$CODEV_MASTER.partial" -type f \( -iname '.env' -o -iname '.env.*' \
-         -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.p12' \
-         -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '.netrc' \
-         -o -iname '.npmrc' -o -iname 'credentials' -o -iname 'credentials.json' \
-         -o -iname '*.tfvars' -o -iname '*.tfstate' \) -delete 2>/dev/null
+    # ⚠️ 必须加 -type f：不加会匹配到目录，`-delete` 虽拒删非空目录，但空目录/单文件目录仍会
+    # 连带整棵子树消失。
+    # 【这一轮必须覆盖 tar --exclude 的【全部】文件名模式】，否则该项的大小写变体就成了裸奔——
+    # tar 那边大小写敏感，这里是唯一的兜底。改动任一边都要同步另一边（`*.key`/`*.env`/`*.jks`/
+    # `id_*` 曾在一次修 credentials 的提交里被漏掉，导致 SERVER.KEY / PROD.ENV / ID_RSA 直接进副本）。
+    # credentials* 不在这一轮里，它有自己的一轮（见下），因为需要额外的源码扩展名白名单。
+    find "$CODEV_MASTER.partial" -type f \( -iname '.env' -o -iname '*.env' -o -iname '.env.*' \
+         -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.p12' \
+         -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '*.jks' -o -iname '.netrc' \
+         -o -iname '.npmrc' -o -iname 'id_rsa*' -o -iname 'id_dsa*' \
+         -o -iname 'id_ecdsa*' -o -iname 'id_ed25519*' \
+         -o -iname '*.tfvars' -o -iname '*.tfstate' -o -iname '*.tfstate.*' \) -delete 2>/dev/null
+    # credentials 单独一轮：宽通配能挡住 gcp-credentials.json / aws_credentials /
+    # credentials.yml.enc 这类前缀后缀变体（实测 8/8），但会连 credentials.go /
+    # credentials_manager.dart / CredentialsProvider.kt 这类【合法源码】一起删（实测 9/9 全中）。
+    # 故先按名字宽匹配、再用 ! -iname 把常见源码扩展名摘出来（实测 8/8 挡住、0/9 误删）。
+    # 只在这里挡、不进 tar --exclude：tar 按路径分量匹配会整体吃掉 src/credentials/ 目录。
+    find "$CODEV_MASTER.partial" -type f -iname '*credentials*' \
+         ! -iname '*.go' ! -iname '*.dart' ! -iname '*.ts' ! -iname '*.tsx' ! -iname '*.js' \
+         ! -iname '*.jsx' ! -iname '*.py' ! -iname '*.rs' ! -iname '*.java' ! -iname '*.kt' \
+         ! -iname '*.swift' ! -iname '*.rb' ! -iname '*.php' ! -iname '*.cs' ! -iname '*.c' \
+         ! -iname '*.h' ! -iname '*.cpp' ! -iname '*.hpp' ! -iname '*.sh' ! -iname '*.vue' \
+         ! -iname '*.md' ! -iname '*.txt' -delete 2>/dev/null
     # mv 前守卫：目标已存在时 `mv dir existingdir` 会把源【移进】目标里（实测 rc=0，
     # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
     [ -e "$CODEV_MASTER" ] && { rm -rf "$CODEV_MASTER.partial"; exit 0; }   # 别人已铺好，复用
@@ -204,15 +268,25 @@ codev_repo_copy() {
 codev_bg_sandboxed() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
+  # 【任何提前返回之前就清空】：Claude 按字面路径读 $out，若本轮没跑成而文件还留着上一轮的
+  # 评审正文，那份陈旧内容会被当成本轮结论逐字呈现（最坏情况：上一轮说 FAIL 的问题已修好，
+  # 这轮却又拿旧文本判一次 FAIL）。所以清空必须在 timeout 缺失、mktemp 失败等所有出口之前。
+  : > "$out"; : > "$err"
   if [ -z "$CODEV_TO" ]; then     # 无 timeout：后台裸跑会永久挂起 → 跳过，不阻塞其它
-    : > "$out"; : > "$err"        # 清空旧输出：防跳过后 Claude 按字面路径读到上一轮陈旧评审
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
   fi
   local sbox rc mode
   sbox=$(mktemp -d -t codev-sbox.XXXXXX) || { echo "⚠️ $agent mktemp 失败"; return 1; }
   if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
-    mode="隔离沙盒 + 只读仓库副本 ./repo"
+    # 副本可能【建成了但里面没东西】：空仓库、或全部文件都命中密钥过滤（实测两种都 rc=0、0 文件）。
+    # 此时提示词还在承诺"可以读 ./repo 核实"，agent 找不到任何代码 → 又回到"瞎子"状态，
+    # 而 ▶ 行却显示副本就绪，用户无从察觉。故实测文件数，为 0 就如实标出。
+    if [ "$(find "$sbox/repo" -type f 2>/dev/null | head -1)" ]; then
+      mode="隔离沙盒 + 只读仓库副本 ./repo"
+    else
+      mode="隔离沙盒 + ./repo（⚠️ 副本内 0 个文件：空仓库或全被密钥过滤挡下，agent 无代码视野）"
+    fi
   else
     # 兜底清残留：copy 失败路径已自清理，这里再保一手——否则 agent 被告知"空目录"，
     # cwd 里却躺着半个 repo，它若发现了就会基于残缺代码评审（比看不到更糟）。
@@ -235,9 +309,9 @@ codev_bg_sandboxed() {
 codev_bg_native() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
+  : > "$out"; : > "$err"          # 同 sandboxed：所有提前返回【之前】就清空，防呈现上一轮陈旧评审
   echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
   if [ -z "$CODEV_TO" ]; then
-    : > "$out"; : > "$err"        # 清空旧输出：同 sandboxed，防读到上一轮陈旧评审
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
   fi

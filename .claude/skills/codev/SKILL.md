@@ -282,18 +282,30 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    done
    ```
 2. 选 agent（A）。
-3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**（tracked diff **+ 上面纳入的未跟踪
-   文件内容**），不能只扫 `git diff`，否则未跟踪文件里的密钥会绕过：
+3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**。⚠️ **`./repo` 副本模式下 payload 是
+   整个工作区，不是 diff**：沙盒 agent 能读副本里任何文件并发给它自己的模型，所以只扫 diff 等于漏掉
+   绝大部分实际外发内容。按模式选范围：
    ```bash
    [ -z "$BASE" ] && { echo "BASE 未定义，拒绝扫描（会误把范围当成 working-vs-index）"; exit 1; }
-   { git diff "$BASE"
-     # BSD/macOS xargs 无 GNU 的 -r/--no-run-if-empty（`xargs -0 -r` 会 illegal option 直接失败、
-     # 未跟踪文件整段不参与扫描）；用 `|| true` 吞空输入，`cat --` 防 `-` 开头文件名被当选项。
-     git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; }
-   } | grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'
+   # BSD/macOS xargs 无 GNU 的 -r/--no-run-if-empty（`xargs -0 -r` 会 illegal option 直接失败、
+   # 让整段内容不参与扫描）；用 `|| true` 吞空输入，`cat --` 防 `-` 开头文件名被当选项。
+   if [ "${CODEV_SANDBOX_MODE:-repo}" = repo ]; then
+     # 副本模式：扫【将进副本的全部文件】（= tracked + 未忽略 untracked，与 codev_repo_master 同源）。
+     # 密钥【文件】已被副本过滤挡掉，所以这一轮真正要抓的是【硬编码在源码里】的密钥。
+     { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+       | { xargs -0 cat -- 2>/dev/null || true; }
+   else
+     # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件。
+     { git diff "$BASE"
+       git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; } }
+   fi | grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    ```
-   命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围；未命中再继续。
+   命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围 / 改用 `CODEV_SANDBOX_MODE=text`；
+   未命中再继续。
+   > 副本模式下整仓扫描**命中率天然高得多**（测试固件、示例配置、变量名里带 `token`/`secret` 的正常代码
+   > 都会命中）。**别因为噪音多就跳过或删条件**——按文件聚合命中、区分"真密钥"与"仅命名相似"后再问用户，
+   > 拿不准就当真密钥处理。
 
    > ⚠️ **`./repo` 只读副本让"发送范围"变大了**：沙盒 agent 能读整个工作区并把内容发给它自己的模型，
    > 不再只有 diff。`codev_repo_copy` 已 `--exclude` 掉常见密钥文件（`.env*`、`*.pem`、`*.key`、
