@@ -22,6 +22,11 @@ CODEV_TO=$(command -v timeout || command -v gtimeout || true)
 # 好处：并发的两个 /codev run 不再互相覆盖 out/err，收尾 `rm -rf "$CODEV_DIR"` 也不会误删对方文件。
 CODEV_DIR="${CODEV_DIR:-/tmp}"
 
+# 沙盒模式：repo（默认，给只读仓库副本）| text（旧行为，纯空目录只喂提示词文本）。
+CODEV_SANDBOX_MODE="${CODEV_SANDBOX_MODE:-repo}"
+# 仓库副本体积闸门（KB）。超过就退回 text 模式，免得把巨型仓库整份拷进 /tmp。
+CODEV_MAX_COPY_KB="${CODEV_MAX_COPY_KB:-102400}"
+
 # codev_run <cmd...> — 超时封装。取代 `$TP <cmd>` 变量前缀：
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
 # 「timeout 600」的单个文件执行而失败；用函数 + "$@" 传参，bash/zsh 都对。
@@ -46,25 +51,74 @@ codev_report() {
   fi
 }
 
+# codev_repo_copy <sbox> — 在沙盒里铺一份【只读仓库副本】到 <sbox>/repo。
+# 解决"非原生只读 agent 是瞎子"：空目录让它们只能吃提示词里的文本，看不到 diff 之外的既有代码，
+# 遇到"这个不变量在别处成立吗""这个函数真实调用方是谁"只能标存疑 → 假阳性。给一份【副本】既恢复
+# 视野、又保住物理隔离：它们的任何写入都落在副本上，真仓库根本不在 cwd 里，也就不需要快照/归因。
+# 布局：<sbox> 本身可写（当 cwd，免得某些 CLI 往 cwd 写日志/会话就崩），<sbox>/repo 只读。
+# 副本内容 = tracked + 未被 .gitignore 忽略的 untracked（即工作区当前状态，含待评审的未提交改动），
+# 不含 .git（省体积；agent 跑不了 git 命令，diff 由提示词提供），且过滤掉明显的密钥文件（见下 --exclude）。
+# ⚠️ 隐私边界变了：以前空目录只发提示词里那点文本，现在【整个工作区都可能被 agent 读取并发给它的模型】。
+# 凡进副本的内容都要当作"已经发出去了"。--exclude 只挡常见密钥文件名，挡不住硬编码在源码里的密钥——
+# Step 2B 的 secret 扫描仍然必须做。仓库确实敏感就用 CODEV_SANDBOX_MODE=text 退回只喂文本。
+# 返回 0=已铺好，1=跳过（非 git 仓库 / 超体积闸门 / 拷贝失败），由调用方退回 text 模式。
+codev_repo_copy() {
+  local sbox="$1" root sz
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  # 体积闸门：只统计将被拷的文件（已被 .gitignore 排除的 node_modules/build 产物天然不计入）。
+  # BSD xargs 无 -r，用 `|| true` 吞空输入；du 可能被 xargs 分批多次调用，awk 累加即可。
+  # ⚠️ cd 必须在【整条管道之外】（即命令替换的子 shell 里）：若写成 `{ cd "$root" && git ls-files; } | xargs du`，
+  # cd 只作用于管道左段的子 shell，右段的 du 仍在原 cwd 解析相对路径 → 全部 No such file → 恒得 0，闸门形同虚设。
+  sz=$( cd "$root" 2>/dev/null && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+        | { xargs -0 du -sk -- 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}' )
+  [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && return 1
+  mkdir -p "$sbox/repo" || return 1
+  # tar 按 cwd 相对路径打包，故必须先 cd 进仓库根；--null -T - 读 NUL 分隔文件名（含空格/换行也安全）。
+  # --exclude 过滤明显的密钥载体：副本会被外部模型读取，凡进副本的内容都视同已发送出去。
+  # （不用 grep 过滤文件名列表：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔，行为不一致；
+  #   tar 的 --exclude 在 GNU tar / bsdtar 上都支持，更稳。）
+  ( cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
+      | tar -cf - --null -T - \
+          --exclude='.env' --exclude='*.env' --exclude='.env.*' \
+          --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
+          --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
+          --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
+          --exclude='.git' \
+      ) 2>/dev/null | ( cd "$sbox/repo" && tar -xf - ) || return 1
+  chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
+  return 0
+}
+
 # codev_bg_sandboxed <agent> <cmd...> — 非原生只读 agent
-# （reasonix / qoderclicn / opencode / codebuddy）：在【隔离空目录】里跑，只喂提示词文本，
-# cwd 够不到真实仓库 → 从根本上免掉快照/污染问题。输出走会话目录字面路径 $CODEV_DIR/codev-out-<agent>.txt。
-# 用法：codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
+# （reasonix / qoderclicn / opencode / codebuddy）：在【隔离沙盒】里跑，cwd 够不到真实仓库
+# → 从根本上免掉快照/污染问题。默认沙盒里带一份只读仓库副本（见 codev_repo_copy），
+# 设 CODEV_SANDBOX_MODE=text 可退回旧的"空目录只喂文本"。
+# 输出走会话目录字面路径 $CODEV_DIR/codev-out-<agent>.txt。
+# 用法：codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
 #       （首个参数是 agent 标签，其后是要执行的完整命令 argv；"$(cat)" 由调用方先展开成单个 arg。）
 codev_bg_sandboxed() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
-  echo "▶ $agent 启动（medium, 隔离空目录）"
   if [ -z "$CODEV_TO" ]; then     # 无 timeout：后台裸跑会永久挂起 → 跳过，不阻塞其它
     : > "$out"; : > "$err"        # 清空旧输出：防跳过后 Claude 按字面路径读到上一轮陈旧评审
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
   fi
-  local sbox rc
+  local sbox rc mode
   sbox=$(mktemp -d -t codev-sbox.XXXXXX) || { echo "⚠️ $agent mktemp 失败"; return 1; }
+  if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
+    mode="隔离沙盒 + 只读仓库副本 ./repo"
+  else
+    mode="隔离空目录（只喂提示词文本）"
+  fi
+  # 用 printf 传 $mode：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
+  # （实测 echo "…（$mode）" 只输出到"启动（"就截断）。同 codev_report 里 $rc 的处理。
+  printf '▶ %s 启动: %s\n' "$agent" "$mode"
   # umask 077 放进子 shell：输出含 diff/可能密钥仅本人可读，且【不把 umask 泄漏给调用方 shell】。
   ( umask 077; cd "$sbox" && codev_run "$@" < /dev/null > "$out" 2>"$err" ); rc=$?
-  [ -n "$sbox" ] && rm -rf "$sbox"   # 空值守卫，防 mktemp 失败时 rm -rf ""
+  # 副本被 chmod a-w，rm 需要先恢复目录写权限；空值守卫防 mktemp 失败时 rm -rf ""
+  [ -n "$sbox" ] && { chmod -R u+w "$sbox" 2>/dev/null; rm -rf "$sbox"; }
   codev_report "$agent" "$rc" "$err" # 捕【agent】退出码，不是 rm 的
 }
 
@@ -74,7 +128,7 @@ codev_bg_sandboxed() {
 codev_bg_native() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
-  echo "▶ $agent 启动（medium, 原生只读）"
+  echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
   if [ -z "$CODEV_TO" ]; then
     : > "$out"; : > "$err"        # 清空旧输出：同 sandboxed，防读到上一轮陈旧评审
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
@@ -84,6 +138,20 @@ codev_bg_native() {
   # umask 077 放进子 shell：不把 umask 泄漏给调用方 shell（前台/内联退化场景会残留 0600）。
   ( umask 077; codev_run "$@" < /dev/null > "$out" 2>"$err" ); rc=$?
   codev_report "$agent" "$rc" "$err"
+}
+
+# codev_sbox_gc — 清理【残留沙盒】。正常路径下 codev_bg_sandboxed 收尾会删掉自己的沙盒，但
+# 进程被杀时（前台工具超时、Ctrl-C、机器重启）收尾跑不到，沙盒就漏在 TMPDIR 里。
+# 空目录时代漏了无所谓，现在沙盒里有整份仓库副本 → 会堆磁盘、也留代码残迹，所以要定期扫。
+# 只删【60 分钟前】的：codev_run 上限 600s，超过 60 分钟的必然是死掉的，不会误删并发 run 的活沙盒。
+codev_sbox_gc() {
+  local t="${TMPDIR:-/tmp}" d n=0
+  # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
+  for d in $(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 2>/dev/null); do
+    chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "已清理 $n 个残留沙盒（超 60 分钟未回收）"
+  return 0
 }
 
 # codev_auth_codex — codex 多信号鉴权检查（env 或 auth.json）。输出 AUTH_OK / AUTH_FAILED。
@@ -103,6 +171,7 @@ codev_auth_codex() {
 # 便于 Claude 把未鉴权的 codex 提前剔出可选项，不浪费一轮后台任务。
 codev_probe() {
   local c
+  codev_sbox_gc          # 顺手回收上一轮被杀进程漏下的沙盒（含仓库副本，会堆磁盘）
   for c in codex gemini reasonix qoderclicn opencode codebuddy; do
     if command -v "$c" >/dev/null 2>&1; then
       if [ "$c" = codex ]; then echo "OK   codex ($(codev_auth_codex))"; else echo "OK   $c"; fi

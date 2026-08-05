@@ -28,11 +28,13 @@
 | 函数 | 作用 |
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
-| `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离空目录（含 `umask 077`，收进子 shell 不外泄）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
+| `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离沙盒（含 `umask 077`，收进子 shell 不外泄）+ **默认铺一份只读仓库副本 `./repo`**（见下）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
+| `codev_repo_copy <sbox>` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`）拷成 `<sbox>/repo` 并 `chmod -R a-w`。非 git 仓库 / 超体积闸门 / 拷贝失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行 + **非零退出显式上报**（124→超时跳过；≠0→`⚠️ exit=N`+stderr 头 5 行；0→`✔`）。防"无输出"被误判成模型卡死。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_probe` | Step 0 探测：列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
+| `codev_sbox_gc` | 清理 TMPDIR 里**超 60 分钟**的残留 `codev-sbox.*`（进程被杀时收尾跑不到会漏，沙盒里有整份仓库副本，会堆磁盘+留代码残迹）。60 分钟门槛远大于 600s 超时上限，不会误删并发 run 的活沙盒。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
 600s 只兜底真正卡死的进程——**慢模型靠后台执行**（Bash `run_in_background`）跑完，不受前台工具超时约束。
@@ -59,10 +61,38 @@ PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$P
 失败/空输出判定综合 **exit code + stdout + stderr** 三者（`codev_report` 已据此翻牌）；若 stdout 为空但
 stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 stderr"。
 
-非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置二选一：
-- **(a) 首选：隔离空目录只喂文本**（见下方 SANDBOX 模板）——cwd 是空目录，够不到仓库，从根本上免风险。
-  此时**不必逐 agent 快照**，只需在**整批 fan-out 前后各做一次全局** `git status --porcelain` 兜底核对。
+非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置三选一：
+- **(a) 默认 & 首选：隔离沙盒 + 只读仓库副本**——cwd 是 `mktemp -d` 出来的沙盒，里面有 `./repo`
+  （工作区副本，`chmod -R a-w`）。**真实仓库根本不在 cwd 里**，agent 的任何写入都只能落到副本上、
+  随沙盒一起删掉 → 免掉快照/归因/污染问题，同时 agent **能读到全部代码**。这是 (a') 的严格升级版。
+- **(a') 隔离空目录只喂文本**（`CODEV_SANDBOX_MODE=text`）——旧默认。仅在不想让 agent 看到仓库
+  其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。
 - **(b) 确需在真实仓库 cwd 跑**：则**必须逐 agent 前后快照核对 + 串行**（并行无法归因、会互相污染）。
+  有了 (a) 之后基本没有理由再走 (b)。
+
+### 为什么默认改成"只读仓库副本"（重要设计决策）
+
+早期为消灭越界写入风险，把这四个 agent 扔进**空目录**、只喂提示词文本。风险是消灭了，代价是
+它们变成了**瞎子**，实测两个后果：
+1. **diff 评审**：能看全改动本身，但看不到 diff 之外的既有代码——"这个不变量在别处是否成立"
+   "这个函数真实调用方是谁"只能标存疑。
+2. **spec 评审**（无 diff 可喂）：Claude 得手工从仓库摘代码片段塞进提示词（出现过 53KB 的巨型
+   提示词），容易漏、也可能与仓库当前状态脱节。实测导致 agent 给出"conditional FAIL /
+   unverifiable premise"——**不是真发现 bug，是看不到代码造成的假阳性**。
+
+**给副本而不是给真仓库**同时拿到两边：视野恢复了，物理隔离也还在（写入落在副本、真仓库不在 cwd）。
+比"把它们升级成原生只读、放进真仓库跑"更安全——后者要赌各家 CLI 的只读旗标真的是沙盒级保证，
+而实测（见下方各 agent 条目）**没有一家做到 codex `-s read-only` 那种级别**。
+
+**边界说明（别高估它）**：副本是**纵深防御**，不是硬隔离。若 agent CLI 有 shell/tool 能力，
+它仍可用**绝对路径**读写沙盒外的东西（`cat /etc/...`、`cd ~/Project/...`）——空目录时代也一样挡不住。
+所以副本要**叠加**各 agent 的禁工具/只读旗标 + 提示词边界，三层一起用。
+
+**必须在提示词里告诉 agent 副本存在**（prompts.md 的「工作副本」段落），否则它不知道能读 `./repo`，
+副本白铺。
+
+体积闸门：默认 `CODEV_MAX_COPY_KB=102400`（100MB，只统计将被拷的文件，`.gitignore` 排除的
+`node_modules`/构建产物天然不计入）；超了自动退回空目录模式并在 `▶` 行标出。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
 待评审的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。下面片段用于 (b)：
@@ -78,21 +108,20 @@ fi
 ```
 - **必须有 `exit 1`**：只 echo 不退出，Bash 调用仍返回 0，Claude 可能无视警告继续，把"停下"架空。
 - **并行归因问题**：多个非原生只读 agent 同时跑时，快照交叠无法归因到某一个，且 A 的写入会污染
-  B 读到的状态。因此非原生只读 agent **要么串行**（各自前后核对），**要么只喂 diff/代码片段文本、
-  在隔离空目录里跑**（首选：它们只需要提示词文本，不必访问工作区）。隔离由库函数 `codev_bg_sandboxed`
-  实现（`umask 077` + `mktemp -d` 空目录 + 捕 agent 退出码 + 无 timeout 跳过）：
+  B 读到的状态。因此非原生只读 agent **要么串行**（各自前后核对），**要么走沙盒 (a)**。隔离由库函数
+  `codev_bg_sandboxed` 实现（`umask 077` + `mktemp -d` 沙盒 + 只读仓库副本 + 捕 agent 退出码 + 无 timeout 跳过）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"
-  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
+  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
   ```
-  这样 agent 的 cwd 是空目录，够不到真实仓库，从根本上免掉快照/污染问题。**但空目录只是纵深防御的
-  一层，不是硬隔离**：若 agent CLI 自身有 tool-use / shell 执行能力（如某些框架能 `cat /任意绝对路径`
-  或 `cd /`），空 cwd 挡不住它读仓库外的文件。所以对有工具能力的 agent 仍要**叠加提示词约束 + 禁工具
-  旗标**（qoderclicn `--tools ""`、opencode `--agent <只读>`）；纯推理 CLI（reasonix 无禁工具旗标）才靠
-  空目录 + 提示词约束兜底。
+  （`--effort high` 不是笔误：reasonix 拒绝 `medium`，见下方 reasonix 条目。）
+  这样 agent 的 cwd 是沙盒（真实仓库不在里面），从根本上免掉快照/污染问题。**但沙盒只是纵深防御的
+  一层，不是硬隔离**：若 agent CLI 自身有 tool-use / shell 执行能力，它能用**绝对路径**读写沙盒外的
+  文件（`cat /任意路径`、`cd ~/Project/...`）——空目录时代也一样挡不住。所以对有工具能力的 agent 必须
+  **叠加只读/禁工具旗标 + 提示词约束**（见下方各 agent 条目的精确旗标）。
 - **快照盲区**：`git status --porcelain` 检测不到**已存在的未跟踪文件的内容**被改（前后都是 `??` 同名）。
-  这也是"隔离空目录 + 只喂文本"优先于"在仓库里跑再快照"的原因；确需在仓库跑时，可额外记录
+  这也是沙盒优先于"在仓库里跑再快照"的原因；确需在仓库跑时，可额外记录
   `git ls-files --others --exclude-standard -z | xargs -0 shasum` 的前后 hash。
 - 原生只读的 codex/gemini 可放心并行（`-s read-only` / `--approval-mode plan` 是沙盒级保证）。
 
@@ -147,30 +176,37 @@ fi
 
 ## reasonix — DeepSeek
 
-- **调用**（非原生只读，用 `codev_bg_sandboxed` 隔离空目录）：
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
-  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
+  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
   ```
   可选 `--budget <usd>` 设美元上限、`-m <id>` 指定模型（如 deepseek-v4-flash）。
-  **默认 `medium`**：`high`/`max` + 大提示词是 reasonix 最常超时的组合，需要更深再升，并配合后台执行。
-- **只读保证**：**无原生只读旗标** → 必须在提示词里强约束"禁止修改任何文件，只输出文本"，
-  且不给它 auto-approve。**首选隔离空目录只喂文本 (a)**；确需在真实仓库 cwd 跑则**必须**逐次前后
-  `git status` 快照核对 (b)（见顶部只读保障 (a)/(b)）。
-- **推理强度**：`--effort low|medium|high|max`；默认 `medium`，`--xhigh` 用 `max`。
+  `-p` 只打印最终回答（省掉工具调用流水，逐字呈现更干净）。
+- **⚠️ `--effort medium` 在 DeepSeek thinking 模型上会直接报错退出**（实测 exit=1：
+  `provider "deepseek-pro" uses DeepSeek thinking; effort must be high, max, or disabled`）。
+  **reasonix 是全局"默认 medium"规则的例外**：给它 `high`（或 `max`/不传）。传 medium 等于白跑一轮。
+- **⚠️ `--permission-mode plan` 非交互不可用**（实测 exit=2：`requires an interactive session`），
+  别照搬 gemini 的 plan 模式思路。非交互下用默认 `ask` 模式（无人应答即不放行写操作）。
+- **只读保证**：**无可用的非交互只读旗标** → 靠 `codev_bg_sandboxed` 沙盒（真仓库不在 cwd、
+  `./repo` 副本 `chmod a-w`）+ 提示词强约束，且不给它 auto-approve / `bypassPermissions`。
+- **推理强度**：`--effort low|high|max`（**跳过 medium**，见上）；`--xhigh` 用 `max`。
 - **鉴权**：`reasonix setup` 配置 API key。
 - **角色**：低成本、高性价比推理，适合快速多方案头脑风暴。
 
 ## qoderclicn — Qoder
 
-- **调用**（非原生只读，用 `codev_bg_sandboxed`）：
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
-  codev_bg_sandboxed qoderclicn qoderclicn -p "$(cat "$PROMPT")" --reasoning-effort medium --tools ""
+  codev_bg_sandboxed qoderclicn qoderclicn --reasoning-effort medium --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   ```
-  `--tools ""` 禁用全部内置工具（纯问答，硬保证不动文件）——非原生只读 agent 建议默认带上；
-  可选 `-m <model>`。
-- **只读保证**：`-p` 非交互 + 提示词强约束；如需更硬，加 `--tools ""` 禁工具。
+  可选 `-m <model>`。注意 `--tools` 是变长参数，**必须用 `-p` 把它与 query 隔开**（把 `-p …` 放最后）。
+- **只读保证：`--tools "Read,Glob,Grep"`（只读工具白名单）——推荐默认带上。**
+  这是 harness 级强制：模型手里根本没有写工具。实测让它建文件，它答"我可用的工具只有
+  Read、Glob、Grep，没有写入工具或 Bash，因此无法创建"——且**读 `./repo` 正常**。
+  ⚠️ **不要再用 `--tools ""`**：那是把**包括读文件在内**的全部工具都禁掉，沙盒里的 `./repo` 副本
+  就白铺了，agent 重新变瞎。`--tools ""` 只在刻意要"纯文本问答、不给任何代码视野"时才用。
   不要用 `--dangerously-skip-permissions` / `--permission-mode bypass_permissions`。
 - **推理强度**：`--reasoning-effort`；默认 `medium`，`--xhigh` 用 `max`。
 - **鉴权**：Qoder 账号登录。`--list-models` 可查可用模型。
@@ -178,30 +214,47 @@ fi
 
 ## opencode — 多供应商
 
-- **调用**（非原生只读，用 `codev_bg_sandboxed`）：
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
-  codev_bg_sandboxed opencode opencode run "$(cat "$PROMPT")"
+  codev_bg_sandboxed opencode opencode run --agent plan "$(cat "$PROMPT")"
   ```
   默认纯文本便于逐字呈现；`--format json` 输出事件流（可读性差，仅需解析时用）。
   可选 `-m <provider/model>`（如 `openai/gpt-5.4`；避免选 Anthropic 模型，否则失去跨模型
-  多样性的意义）、`--agent <只读agent名>`。
-- **只读保证**：无显式只读旗标 → 提示词强约束 + 不 auto-approve；可用 `--agent` 指定一个
-  只读/审阅型 agent。`--format json` 便于解析事件。
+  多样性的意义）。
+- **⚠️ 本机实测极慢/疑似挂起**：给它一个"读一个文件、列出函数名"的最小任务，**15 分钟仍未返回**
+  （同样的任务 reasonix / qoderclicn / codebuddy 都是秒级完成）。原因未查清（可能是沙盒 cwd 下
+  初始化慢、或等某个交互）。→ **必须后台执行**，并预期它经常撞 600s 安全网被判超时跳过。
+  把它当"有则加分、没有也不影响"的可选 agent，别放进默认推荐组合、也别让它阻塞综合。
+- **只读保证**：`--agent plan` + 沙盒。
+  ⚠️ **`--agent plan` 不够格当"原生只读"，别把它移到 `codev_bg_native` 去真仓库里跑。**
+  实测 `opencode agent list` 里 plan agent 的权限表是：`edit` → `deny *`（只放行
+  `.opencode/plans/*.md`），但**没有任何 `bash` 条目**，于是 `bash` 落到兜底的 `* → allow` 上——
+  也就是说 plan agent **能执行任意 shell**，`edit` 禁令一条 `sh -c 'echo x > f'` 就绕过去了。
+  这不是 codex `-s read-only` 那种沙盒级保证。而且这张权限表来自**用户本地 opencode 配置**
+  （实测里含用户自定义的 `external_directory` 放行项），不是 CLI 的固有不变量，随配置漂移。
+  → 结论：opencode 留在 `codev_bg_sandboxed`，`--agent plan` 只当**纵深防御的一层**。
+  另注：`--auto`（auto-approve）默认关闭，**绝不要加**。
 - **鉴权**：`opencode auth`（providers）。`opencode models` 查可用模型。
 - **角色**：灵活切换多家模型，做交叉对比很方便。
 
 ## codebuddy — 腾讯（Claude Code 分支）
 
-- **调用**（非原生只读，用 `codev_bg_sandboxed`）：
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
-  codev_bg_sandboxed codebuddy codebuddy -p "$(cat "$PROMPT")"
+  codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 12 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   ```
-- **只读保证**：`-p` 非交互 + 提示词强约束 + 隔离空目录（非原生只读）；
-  不要用 `--dangerously-skip-permissions`。
-- **⚠️ 已知问题**：本机实测 `codebuddy -p` 常**无标准输出或超时**（退出码 0 但 stdout 空，或超
-  timeout 返回 124）。若空输出/超时：判定本次不可用，**跳过它**并如实告诉用户
+- **只读保证**：`--tools "Read,Glob,Grep"`（只读工具白名单，同 qoderclicn 的 harness 级强制）
+  + `-p` 非交互 + 沙盒 + 提示词强约束。不要用 `-y` / `--dangerously-skip-permissions` /
+  `--permission-mode bypassPermissions`。同样**别用 `--tools ""`**（会连读文件也禁掉）。
+- **⚠️ 空输出/超时问题（历史）**：过去实测 `codebuddy -p` 常无 stdout 或撞 timeout。
+  **实测加上 `--effort minimal --max-turns 12 --tools "Read,Glob,Grep"` 后恢复正常**（秒级返回、
+  正确读了 `./repo` 里的文件）——此前很可能是**放开全部工具 + 默认高 effort 导致 agent 无限兜圈**，
+  而非登录/API 问题。所以**这三个旗标当作 codebuddy 的必备参数**，别省。
+- **控制提示词体积**：codebuddy 对大提示词最敏感。给它的 prompt 建议**压到 30KB 以内**
+  （比全局 100KB 阈值更严）——有了 `./repo` 副本，本来也不必再把大段代码内联进去，让它自己读。
+- 仍然空输出/超时时：判定本次不可用，**跳过它**并如实告诉用户
   "codebuddy 无输出/超时（可能原因：未登录 / API 异常 / 上下文超限），已跳过；可运行
   `codebuddy` 交互登录后重试"。
 - **鉴权**：`codebuddy`（交互登录）。
@@ -219,17 +272,26 @@ fi
 
 ## 只读风险总结
 
-| agent | 原生只读 | 依赖提示词约束 |
-|---|---|---|
-| codex | ✅ `-s read-only` | — |
-| gemini | ✅ `--approval-mode plan` | — |
-| reasonix | ❌ | ✅ 必须 |
-| qoderclicn | 半（`--tools ""`） | ✅ |
-| opencode | 半（`--agent`） | ✅ |
-| codebuddy | ❌ | ✅ 必须 |
+| agent | 只读保障级别 | 实测旗标 | 运行位置 |
+|---|---|---|---|
+| codex | **沙盒级**（进程被限制） | `-s read-only`（`review` 子命令天然只读，不吃 `-s`） | 真实仓库 `codev_bg_native` |
+| gemini | **沙盒级** | `--approval-mode plan` | 真实仓库 `codev_bg_native` |
+| qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
+| codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
+| opencode | **弱**（`edit` 禁了但 `bash` 没禁，可绕过；且权限表随用户配置漂移） | `--agent plan` | 沙盒 `codev_bg_sandboxed` |
+| reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错） | 沙盒 `codev_bg_sandboxed` |
 
-对"依赖提示词约束"的 agent（表中非 ✅ 的四个），提示词里的**文件系统边界**段落是第一道防线；
-但铁律"只读"不能只靠请求——**必须**按本文件顶部的快照片段在调用前后 `git status --porcelain`
-核对，发现改动即**停下、逐字上报差异交用户处置（`exit 1`，绝不自动回滚**，以免误删用户未提交
-的工作）。这一步对非原生只读 agent 是强制的，不是"有顾虑时"可选；首选让它们只处理提示词文本、
-不接触真实工作区（见顶部片段）。
+三层纵深防御，下面四个 agent **三层都要上**，不能只靠其中一层：
+1. **沙盒**（`codev_bg_sandboxed`）——真实仓库不在 cwd，只有 `./repo` 只读副本。**这是主防线**：
+   即使前两层全被绕过，写入也只落在副本上，随沙盒删掉。
+2. **旗标**（上表"实测旗标"列）——能拿到 harness 级的就拿（qoderclicn / codebuddy）；
+   拿不到的（reasonix / opencode）如实承认只有第 1、3 层。
+3. **提示词边界**（prompts.md 的「文件系统边界」段落）——最弱的一层，只防"顺手"不防"故意"。
+
+**不要**因为某个 agent 有个看起来像只读的旗标就把它挪到 `codev_bg_native` 去真仓库里跑——
+除非确认那是**沙盒级**（进程/内核层面限制），而非"框架答应不调用写工具"。opencode `--agent plan`
+就是典型反例（见上方 opencode 条目：`bash` 未被禁）。
+
+若确需在真实仓库 cwd 跑这四个中的任何一个（应当极少），**必须**按本文件顶部的快照片段在调用前后
+`git status --porcelain` 核对 + 串行，发现改动即**停下、逐字上报差异交用户处置（`exit 1`，绝不自动
+回滚**，以免误删用户未提交的工作）。

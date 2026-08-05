@@ -70,11 +70,12 @@ bash/zsh 都能正常跑。
 /codev review 并发安全和错误处理   # 带关注点
 ```
 流程：自动定 base（`@{u}` → `origin/HEAD` → `main`… 回退链，会验证 commit 存在）→ **secret 扫描**
-→ 各 agent 评审 → 综合出**一致性矩阵 + PASS/FAIL 门禁**（出现 P1/critical 即 FAIL）→ 问你要不要
-让 Claude 修复确认的问题。
+→ 各 agent 评审 → **事实核查回填**（把 agent 标注的"需核实假设"逐条查证）→ 综合出
+**一致性矩阵 + PASS/FAIL 门禁**（出现 P1/critical 即 FAIL）→ 问你要不要让 Claude 修复确认的问题。
 
-- codex 用原生 `codex review --base <base>`（只读，从仓库根跑）。
-- 其余 agent 收到脱敏后的 diff 文本，在隔离空目录里跑。
+- codex 用原生 `codex review`（只读，从仓库根跑，自己跑 `git diff`）。
+- 其余 agent 在**隔离沙盒**里跑：cwd 不是真仓库，但沙盒里有一份 `./repo` —— 工作区（含未提交
+  改动）的**只读副本**。它们能读全部代码来核实跨文件问题，写入又只落在副本上、用完即删。
 
 ### challenge — 对抗式挑战
 ```
@@ -129,6 +130,9 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 默认一律 `medium`（**高强度 + 大提示词是超时主因**）。仅复杂任务或你要更深时升 `high`。
 输入里带 `--xhigh` 才对支持的 agent 用最高档（codex `xhigh`、reasonix/qoderclicn `max`）——会更慢、更易超时。
 
+> **例外：reasonix 必须用 `high`/`max`。** 它背后的 DeepSeek thinking 模型直接拒绝 `medium`
+> （报 `effort must be high, max, or disabled` 并退出）。
+
 ---
 
 ## 7. 常见问题
@@ -138,7 +142,10 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | 提示"未检测到任何外部 agent CLI" | 一个都没装，按第 2.1 节装并登录 |
 | `timeout -> MISSING` | 没装 coreutils，`brew install coreutils`；不装则慢 agent 会被跳过 |
 | 某 agent 超时被跳过 | 已默认后台+medium；仍超时可降强度/精简范围重试。不阻塞其它 agent |
-| codebuddy 常无输出/超时 | 已知问题（退出码 0 但 stdout 空）；默认推荐里已注明，会自动跳过 |
+| codebuddy 无输出/超时 | 加 `--effort minimal --max-turns 12 --tools "Read,Glob,Grep"` 后实测已恢复正常（此前多半是放开全部工具+高 effort 导致兜圈）。仍不行则自动跳过 |
+| opencode 迟迟不返回 | 本机实测极慢（最小任务 15 分钟未返回），已按后台执行，常撞 600s 被跳过。当可选 agent 用，不阻塞综合 |
+| agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
+| 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟的 |
 | gemini 报网络错误 | 本机 gemini 偶发 503/fetch failed，属它自身网络问题，重试或换 agent |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
 | 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型 |
@@ -161,6 +168,33 @@ codev/
 
 > **`bin/codev-lib.sh`**：调用外部 agent 的公共底座。Step 0 会建一个**本次会话专属目录**
 > （`mktemp -d`）并把它拷进去，之后每个后台调用 `CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"`
-> 一行即可拿到 `codev_bg_native` / `codev_bg_sandboxed` 等函数——超时封装、隔离空目录、退出码/超时的
-> 显式上报都集中在这一处，改一次全局生效。输出走会话目录（而非固定 `/tmp/codev-*`），避免并发的两个
-> `/codev` run 互相覆盖、清理误删。参考 gstack 的 `bin/gstack-codex-probe` 做法。
+> 一行即可拿到 `codev_bg_native` / `codev_bg_sandboxed` 等函数——超时封装、隔离沙盒 + 只读仓库副本、
+> 退出码/超时的显式上报都集中在这一处，改一次全局生效。输出走会话目录（而非固定 `/tmp/codev-*`），
+> 避免并发的两个 `/codev` run 互相覆盖、清理误删。参考 gstack 的 `bin/gstack-codex-probe` 做法。
+
+---
+
+## 9. 隔离沙盒与只读仓库副本
+
+六个 agent 分两档跑：
+
+| 档 | agent | 只读保障 | 跑在哪 |
+|---|---|---|---|
+| **沙盒级只读** | codex、gemini | CLI 自带进程级限制（`-s read-only` / `--approval-mode plan`） | 真实仓库根 |
+| **隔离沙盒** | reasonix、qoderclicn、opencode、codebuddy | 三层：沙盒 + 只读工具白名单 + 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+
+第二档的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
+并已排除 `.env*`、`*.pem`、`*.key`、`id_rsa*`、`.netrc` 等常见密钥文件。
+
+**为什么给副本而不是空目录**：早期为了消灭越界写入风险，把这四个 agent 扔进空目录只喂提示词文本。
+风险是没了，但它们变成了**瞎子**——看不到 diff 之外的代码，遇到"这个不变量在别处成立吗""这个函数
+真实调用方是谁"只能标存疑，评审 spec 时更是只能靠 Claude 手工摘代码塞进提示词（易漏、易与仓库
+当前状态脱节），结果给出的"FAIL"往往不是真 bug，而是看不到代码导致的假阳性。
+给**副本**同时拿到两边：视野恢复了，物理隔离也还在（写入落在副本上，真仓库根本不在 cwd 里）。
+
+**注意隐私边界变了**：沙盒 agent 现在能读整个工作区并发给它自己的模型，不再只有 diff。
+密钥文件已排除、secret 扫描照做，但**挡不住硬编码在源码里的密钥**。仓库整体敏感时，
+让 Claude 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"（代价：那四个 agent 重新变瞎）。
+
+副本超过 100MB（`CODEV_MAX_COPY_KB`）或当前不是 git 仓库时，会自动退回空目录模式，
+启动行 `▶` 会标出实际用的是哪种。

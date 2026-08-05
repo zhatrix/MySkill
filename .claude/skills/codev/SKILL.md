@@ -28,12 +28,19 @@ allowed-tools:
 
 **铁律**
 - Claude 是**唯一改文件的人**。外部 agent 一律**只读**运行，只输出方案 / 评审 / 质疑，
-  绝不让它们改仓库文件。**只读靠双重保障**：能用原生只读旗标的用旗标（codex `-s read-only`、
-  gemini `--approval-mode plan`）；无完整原生只读的（reasonix / codebuddy 完全无；qoderclicn `--tools ""`、
-  opencode `--agent` 为半原生）按运行位置二选一：**(a) 首选——隔离空目录只喂提示词文本**（cwd 是空目录，够不到仓库，从根本上
-  免风险；此时只需 fan-out **整体**前后各做一次全局 `git status --porcelain` 兜底核对，不必逐 agent 快照）；
-  **(b) 确需在真实仓库 cwd 跑——则必须逐 agent 前后快照核对 + 串行**。发现改动即停下、逐字上报用户由其
-  处置（**不自动回滚**，以免误删用户未提交的工作；见 `agents.md` 只读风险总结）。
+  绝不让它们改仓库文件。**只读靠分级保障**：
+  - **沙盒级只读的两个**（codex `-s read-only`、gemini `--approval-mode plan`）→ `codev_bg_native`，
+    在**真实仓库根**跑，自己读文件、跑 `git diff`。
+  - **其余四个**（reasonix / qoderclicn / opencode / codebuddy）→ `codev_bg_sandboxed`，在
+    **隔离沙盒**里跑：cwd 是 `mktemp -d` 出来的沙盒，真实仓库**不在**里面，但沙盒内铺了一份
+    `./repo` —— 工作区（含未提交改动）的**只读副本**。它们既能读全部代码，写入又只能落到副本上、
+    随沙盒删掉。再叠加各自的只读/禁工具旗标（见 `agents.md` 表格）+ 提示词边界，共三层。
+  - **别把第二组挪进真实仓库**，除非确认其旗标是**沙盒级**而非"框架答应不调用写工具"
+    （opencode `--agent plan` 就是反例：`edit` 禁了但 `bash` 没禁）。确需如此则必须逐 agent
+    前后 `git status --porcelain` 快照核对 + 串行，发现改动即停下、逐字上报用户由其处置
+    （**不自动回滚**，以免误删用户未提交的工作；见 `agents.md` 只读风险总结）。
+- **沙盒 agent 的提示词必须带「工作副本」段落**（prompts.md），告诉它 `./repo` 可读——
+  否则它不知道自己有代码视野，会退化成只能对着内联文本猜，产出"无法验证前提"式的假阳性。
 - 外部 agent 的输出**逐字呈现**给用户，不总结、不裁剪、不美化。清楚标注来源与模型。
 - 每个要 fan-out（并行调多个外部 agent）的节点，先用 AskUserQuestion 让用户确认调用哪些
   agent（给推荐组合），因为这会消耗各自账号的额度。
@@ -61,6 +68,7 @@ chmod 600 "$CODEV_DIR/codev-lib.sh"
 source "$CODEV_DIR/codev-lib.sh" || { echo "FATAL: source 库失败"; exit 1; }
 echo "会话目录：$CODEV_DIR"   # ← 记住这个字面路径：后续每个后台调用都用它 source 库、读输出
 codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAILED）+ timeout 状态（见 agents.md）
+                   # 顺带 codev_sbox_gc：回收上一轮进程被杀时漏下的沙盒（里面有仓库副本，会堆磁盘）
 ```
 
 - 只把标 `OK` 的 agent 列入后续可选项。
@@ -137,11 +145,18 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
   收益不大**（每面只 1 个模型看、又无交叉），直接建议全量；N=2 若坚持分工，就二分（如 codex=架构/数据库/
   并发/错误处理，qoderclicn=UI/交互/依赖/构建）。
 
-### B. 文件系统边界
+### B. 文件系统边界 + 工作副本
 发给**每个**外部 agent 的提示词都必须前置 `references/prompts.md` 里的"文件系统边界"段落
 （禁止读取**用户主目录下**的私有配置 `~/.claude/`、`~/.agents/`、`~/agents/` 等——注意是绝对路径，
 **不**笼统禁止仓库内同名目录，业务代码若在 `agents/` 属正常评审对象；只看仓库代码；**禁止修改任何
 文件，只输出评审/建议**）。
+
+**沙盒 agent 额外前置「工作副本」段落**（同文件）：告诉它 cwd 下的 `./repo` 是工作区只读副本、
+可以自由 grep/读文件去核实，且 `./repo` 无 `.git`（git 命令跑不了，diff 已内联）。
+漏掉这段 = 副本白铺。
+
+**评审/挑战/spec 模板还要带「两档结论」**：强制 agent 把结论分成【已查证】和【需进一步核实的假设】
+两栏，别因为看不到某处代码就给整体 FAIL。第二栏由 F 之前的事实核查环节收口（见 synthesis.md 0.5）。
 
 ### C. 并行调用（后台执行，避免超时）
 > 经验：慢模型（reasonix/codebuddy 等）在**前台被 `timeout 240` 卡死**——用户直接手调这些 CLI 从不
@@ -155,12 +170,20 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 `source "$CODEV_DIR/codev-lib.sh"` 拿回全部库函数；输出也走会话目录内的**字面路径**
 `$CODEV_DIR/codev-out-<agent>.txt`（收到完成通知时你按此读；不能用随机 `mktemp`）。骨架「设 CODEV_DIR + source + 一行」：
 ```bash
-# —— 非原生只读 agent（reasonix/qoderclicn/opencode/codebuddy）：隔离空目录只喂文本 ——
+# —— 非原生只读 agent（reasonix/qoderclicn/opencode/codebuddy）：隔离沙盒 + ./repo 只读副本 ——
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"    # <会话目录> = Step 0 打印的字面路径
-PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"            # 提示词文件（前一步已写好）
-codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort medium
+PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"            # 提示词文件（前一步已写好，含「工作副本」段）
+codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
 # 首参是 agent 标签，其后是该 agent 的完整命令 argv（换成 agents.md 里目标 agent 的精确命令即可）。
-# 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 空目录 / umask 077(子shell内) / 捕 agent 退出码 / ✔或⚠️上报。
+# ⚠️ 各 agent 的必备旗标不同，务必照 agents.md 抄，别省：
+#   reasonix   --effort high -p          （medium 会直接报错退出，它是"默认 medium"的例外）
+#   qoderclicn --tools "Read,Glob,Grep" -p "…"   （只读工具白名单；别用 --tools ""，那会连读也禁掉）
+#   codebuddy  --effort minimal --max-turns 12 --tools "Read,Glob,Grep" -p "…"（缺了就容易空输出/超时）
+#   opencode   run --agent plan          （很慢，务必后台）
+# 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 沙盒 + ./repo 只读副本 /
+#            umask 077(子shell内) / 捕 agent 退出码 / 收尾删沙盒 / ✔或⚠️上报。
+# 副本超体积闸门（默认 100MB）或非 git 仓库时自动退回空目录模式，▶ 行会标出；
+# 想强制旧的"空目录只喂文本"：调用前 export CODEV_SANDBOX_MODE=text。
 
 # —— 原生只读 agent（codex/gemini）：无需沙盒，在仓库根跑 ——
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
@@ -168,11 +191,15 @@ cd "$(git rev-parse --show-toplevel)"
 PROMPT="$CODEV_DIR/codev-prompt-codex.txt"
 codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort="medium"'
 ```
-- **推理强度默认 `medium`**（防慢）；发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（只发相关 diff/
-  文件，别把无关内容全塞进去——越大越慢越易超时）；
+- **推理强度默认 `medium`**（防慢）；**例外：reasonix 必须 `high`/`max`**（DeepSeek thinking 模型
+  拒绝 medium，实测直接 exit=1）；
+- **提示词体积**：发送前 `wc -c "$PROMPT"`，**超大（> 100KB）就精简**（codebuddy 更严，压到 30KB 内）。
+  有了 `./repo` 副本，**本来就不该再把大段既有代码内联进提示词**——只给 diff / spec 正文，
+  其余让 agent 自己去 `./repo` 读。这同时解决了以前 spec 评审要手工摘代码、易漏易脱节的问题；
 - **无 timeout 时**：`codev_bg_*` 会自动跳过该 agent（后台裸跑=永久挂起）并清空其旧输出文件；确要它参与就改前台串行或装 coreutils；
-- **只读隔离**：codex/gemini 用 `codev_bg_native`（原生只读，可并行）；reasonix/qoderclicn/opencode/codebuddy
-  用 `codev_bg_sandboxed`（空目录只喂文本，见 agents.md (a)/(b)）；
+- **只读隔离**：codex/gemini 用 `codev_bg_native`（沙盒级只读，在真实仓库根跑，可并行）；
+  reasonix/qoderclicn/opencode/codebuddy 用 `codev_bg_sandboxed`（隔离沙盒 + `./repo` 只读副本，
+  见 agents.md (a)/(a')/(b)）；
 - **库缺失即中止**：Step 0 的 `cp`/`source` 已带 `|| exit 1`，库拷贝失败会直接停下报错（不再"手抄内联"——
   98 行库靠人肉内联极易出错）。若真遇到，检查 `<SKILL_DIR>` 是否替换成头部 Base directory 字面值后重跑 Step 0。
 
@@ -210,6 +237,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 ### F. 跨模型综合
 所有 agent 返回后，按 `references/synthesis.md`：
+- **先做事实核查回填**（synthesis.md 0.5，**不可跳过**）：把各 agent「需进一步核实的假设」栏合并成
+  一张清单，逐条由 Claude 自己读代码核实、或交给 codex（有真实仓库权限）核实，回填
+  成立/不成立/待定后再进矩阵。**agent 因看不到代码给的整体 FAIL 不直接采纳**；
 - **全量模式**：一致性矩阵（都发现 / 多数发现 / 仅某 agent 发现）+ Claude 裁决（采纳/存疑/驳回）；
 - **分工模式**：按**关注面拼合**各 agent 结论（不做一致性矩阵，因无重叠），某块只有一个模型看过要
   标注"置信有限、无交叉验证"；
@@ -262,13 +292,22 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    ```
    命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围；未命中再继续。
+
+   > ⚠️ **`./repo` 只读副本让"发送范围"变大了**：沙盒 agent 能读整个工作区并把内容发给它自己的模型，
+   > 不再只有 diff。`codev_repo_copy` 已 `--exclude` 掉常见密钥文件（`.env*`、`*.pem`、`*.key`、
+   > `id_rsa*`、`.netrc`、`.npmrc` 等）且不含 `.git`，但**挡不住硬编码在源码里的密钥**。
+   > 所以上面这轮 secret 扫描照做不误。若仓库整体敏感（含客户数据、私有密钥、合规限制），
+   > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"，并告知用户此时沙盒 agent 会看不到
+   > diff 之外的代码、结论置信度下降。**首次在一个新仓库启用副本模式时，向用户说明这一点。**
 4. 并行发出（B/C）：
    - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**：prompt 里含文件系统边界 +
      "请自己跑 `git diff <BASE>...HEAD` 只评审这些改动 + 关注点"，从而**不带 `--base`/`--commit`**（避开
      `[PROMPT]` 与它们的 argv 互斥）、也**不带 `-s`/`-C`**（review 不认这俩），须从仓库根跑。这样保住了
      自定义关注点（详见 agents.md）；
-   - 其它 agent 用 prompts.md 的 **review 模板** + `git diff "$BASE"` 内容（经上面扫描后），走 `codev_bg_sandboxed`。
-5. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）+ **PASS/FAIL 门禁**。
+   - 其它 agent 用 prompts.md 的 **review 模板**（含「工作副本」+「两档结论」段）+ `git diff "$BASE"`
+     内容（经上面扫描后），走 `codev_bg_sandboxed`。**只内联 diff**，diff 之外的既有代码不必再手工摘录——
+     让它们自己去沙盒里的 `./repo` 读。
+5. 运行时显示（D）→ 忠实呈现（E）→ **事实核查回填** → 综合（F）+ **PASS/FAIL 门禁**。
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
    一致率。
 7. 询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
