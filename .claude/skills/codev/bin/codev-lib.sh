@@ -140,7 +140,7 @@ codev_repo_master() {
             --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
             --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
             --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
-            --exclude='*credentials*' --exclude='*.tfvars' --exclude='*.tfstate' --exclude='*.tfstate.*' \
+            --exclude='*.tfvars' --exclude='*.tfstate' --exclude='*.tfstate.*' \
             --exclude='.git' \
         | ( cd "$CODEV_MASTER.partial" && tar -xf - ) ) 2>/dev/null \
       || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
@@ -148,13 +148,21 @@ codev_repo_master() {
     # 链接，agent 经 ./repo/link 就能读到沙盒外的真实文件；更糟的是【能写穿】——实测
     # `chmod -R a-w` 之后 `echo X > repo/link` 仍成功改掉了真实目标（chmod 只改 symlink
     # 自身权限位，不保护目标）。那会击穿"写入只落在副本上"这条主防线，故一律删掉链接。
+    find "$CODEV_MASTER.partial" -type l -delete 2>/dev/null
     # 大小写盲区：--exclude 的 fnmatch 大小写敏感（实测 UPPER.KEY / .ENV 不被排除），
     # 故再用 -iname 做一轮大小写不敏感清扫兜底。
-    find "$CODEV_MASTER.partial" -type l -delete 2>/dev/null
-    find "$CODEV_MASTER.partial" \( -iname '.env' -o -iname '*.env' -o -iname '.env.*' \
-         -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.p12' \
-         -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '*.jks' -o -iname '.netrc' \
-         -o -iname '.npmrc' -o -iname '*credentials*' -o -iname '*.tfvars' \) -delete 2>/dev/null
+    # ⚠️ 必须加 -type f，且 credentials 这类【无扩展名】的密钥文件只能在这里挡、不能进 tar 的
+    # --exclude：tar 的 --exclude 按【路径分量】匹配，会连目录一起挡掉——`*credentials*` 或
+    # 光秃秃的 `credentials` 都会整体吃掉 `src/credentials/` 目录（实测连不含密钥的 util.ts
+    # 一起没了，`--exclude=./credentials` 锚定也无效）。而 `find -type f` 天然匹配不到目录，
+    # 正好只删掉真的凭证文件。`credentials.go`、`credentials_manager.dart`、`src/credentials/`
+    # 这类合法源码在真实项目里极常见，误删会让 agent 对着缺文件的副本评审 → 假阳性。
+    # 宁可漏挡一个少见的密钥文件名（secret 扫描仍会兜），也不能删用户的源码。
+    find "$CODEV_MASTER.partial" -type f \( -iname '.env' -o -iname '.env.*' \
+         -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.p12' \
+         -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '.netrc' \
+         -o -iname '.npmrc' -o -iname 'credentials' -o -iname 'credentials.json' \
+         -o -iname '*.tfvars' -o -iname '*.tfstate' \) -delete 2>/dev/null
     # mv 前守卫：目标已存在时 `mv dir existingdir` 会把源【移进】目标里（实测 rc=0，
     # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
     [ -e "$CODEV_MASTER" ] && { rm -rf "$CODEV_MASTER.partial"; exit 0; }   # 别人已铺好，复用

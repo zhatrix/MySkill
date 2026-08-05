@@ -187,8 +187,11 @@ codev/
 第二档的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
 并已排除常见密钥文件：`.env` / `*.env` / `.env.*` / `.envrc`、`*.pem` / `*.key` / `*.p12` / `*.pfx`、
 `id_rsa*` / `id_dsa*` / `id_ecdsa*` / `id_ed25519*`、`*.keystore` / `*.jks`、`.netrc` / `.npmrc`、
-`*credentials*`、`*.tfvars` / `*.tfstate*`。因 tar 的 `--exclude` **大小写敏感**，解包后还会用
-大小写不敏感的 `-iname` 再扫一轮（挡 `.ENV`、`UPPER.KEY` 这类变体）。
+`credentials` / `credentials.json`、`*.tfvars` / `*.tfstate*`。因 tar 的 `--exclude` **大小写敏感**，
+解包后还会用 `find -type f -iname` 再扫一轮（挡 `.ENV`、`UPPER.PEM` 这类变体）。
+> 副作用：`*.key` / `*.env` 会连带挡掉 `src/keymap.key`、`config/test.env` 这类**合法**文件——
+> 有意的 security-first 取舍。反之，`src/credentials/` 这类**目录**不会被误删（凭证文件只按
+> 文件名精确挡，不用宽通配，详见 `references/agents.md`）。
 **tracked 符号链接一律删除**——它们能让 agent 经 `./repo/link` 读到、甚至写穿到沙盒外的真实文件
 （`chmod -R a-w` 只改链接自身权限位，不保护目标，实测可写穿）。
 

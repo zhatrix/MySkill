@@ -126,9 +126,24 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
    untracked、以及被它 `.gitignore` 忽略的文件都一起打包（实测 `sub/untracked_secret.txt` 进了包）。
    加 `--no-recursion` 后目录项只建空目录、不下钻；普通文件因 `ls-files` 已逐个列出，不受影响。
 
-密钥过滤是**两道**：tar 的 `--exclude`（大小写敏感）+ 解包后一轮 `-iname` 大小写不敏感清扫
-（挡 `.ENV`、`UPPER.KEY` 这类变体，实测 `--exclude` 确实漏它们）。两道都只认**文件名**，
+密钥过滤是**两道**：tar 的 `--exclude`（大小写敏感）+ 解包后一轮 `find -type f -iname` 大小写
+不敏感清扫（挡 `.ENV`、`UPPER.PEM` 这类变体，实测 `--exclude` 确实漏它们）。两道都只认**文件名**，
 挡不住硬编码在源码里的密钥 —— Step 2B 的 secret 扫描仍然必须做。
+
+**过滤模式的两条硬约束**（都是踩过的坑，改清单前务必先看）：
+
+1. **tar 的 `--exclude` 按【路径分量】匹配，会连目录一起挡掉。** 所以宽通配是禁区：
+   `*credentials*`（甚至光秃秃的 `credentials`）会整体吃掉 `src/credentials/` 整棵子树，
+   连里面不含密钥的文件一起消失，`--exclude=./credentials` 锚定也无效。无扩展名的凭证文件
+   （`credentials`、`credentials.json`）只在**后置 `find -type f -iname`** 里挡——
+   `-type f` 天然匹配不到目录，正好只删真的凭证文件。
+2. **后置 `find` 必须带 `-type f`。** 不加会匹配到目录，`-delete` 虽拒删非空目录，
+   但空目录/单文件目录仍会连带整棵子树消失。
+
+**已知的假阳性（security-first 的有意取舍，非 bug）**：`*.key` 和 `*.env` 会连带挡掉
+`src/keymap.key`、`config/test.env` 这类合法文件。判断标准是"宁可漏挡一个少见的密钥文件名
+（secret 扫描仍会兜底），也绝不删用户的源码"——所以**只对确定是密钥载体的模式用通配**。
+若某仓库确实因此丢了关键文件、导致 agent 评审失真，用 `CODEV_SANDBOX_MODE=text` 或临时调整清单。
 
 ### 母本 + clone：每会话只 tar 一次
 
