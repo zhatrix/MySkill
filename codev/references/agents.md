@@ -311,23 +311,37 @@ fi
 
 ## codebuddy — 腾讯（Claude Code 分支）
 
-- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）。
+  **`--max-turns` 按任务定档，别一律 12**：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  # 轻量咨询 / 纯 diff 意见（不要求逐条进 ./repo 核实）：
   codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 12 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
+  # 核实型评审（提示词要求"读 ./repo 核实事实"，spec/多轮评审都算）：
+  codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 64 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   ```
 - **只读保证**：`--tools "Read,Glob,Grep"`（只读工具白名单，同 qoderclicn 的 harness 级强制）
   + `-p` 非交互 + 沙盒 + 提示词强约束。不要用 `-y` / `--dangerously-skip-permissions` /
   `--permission-mode bypassPermissions`。同样**别用 `--tools ""`**（会连读文件也禁掉）。
-- **⚠️ 空输出/超时问题（历史）**：过去实测 `codebuddy -p` 常无 stdout 或撞 timeout。
-  **实测加上 `--effort minimal --max-turns 12 --tools "Read,Glob,Grep"` 后恢复正常**（秒级返回、
-  正确读了 `./repo` 里的文件）——此前很可能是**放开全部工具 + 默认高 effort 导致 agent 无限兜圈**，
-  而非登录/API 问题。所以**这三个旗标当作 codebuddy 的必备参数**，别省。
+- **⚠️ turn 预算是 codebuddy 评审失败的头号死因（2026-08-11 实测 8 次调用 6 败）**：
+  核实型评审实际需要 **60+ 次 Read/Grep**（两次成功轮分别 63、65 次调用才出稿），
+  `--max-turns 12` 下终稿一个字没写就被掐掉（stderr `Max turns (12) exceeded`、stdout 空）。
+  且 **turn ≠ 调用数**：模型合批时 12 turns 能发 23 次调用，不合批时 40 turns 就只有 40 次——
+  同参数成败全看当轮是否合批，这就是"时好时坏"的来源。另一头是 `codev_run` 的 600s 上限：
+  不限 turns 实测 86 次调用后被超时杀掉（同样零输出）。所以两条都要做：
+  **① 评审用 64 turns；② 用下面的"收窄核实范围"把调用数压进 600s 窗口**。
+  `--effort minimal` 与 `--tools` 白名单仍是必备（放开全部工具 + 默认高 effort 曾致无限兜圈）。
+- **收窄核实范围（评审提示词必做）**：不要笼统写"逐条到 ./repo 核实"——那会把 turn 和 600s
+  都烧穿。在提示词里明确：**只核实最关键的 3-5 个论断（点名文件/函数），其余凭 diff/摘录判断**；
+  或把关键代码片段直接内联进提示词（注意下条体积上限），少读盘。
 - **控制提示词体积**：codebuddy 对大提示词最敏感。给它的 prompt 建议**压到 30KB 以内**
-  （比全局 100KB 阈值更严）——有了 `./repo` 副本，本来也不必再把大段代码内联进去，让它自己读。
-- 仍然空输出/超时时：判定本次不可用，**跳过它**并如实告诉用户
-  "codebuddy 无输出/超时（可能原因：未登录 / API 异常 / 上下文超限），已跳过；可运行
-  `codebuddy` 交互登录后重试"。
+  （比全局 100KB 阈值更严）——有了 `./repo` 副本，大段代码可让它自己读，但读盘吃 turn，
+  取舍标准：少数关键片段内联省 turn，全量代码靠 `./repo` + 收窄核实范围。
+- 仍然空输出/超时时：**先读 `codev-err-codebuddy.txt` 分诊**，别一律归因登录：
+  `Max turns (N) exceeded` → turn 预算问题，按上两条调档/收窄后重试一次；
+  `400 invalid parameter value` → 服务端拒首条请求，多为 CLI 版本过旧（2026-08-11 实测
+  升级 CLI 后消失），提示用户升级 codebuddy；其余（空 stderr / 鉴权字样）才判不可用，
+  **跳过它**并如实告诉用户"codebuddy 无输出/超时，已跳过；可运行 `codebuddy` 交互登录后重试"。
 - **鉴权**：`codebuddy`（交互登录）。
 - **角色**：中文语境下的代码评审。
 
