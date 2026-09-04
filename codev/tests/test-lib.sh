@@ -60,9 +60,9 @@ echo "9. 账本：以上每次 report 追加一行，字段=时间 agent 类别 
 [ -f "$CODEV_LEDGER" ] || bad "账本文件不存在"
 n=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
 [ "$n" = 8 ] && ok "8 行" || bad "行数 $n ≠ 8" "$(cat "$CODEV_LEDGER")"
-grep -q "	qoderclicn	quota	" "$CODEV_LEDGER" && ok "qoderclicn quota" || bad "qoderclicn 未记 quota" "$(cat "$CODEV_LEDGER")"
-grep -q "	codex	ok	" "$CODEV_LEDGER" && ok "codex ok" || bad "codex 未记 ok"
-grep -q "	reasonix	timeout	" "$CODEV_LEDGER" && ok "reasonix timeout" || bad "reasonix 未记 timeout"
+grep -q "	qoderclicn	[^	]*	quota	" "$CODEV_LEDGER" && ok "qoderclicn quota" || bad "qoderclicn 未记 quota" "$(cat "$CODEV_LEDGER")"
+grep -q "	codex	[^	]*	ok	" "$CODEV_LEDGER" && ok "codex ok" || bad "codex 未记 ok"
+grep -q "	reasonix	[^	]*	timeout	" "$CODEV_LEDGER" && ok "reasonix timeout" || bad "reasonix 未记 timeout"
 
 echo "10. codev_probe 展示每个 agent 最近结果（近期账本摘要）"
 r=$(codev_probe 2>&1)
@@ -101,6 +101,77 @@ tokens used
 9,999"
 r=$(report codex 0)
 case "$r" in *"✔"*截断*"usage limit"*) ok "✔+警告";; *) bad "缺截断警告" "$r";; esac
+
+echo "15. 模型识别：codex 从 stderr banner 取 model；其它 agent 取 CODEV_MODEL_<agent>；都没有则 unknown"
+mk codex "body" "OpenAI Codex v0.152.0
+--------
+model: gpt-5.6-sol
+provider: openai"
+[ "$(codev_model_of codex)" = "gpt-5.6-sol" ] && ok "codex banner" || bad "codex model=$(codev_model_of codex)"
+CODEV_MODEL_reasonix=deepseek-v4; [ "$(codev_model_of reasonix)" = "deepseek-v4" ] && ok "env override" || bad "env override=$(codev_model_of reasonix)"
+unset CODEV_MODEL_reasonix; [ "$(codev_model_of gemini)" = "unknown" ] && ok "unknown" || bad "unknown=$(codev_model_of gemini)"
+
+echo "16. 账本行含 会话 与 模型 两列；429 行把重置时间写进 note 列"
+: > "$CODEV_LEDGER"
+mk codex "body" "model: gpt-5.6-sol"
+report codex 0 >/dev/null
+mk codebuddy "" "429 您的使用量已超出频率限制，将在 2026-09-04 15:51:10 UTC+8 重置，您也可以切换其他模型继续使用。"
+report codebuddy 1 >/dev/null
+sess=$(basename "$CODEV_DIR")
+grep -q "^[^	]*	$sess	codex	gpt-5.6-sol	ok	" "$CODEV_LEDGER" && ok "session+model 列" || bad "列不对" "$(cat "$CODEV_LEDGER")"
+grep -q "	codebuddy	[^	]*	quota	.*重置 2026-09-04 15:51:10" "$CODEV_LEDGER" && ok "重置时间进 note" || bad "缺重置时间" "$(cat "$CODEV_LEDGER")"
+r=$(codev_probe 2>&1); case "$r" in *codebuddy*quota*15:51*) ok "probe 显示重置时间";; *) bad "probe 未显示重置时间" "$(printf '%s' "$r" | grep codebuddy)";; esac
+
+echo "17. 成本：reasonix metrics 取 cost+currency；本会话汇总行按 agent 列 用时/tokens/成本"
+mk reasonix "OK" ""
+cat > "$CODEV_DIR/codev-metrics-reasonix.json" <<'JSON'
+{ "prompt_tokens": 100, "completion_tokens": 5, "cost": 0.052425, "currency": "CNY", "x": { "cost": 9.9 } }
+JSON
+r=$(CODEV_T0=$(( $(date +%s) - 3 )) report reasonix 0)
+case "$r" in *"tokens 105"*"0.052 CNY"*) ok "tokens+cost";; *) bad "缺 cost" "$r";; esac
+r=$(codev_session_summary)
+case "$r" in *reasonix*105*0.052*CNY*) ok "汇总含 reasonix";; *) bad "汇总缺" "$r";; esac
+case "$r" in *codex*gpt-5.6-sol*) ok "汇总含模型";; *) bad "汇总缺模型" "$r";; esac
+rm -f "$CODEV_DIR/codev-metrics-reasonix.json"
+
+echo "18. 发现台账：codev_finding_add 追加结构化行；codev_stats 按 agent+模型算 P1 精确率与独家命中"
+export CODEV_FINDINGS="$CODEV_DIR/findings.tsv"
+codev_finding_add ntms spec-a 1 codex gpt-5.6-sol r1-codex-01 P1 A 采纳 成立 独家 "register_payment 漏 tenant_id"
+codev_finding_add ntms spec-a 1 codex gpt-5.6-sol r1-codex-02 P1 A 驳回 不成立 独家 "说 advisory 锁不存在"
+codev_finding_add ntms spec-a 1 reasonix deepseek-v4 r1-reasonix-01 P2 B 采纳 成立 共同 "seq 唯一约束措辞"
+codev_finding_add ntms spec-a 2 codex gpt-5.6-sol r2-codex-01 P1 A 采纳 成立 共同 "含	制表符	的描述"
+n=$(wc -l < "$CODEV_FINDINGS" | tr -d ' '); [ "$n" = 4 ] && ok "4 行" || bad "行数 $n" "$(cat "$CODEV_FINDINGS")"
+awk -F'\t' 'NF!=13{bad=1} END{exit bad}' "$CODEV_FINDINGS" && ok "每行 13 列（制表符已转义）" || bad "列数不齐" "$(awk -F'\t' '{print NF}' "$CODEV_FINDINGS")"
+r=$(codev_stats)
+case "$r" in *"codex"*"gpt-5.6-sol"*) ok "stats 含 codex";; *) bad "stats 缺 codex" "$r";; esac
+# codex: 声称 P1 3 条(r1-01 成立, r1-02 不成立, r2-01 成立) → 成立 2/3；独家且成立 1
+case "$r" in *"2/3"*) ok "P1 精确率 2/3";; *) bad "精确率错" "$r";; esac
+case "$r" in *"reasonix"*"0/0"*) ok "reasonix 无 P1 显示 0/0";; *) bad "reasonix 行错" "$r";; esac
+
+echo "19. 回流 commit：只提交 pathspec，trailer 带轮次/评审方/P1 数；无关脏文件不入库；能按 trailer 找回上一轮 commit"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && mkdir -p docs src && echo v1 > docs/spec.md && echo a > src/a.py && git add -A && git commit -qm init \
+  && echo v1.1 > docs/spec.md && echo dirty > src/a.py \
+  && codev_commit_round docs/spec.md 1 "codex(gpt-5.6-sol), reasonix(deepseek-v4)" 2 - "spec v1.0→v1.1：回流 2 条 P1" "Co-Authored-By: X <x@y>" >/dev/null \
+  && git status --porcelain > /tmp/codev-st.txt && git log -1 --format=%B > /tmp/codev-msg.txt \
+  && echo v1.2 > docs/spec.md \
+  && codev_commit_round docs/spec.md 2 "codex(gpt-5.6-sol)" 0 2 "spec v1.1→v1.2" >/dev/null \
+  && codev_prev_round_commit docs/spec.md 2 > /tmp/codev-prev.txt \
+  && git log --format=%H -2 > /tmp/codev-hashes.txt )
+grep -q '^ M src/a.py' /tmp/codev-st.txt && ok "无关脏文件未入库" || bad "脏文件被提交" "$(cat /tmp/codev-st.txt)"
+grep -q '^Codev-Round: 1$' /tmp/codev-msg.txt && ok "Codev-Round trailer" || bad "缺 Codev-Round" "$(cat /tmp/codev-msg.txt)"
+grep -q '^Codev-Reviewed-By: codex(gpt-5.6-sol), reasonix(deepseek-v4)$' /tmp/codev-msg.txt && ok "Reviewed-By" || bad "缺 Reviewed-By" "$(cat /tmp/codev-msg.txt)"
+grep -q '^Codev-Verified-P1: 2 (prev -)$' /tmp/codev-msg.txt && ok "Verified-P1" || bad "缺 Verified-P1" "$(cat /tmp/codev-msg.txt)"
+grep -q '^Co-Authored-By: X <x@y>$' /tmp/codev-msg.txt && ok "额外 trailer 透传" || bad "缺额外 trailer" "$(cat /tmp/codev-msg.txt)"
+[ "$(cat /tmp/codev-prev.txt)" = "$(sed -n 2p /tmp/codev-hashes.txt)" ] && ok "找回第 1 轮 commit" || bad "prev commit 错" "$(cat /tmp/codev-prev.txt) vs $(cat /tmp/codev-hashes.txt)"
+rm -rf "$REPO" /tmp/codev-st.txt /tmp/codev-msg.txt /tmp/codev-prev.txt /tmp/codev-hashes.txt
+
+echo "20. 归档：codev_archive 把本会话 prompt/out/err/metrics 复制到 <repo>/.superpowers/codev/<slug>/r<N>/，并保证被 git 忽略"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); mk codex "body" "err"; printf 'p' > "$CODEV_DIR/codev-prompt-codex.txt"
+( cd "$REPO" && git init -q && codev_archive spec-a 2 >/dev/null && ls .superpowers/codev/spec-a/r2/ > /tmp/codev-ar.txt && git check-ignore -q .superpowers/codev/spec-a/r2/codev-out-codex.txt && echo ignored >> /tmp/codev-ar.txt )
+grep -q 'codev-out-codex.txt' /tmp/codev-ar.txt && ok "已归档" || bad "未归档" "$(cat /tmp/codev-ar.txt)"
+grep -q '^ignored$' /tmp/codev-ar.txt && ok "被 git 忽略（.git/info/exclude）" || bad "未忽略" "$(cat /tmp/codev-ar.txt)"
+rm -rf "$REPO" /tmp/codev-ar.txt
 
 rm -rf "$CODEV_DIR"
 echo; echo "pass=$pass fail=$fail"

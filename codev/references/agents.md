@@ -35,7 +35,13 @@
 | `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
 | `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；stderr 只看以 ERROR/错误/三位状态码开头的"错误行"，不扫 codex 回显的提示词。 |
 | `codev_tokens <agent>` | 能取到才输出 `tokens N`：codex 取 stderr "tokens used"；reasonix 取 `--metrics` 写的 JSON（prompt+completion）。取不到输出空串。 |
-| `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；TSV：时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
+| `codev_model_of <agent>` | 模型名：`CODEV_MODEL_<agent>` 环境变量 > codex stderr banner `model:` 行 > `unknown`。调用前 `export CODEV_MODEL_reasonix=deepseek-v4` 之类。 |
+| `codev_cost <agent>` / `codev_session_summary` | reasonix `--metrics` 的 cost/currency；本会话所有调用的 用时/tokens/成本 一览（fan-out 结束后打印）。 |
+| `codev_finding_add …` / `codev_stats [repo]` | 发现台账（`CODEV_FINDINGS`，默认 `~/.local/state/codev/findings.tsv`，13 列）；统计每个 agent/模型的 P1 亲验成立率、独家成立数。awk 用 `LC_ALL=C`：macOS 自带 awk 在 UTF-8 下 `"不成立"=="成立"` 判真。 |
+| `codev_commit_round <path> <round> <reviewers> <p1> <prev_p1> <summary> [trailer…]` | 回流 commit：只 `git add -- <path>`（绝不 `-A`），trailer 块 `Codev-Round` / `Codev-Reviewed-By` / `Codev-Verified-P1` + 透传 trailer。无改动则拒绝提交。 |
+| `codev_prev_round_commit <path> <round>` | 找触及 path 且 `Codev-Round: <round-1>` 的最近 commit，供 `git diff` 内联两版差异。 |
+| `codev_archive <slug> <round>` | 把本会话 prompt/out/err/metrics 复制到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`，并用 `.git/info/exclude` 保证不入库。 |
+| `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
 | `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟**（沙盒天生短命，上限 CODEV_TIMEOUT ≤ 3000s，不会误删并发 run 的活沙盒）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |

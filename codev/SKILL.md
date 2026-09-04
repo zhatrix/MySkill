@@ -15,6 +15,7 @@ allowed-tools:
   - Grep
   - AskUserQuestion
   - Monitor
+  - Agent
 ---
 
 # codev — 多 agent 协作开发
@@ -73,6 +74,9 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 - **近期结果账本**（`~/.local/state/codev/ledger.tsv`，库自动记）是选 agent 的第一依据：某 agent 最近
   两次都是 `quota`/`auth` → 默认不放进推荐组合，只在用户点名时才用并提前说明"上次是额度耗尽"；
   最近是 `timeout`/`turns` → 提示"上次超时，这次收窄范围/提高 CODEV_TIMEOUT"。
+- **发现台账**（`~/.local/state/codev/findings.tsv`，Claude 在综合后用 `codev_finding_add` 逐条记）：
+  `codev_stats` 给每个 agent/模型的"声称 P1 里亲验成立的比例"和"独家且成立"数。样本少于 20 条时只当参考，
+  不据此改推荐组合；累积够了在 A1 的选项描述里附一句"近 N 条 P1 成立率 x/y"。
 - **超时**：`CODEV_TIMEOUT` 默认 600s，只是兜底卡死进程的安全网。**核实型任务（要求 agent 进仓库逐条核实、
   或文档 > 20KB）在发起后台调用前 `export CODEV_TIMEOUT=1200`**（每个后台调用自包含，须在各自命令里设）。
 
@@ -109,7 +113,10 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 - `--agents codex,reasonix`：用户已点名 agent 组合 → **跳过 A1 的 AskUserQuestion**，直接用（仍只取 Step 0 为 OK 的）。
   用户在本对话里明说过"就用 X+Y，别再问"也同样生效，直到用户改口。
 - `--round N`：多轮评审的轮次（默认 1）。N ≥ 2 时按 synthesis.md §6「多轮回流协议」走：提示词标题带轮次、
-  附上一轮已采纳发现清单要求回归核对、轮间先做 Claude 自审。
+  附上一轮发现清单（含已驳回项）要求回归核对、内联两版文档的 `git diff`、外审前先做 fresh-subagent 自审。
+- `--auto [--max-rounds K]`（默认 K=3，上限 5）：自动连跑多轮直到收敛，**只在开始时问一次**（agent 组合 +
+  轮次上限 + 预算），之后每轮自审 → 外审 → 综合 → 回流 → `codev_commit_round` 提交，不再逐轮询问。
+  停止条件与流程见 synthesis.md §6.3。没有 `--auto` 时每轮结束仍停下问用户是否开下一轮。
 - `review` 的首个非开关参数若是**存在的文件路径**（`.md`/`.txt`/`.rst`），就是文档评审（Step 2F），不是关注点。
 
 **自动检测（无参数）**：
@@ -221,6 +228,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 - **开放式"逐条核对"必超时**（codex / qoderclicn / reasonix 都实测过 600s 双杀）：核实型提示词一律
   **点名 3-8 个最关键论断**（文件/函数/表名）让它核实，其余凭文本判断；这条对所有 agent 通用，不只 codebuddy；
 - **reasonix 加 `--metrics "$CODEV_DIR/codev-metrics-reasonix.json"`**（实测可用），E 呈现时才有 token/成本；
+- **模型名进账本**：每个后台调用里 `export CODEV_MODEL_<agent>=<模型>`（值取自你传的 `-m/--model`，或该 CLI 的
+  默认模型；codex 不用设，库从 stderr banner 取）。没设就记 `unknown`，commit trailer 与统计都会失真；
 - **无 timeout 时**：`codev_bg_*` 会自动跳过该 agent（后台裸跑=永久挂起）并清空其旧输出文件；确要它参与就改前台串行或装 coreutils；
 - **只读隔离**：codex/gemini 用 `codev_bg_native`（沙盒级只读，在真实仓库根跑，可并行）；
   reasonix/qoderclicn/opencode/codebuddy 用 `codev_bg_sandboxed`（隔离沙盒 + `./repo` 只读副本，
@@ -233,21 +242,14 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 非 ✔ 的一律**本轮无效**：不呈现其输出文件内容（额度错误串常被打到 stdout，exit 还是 0——qoderclicn 实测），
 不计入矩阵，如实告知类别与 stderr 错误行（含 429 的重置时间），不阻塞其它 agent。
 `✔` 但附"stderr 含错误行"→ 正文可能被截断，呈现前核对是否有完整结论段。实时盯用 `Monitor` 跟踪输出路径（见 D）。
+全部 agent 结束后跑一次 `codev_session_summary`（用时/tokens/成本一览）并原样打印。
 
-### D. 运行时显示（当前 agent / 模型 / 交互内容）
-让用户始终知道"现在谁在跑、用什么模型、在聊什么"：
-运行时显示由两部分实现：**你（Claude）在发起/收到通知时打印状态板** + 后台任务自身 stdout 的
-`▶/✔/⏭/⚠️` 行（由库函数 `codev_bg_*` / `codev_report` 打印）。二者结合让用户看到进度。
-1. **启动即报**：发出这批后台调用的同时，你打印一次状态清单，每 agent 一行：
-   `▶ codex（模型 GPT）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式把"范围"写成该 agent 关注面）。
-2. **实时交互内容**（可选）：想盯某个慢 agent，用 `Monitor`（已在 allowed-tools）跟踪它的**字面输出
-   路径** `$CODEV_DIR/codev-out-<agent>.txt`，它随文件新增行推事件、随进程结束自动停。**不要**用 `tail -f` 起
-   后台任务（不自然结束、制造悬挂进程）；只想瞄一眼就用有界的 `tail -n 20 "$CODEV_DIR/codev-out-<agent>.txt"`。
-   （不为监控给 codex 加 `--json`——那样正文变 JSONL、E 的逐字呈现会展示机器码；监控只看纯文本流水。）
-3. **完成即翻牌**：收到某 agent 完成通知后，把它那行更新为 `✔ codex 完成` / `⏭ reasonix 跳过（超时）` /
-   `⚠️ opencode 非零退出`（与 `codev_report` 打印的一致）；**token/用时能取到才加** `（tokens N｜用时 Ss）`
-   （仅 codex 可靠取 token，取不到就省略括号，别编造）。
-4. 全部结束后进入 E 的**逐字呈现**。运行时显示只给"过程感"，不替代最终逐字原文。
+### D. 运行时显示
+两部分：**你在发起/收到通知时打印状态板** + 后台任务 stdout 的 `▶/✔/⏭/⛔/⚠️` 行（库函数打印）。
+1. 启动即报，每 agent 一行：`▶ codex（模型 gpt-5.6-sol）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式"范围"写关注面）。
+2. 想盯某个慢 agent：`Monitor` 跟踪 `$CODEV_DIR/codev-out-<agent>.txt`；**不要**后台 `tail -f`（悬挂进程）；不为监控给 codex 加 `--json`。
+3. 完成即翻牌：照抄 `codev_report` 的翻牌行（类别 + 用时/tokens/成本，取不到就不写）。
+4. 全部结束后打印 `codev_session_summary`，再进 E。
 
 ### E. 忠实呈现
 每个 agent 的原始输出用分隔框逐字呈现：
@@ -270,6 +272,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 - **全量模式**：一致性矩阵（都发现 / 多数发现 / 仅某 agent 发现）+ Claude 裁决（采纳/存疑/驳回）；
 - **分工模式**：按**关注面拼合**各 agent 结论（不做一致性矩阵，因无重叠），某块只有一个模型看过要
   标注"置信有限、无交叉验证"；
+- **先给每条发现编号** `r<轮次>-<agent>-<两位序号>`（如 `r2-codex-03`），矩阵、裁决、回归核对、已驳回清单全部引用编号
+  （synthesis.md 0.4）；综合完成后逐条 `codev_finding_add` 记入发现台账；
 - **P1 采纳前必须 Claude 亲验前提**（synthesis.md 0.6，**不分 A/B 栏**）：agent 标"已查证"的也翻过车
   （枚举存在≠路径可达、"同构"未看触发时序、grep 失败被说成"不存在"）；agent 之间矛盾**以代码为准**；
 - review 模式额外给 **PASS / FAIL 门禁**（出现**已亲验成立**的 P1/critical 即 FAIL）；
@@ -352,7 +356,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 5. 运行时显示（D）→ 忠实呈现（E）→ **事实核查回填 + P1 亲验** → 综合（F）+ **PASS/FAIL 门禁**。
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
    一致率。
-7. 询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
+7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
+   修复后的 commit 同样走 `codev_commit_round <pathspec> …`：首参是一个 git pathspec，多文件时给它们的公共目录
+   （函数会打印暂存的 `--stat`，核对没有把用户的无关改动带进去；有就先 `git reset -- <无关文件>`）。
 
 ## Step 2F — 文档评审（spec / 实施计划 / 方案文档，无 diff）
 
@@ -361,18 +367,26 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 1. 定位文档：`DOC=<路径>`，`git ls-files --error-unmatch "$DOC"` 或未被忽略的 untracked → **在工作区内**，
    走路径引用；否则（仓库外 / 被 ignore）才内联全文。`wc -c "$DOC"` 与 `grep -n '^#' "$DOC"` 拿体积与章节目录。
-2. 选 agent（A）；`--round N` 时先做 synthesis.md §6 的**轮间自审**（专验上一轮回流新写入的段落）。
+2. 选 agent（A）。`--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就
+   让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
+   （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），
+   自审发现由 Claude 亲验后直接改进文档，再进外审。
 3. secret 扫描：扫**文档正文**（内联/路径引用都要，agent 会读它）；副本模式下按 2B 第 3 步扫整仓。
 4. 组提示词（prompts.md「文档评审模板」）：路径引用 + 章节目录 + 关注点 + **点名 3-8 条核实项**
    （文档里最关键、最可能与代码脱节的 `文件:行号` / 表名 / 函数 / 迁移号断言）+ 两档结论；
-   `--round ≥ 2` 附「回归核对」段（上一轮已采纳发现清单，逐条判 已修 / 未修 / 修出新问题）。
+   `--round ≥ 2` 附「回归核对」段（上一轮发现编号清单：已采纳的逐条判 已修 / 未修 / 修出新问题；**已驳回的列出驳回依据，
+   要求除非有新证据否则不要重提**）+ **必带**内联 `git diff "$PREV" -- "$DOC"`（≤15KB 直接放；超了放 `--stat` + 改动章节；
+   diff 不是文档全文，路径引用规则不适用——副本无 `.git`，agent 自己跑不出两版差异）。
    codex 用 `codex exec`（不是 `review`——没有 diff 可评），`-c 'model_reasoning_effort="medium"'`；
    复杂文档 `export CODEV_TIMEOUT=1200`。
 5. 并行发出（C）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
    记录本轮 **已核实 P1 数**，写进综合结尾（供 §6 收敛判据用）。
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
-   全文 grep 同步**，版本号 +0.1、commit，再问用户是否开下一轮。
+   全文 grep 同步**，版本号 +0.1；然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的
+   `.superpowers/codev/`，不进 git）+ `codev_commit_round "$DOC" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
+   "Co-Authored-By: …"`（**只提交该文档 pathspec**，工作树里用户的其它改动不碰；trailer 由库写）。
+   非 `--auto` → 问用户是否开下一轮；`--auto` → 按 synthesis.md §6.3 判停/续。
 
 ## Step 2C — challenge（对抗式挑战）
 
@@ -391,12 +405,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 ## Step 2E — 全流程（默认）
 
-串联执行，每个阶段之间**停下等用户确认**（不要一口气冲到底）：
-1. **brainstorm**（Step 2A）→ 用户拍板方案。
-2. **编码**：Claude 按方案与 CLAUDE.md 规范实现（Flutter 记得 build_runner / dart-define；
-   新增引用立即查 import）。
-3. **review**（Step 2B）→ 若 FAIL，Claude 修复后可再跑一轮。
-4. **最终小结**（wrap-up，区别于 F 的"跨模型综合"）：输出做了什么、外部 agent 的关键贡献、遗留项。
+brainstorm（2A）→ 用户拍板 → Claude 按方案与 CLAUDE.md 规范编码 → review（2B，FAIL 则修复后可再跑）→ 最终小结
+（做了什么、外部 agent 的关键贡献、遗留项）。**每个阶段之间停下等用户确认**，不一口气冲到底。
 
 ---
 

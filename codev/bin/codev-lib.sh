@@ -10,7 +10,7 @@
 #
 # 卫生规则（务必遵守，否则 source 进调用方 shell 会污染/中断它）：
 #   - 不要 set -e / set -u / trap / 改 IFS / 改 PATH（umask 已收进各函数的子 shell，不外泄）。
-#   - source 时【不执行任何命令】，只做函数定义 + CODEV_TO / CODEV_DIR / CODEV_TIMEOUT / CODEV_LEDGER 等赋值。
+#   - source 时【不执行任何命令】，只做函数定义 + CODEV_TO / CODEV_DIR / CODEV_TIMEOUT / CODEV_LEDGER / CODEV_FINDINGS 等赋值。
 #   - 所有函数前缀 codev_、所有全局变量前缀 CODEV_。
 #   - bash/zsh 通用：用 local/[ ]/"$@"，不用 bash 数组下标（注意 local 非 POSIX，仅保证 bash/zsh）。
 
@@ -68,6 +68,9 @@ esac
 # codev_probe 读它给每个 agent 标"近期 3 次结果"。解决的实测痛点：qoderclicn 额度死透、codebuddy 连续
 # 429 后，下一会话仍按过期的默认组合把它们推荐上去、白跑一轮才发现。账本只记类别与字节数，不记内容。
 CODEV_LEDGER="${CODEV_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/ledger.tsv}"
+# 发现台账：每条外部 agent 的发现一行（含 Claude 裁决与亲验结果），codev_stats 据此算每个 agent/模型的
+# "声称 P1 里经亲验成立的比例"与"独家且成立"数——这才是选模型的依据，不是采纳条数（条数奖励产出多而泛的 agent）。
+CODEV_FINDINGS="${CODEV_FINDINGS:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/findings.tsv}"
 
 # codev_run <cmd...> — 超时封装。取代 `$TP <cmd>` 变量前缀：
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
@@ -152,23 +155,151 @@ codev_tokens() {
   return 0
 }
 
-# codev_ledger_append <agent> <class> <rc> <secs> — 追加一行到跨会话账本（失败静默，不影响主流程）。
-codev_ledger_append() {
-  local agent="$1" cls="$2" rc="$3" secs="$4" pb=0 ob=0 d
-  d=$(dirname "$CODEV_LEDGER"); mkdir -p "$d" 2>/dev/null || return 0
-  [ -s "$CODEV_DIR/codev-prompt-$agent.txt" ] && pb=$(wc -c < "$CODEV_DIR/codev-prompt-$agent.txt" | tr -d ' ')
-  [ -s "$CODEV_DIR/codev-out-$agent.txt" ] && ob=$(wc -c < "$CODEV_DIR/codev-out-$agent.txt" | tr -d ' ')
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M)" "$agent" "$cls" "$rc" "$secs" "$pb" "$ob" >> "$CODEV_LEDGER" 2>/dev/null
+# codev_model_of <agent> — 该次调用的模型名：优先环境变量 CODEV_MODEL_<agent>（Claude 在调用命令里
+# `export CODEV_MODEL_reasonix=deepseek-v4` 设，值来自 -m/--model 或该 CLI 的默认）；codex 从 stderr banner
+# 的 "model: xxx" 行取；都没有输出 unknown。账本与 commit trailer 都靠它记模型。
+codev_model_of() {
+  local agent="$1" v=""
+  case "$agent" in *[!A-Za-z0-9_]*|'') echo unknown; return 0;; esac
+  eval "v=\${CODEV_MODEL_$agent:-}"
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  if [ "$agent" = codex ] && [ -s "$CODEV_DIR/codev-err-codex.txt" ]; then
+    v=$(grep -am1 '^model: ' "$CODEV_DIR/codev-err-codex.txt" 2>/dev/null | sed 's/^model: //' | tr -d '\r')
+  fi
+  printf '%s' "${v:-unknown}"
+}
+
+# codev_cost <agent> — 能取到才输出 "0.052 CNY"（reasonix --metrics 的 cost/currency 首次出现）；否则空串。
+codev_cost() {
+  local m="$CODEV_DIR/codev-metrics-$1.json" c u
+  [ -s "$m" ] || return 0
+  c=$(grep -o '"cost"[^0-9]*[0-9][0-9.]*' "$m" 2>/dev/null | head -n 1 | sed 's/.*[^0-9.]\([0-9][0-9.]*\)$/\1/')
+  u=$(grep -o '"currency"[^"]*"[A-Za-z]*"' "$m" 2>/dev/null | head -n 1 | sed 's/.*"\([A-Za-z]*\)"$/\1/')
+  [ -n "$c" ] && printf '%.3f %s' "$c" "${u:-?}"
   return 0
 }
 
-# codev_ledger_recent <agent> — 该 agent 最近 3 次类别（旧→新）+ 最近一次时间，如 "quota quota ok (最近 09-04T14:10)"。
+# codev_reset_note <text> — 从额度/限流错误串里抽重置时间："将在 X 重置" / "try again at X" / "resets at X"。
+codev_reset_note() {
+  local t="$1" r=""
+  r=$(printf '%s' "$t" | sed -nE 's/.*将在 ?(.+) ?重置.*/\1/p' | head -n 1 | sed 's/[ ，,.。]*$//')
+  [ -z "$r" ] && r=$(printf '%s' "$t" | sed -nE 's/.*(try again|resets?|available) (at|after|in) ([^.。,，]+).*/\3/p' | head -n 1)
+  [ -n "$r" ] && printf '重置 %s' "$r"
+  return 0
+}
+
+# codev_ledger_append <agent> <class> <rc> <secs> [note] — 追加一行到跨会话账本（失败静默）。
+# 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注（12 列，制表符分隔）。
+codev_ledger_append() {
+  local agent="$1" cls="$2" rc="$3" secs="$4" note="${5:-}" pb=0 ob=0 d tk cost
+  d=$(dirname "$CODEV_LEDGER"); mkdir -p "$d" 2>/dev/null || return 0
+  [ -s "$CODEV_DIR/codev-prompt-$agent.txt" ] && pb=$(wc -c < "$CODEV_DIR/codev-prompt-$agent.txt" | tr -d ' ')
+  [ -s "$CODEV_DIR/codev-out-$agent.txt" ] && ob=$(wc -c < "$CODEV_DIR/codev-out-$agent.txt" | tr -d ' ')
+  tk=$(codev_tokens "$agent" | tr -cd '0-9'); cost=$(codev_cost "$agent")
+  note=$(printf '%s' "$note" | tr '\t\n' '  ')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M)" "$(basename "$CODEV_DIR")" \
+    "$agent" "$(codev_model_of "$agent")" "$cls" "$rc" "$secs" "$pb" "$ob" "${tk:--}" "${cost:--}" "${note:--}" >> "$CODEV_LEDGER" 2>/dev/null
+  return 0
+}
+
+# codev_ledger_recent <agent> — 该 agent 最近 3 次类别（旧→新，quota 附重置时间）+ 最近一次时间。
 codev_ledger_recent() {
   local agent="$1" rows
   [ -s "$CODEV_LEDGER" ] || return 0
-  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | tail -n 3)
+  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | awk -F'\t' -v a="$agent" '$3==a' | tail -n 3)
   [ -n "$rows" ] || return 0
-  printf '%s (最近 %s)' "$(printf '%s\n' "$rows" | cut -f3 | tr '\n' ' ' | sed 's/ $//')" "$(printf '%s\n' "$rows" | tail -n 1 | cut -f1 | cut -c6-)"
+  printf '%s (最近 %s)' \
+    "$(printf '%s\n' "$rows" | awk -F'\t' '{ if ($5=="quota" && $12!="-") printf "%s(%s) ", $5, $12; else printf "%s ", $5 }' | sed 's/ $//')" \
+    "$(printf '%s\n' "$rows" | tail -n 1 | cut -f1 | cut -c6-)"
+}
+
+# codev_session_summary — 本会话（CODEV_DIR）所有调用的 用时/tokens/成本 一览，fan-out 全部结束后打印一次。
+codev_session_summary() {
+  local sess
+  sess=$(basename "$CODEV_DIR")
+  [ -s "$CODEV_LEDGER" ] || { echo "（本会话无账本记录）"; return 0; }
+  echo "本会话用量（agent 模型 类别 用时 tokens 成本）："
+  awk -F'\t' -v s="$sess" '$2==s { printf "  %-10s %-18s %-8s %4ss  %8s  %s\n", $3, $4, $5, $7, $10, $11 }' "$CODEV_LEDGER"
+}
+
+# codev_finding_add <repo> <doc> <round> <agent> <model> <id> <severity> <column> <verdict> <verified> <unique> <desc>
+# 发现台账追加一行（13 列：时间 + 12 个入参；入参里的制表符/换行会被替换成空格）。
+#   severity: P1/P2/P3   column: A/B（agent 自报的已查证/待核实）   verdict: 采纳/驳回/存疑
+#   verified: 成立/不成立/待定（Claude 亲验结果）   unique: 独家/共同（是否只有这一家发现）
+codev_finding_add() {
+  [ $# -ge 12 ] || { echo "用法: codev_finding_add repo doc round agent model id severity column verdict verified unique desc" >&2; return 1; }
+  local d f
+  d=$(dirname "$CODEV_FINDINGS"); mkdir -p "$d" 2>/dev/null || return 1
+  printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_FINDINGS"
+  for f in "$@"; do printf '\t%s' "$(printf '%s' "$f" | tr '\t\n' '  ')" >> "$CODEV_FINDINGS"; done
+  printf '\n' >> "$CODEV_FINDINGS"
+}
+
+# codev_stats [repo] — 按 agent+模型汇总发现台账：声称 P1 里经亲验成立的比例、独家且成立数、总条数、采纳数。
+codev_stats() {
+  local repo="${1:-}"
+  [ -s "$CODEV_FINDINGS" ] || { echo "（发现台账为空：${CODEV_FINDINGS}）"; return 0; }
+  echo "发现台账统计（agent 模型 | P1 成立/声称 | 独家成立 | 总条数 | 采纳）${repo:+，仓库=$repo}："
+  # LC_ALL=C 必须：macOS 自带 awk（BWK 20200816）在 UTF-8 locale 下 "不成立"=="成立" 判真（实测 3/3），
+  # 中文字段相等比较只能按字节做。
+  LC_ALL=C awk -F'\t' -v r="$repo" '
+    r=="" || $2==r {
+      k=$5 "\t" $6; n[k]++
+      if ($8=="P1") { p1[k]++; if ($11=="成立") ok[k]++ }
+      if ($12=="独家" && $11=="成立") u[k]++
+      if ($10=="采纳") a[k]++
+    }
+    END { for (k in n) { split(k, kk, "\t"); printf "  %-10s %-18s P1 %d/%d  独家成立 %d  总 %d  采纳 %d\n", kk[1], kk[2], ok[k]+0, p1[k]+0, u[k]+0, n[k], a[k]+0 } }' "$CODEV_FINDINGS" | sort
+}
+
+# codev_commit_round <path> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
+# 一轮回流后的 commit：【只提交 <path>（pathspec）】，绝不 add -A——工作树里常有用户自己未提交的无关改动。
+# 提交信息 = <summary> + 空行 + trailer 块（Codev-Round / Codev-Reviewed-By / Codev-Verified-P1 + 透传的额外 trailer，
+# 如 Co-Authored-By）。trailer 让 `git log --grep '^Codev-Round: 2'` 能直接回答"第 2 轮评了谁、剩几条 P1"。
+codev_commit_round() {
+  [ $# -ge 6 ] || { echo "用法: codev_commit_round path round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
+  local path="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t; shift 6
+  git add -- "$path" || return 1
+  if git diff --cached --quiet -- "$path"; then echo "⚠️ $path 没有待提交的改动，跳过 commit" >&2; return 1; fi
+  git diff --cached --stat -- "$path" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件（pathspec 是目录时尤其要核对）
+  msg=$(mktemp -t codev-msg.XXXXXX) || return 1
+  {
+    printf '%s\n\n' "$summary"
+    printf 'Codev-Round: %s\n' "$round"
+    printf 'Codev-Reviewed-By: %s\n' "$rev"
+    printf 'Codev-Verified-P1: %s (prev %s)\n' "$p1" "$prev"
+    for t in "$@"; do printf '%s\n' "$t"; done
+  } > "$msg"
+  git commit -q -F "$msg" -- "$path"; local rc=$?
+  rm -f "$msg"
+  [ "$rc" = 0 ] && echo "✔ 已提交第 $round 轮回流：$(git log -1 --format=%h) $summary"
+  return $rc
+}
+
+# codev_prev_round_commit <path> <round> — 找触及 <path> 且 trailer 为 Codev-Round: <round-1> 的最近 commit（找不到输出空）。
+# 用途：第 N 轮提示词里内联 `git diff <该 commit> -- <path>`，让 agent 看到两版之间的真实差异而不是手写的"改动章节"。
+codev_prev_round_commit() {
+  local path="$1" round="$2" prev
+  prev=$((round - 1)); [ "$prev" -ge 1 ] || return 0
+  git log --format=%H --grep="^Codev-Round: $prev\$" -- "$path" 2>/dev/null | head -n 1
+}
+
+# codev_archive <slug> <round> — 把本会话的 prompt/out/err/metrics 归档到 <仓库根>/.superpowers/codev/<slug>/r<N>/。
+# 会话目录 24h 后被 GC，归档让"第 3 轮 codex 当时原话是什么"仍可查；目录用 .git/info/exclude 保证不入库
+# （本地生效、不改仓库的 .gitignore）。评审原文不进 git：几十 KB × 多家 × 多轮会堆满仓库。
+codev_archive() {
+  local slug="$1" round="$2" root dest f
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "⚠️ 非 git 仓库，跳过归档" >&2; return 1; }
+  slug=$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-')
+  dest="$root/.superpowers/codev/$slug/r$round"
+  mkdir -p "$dest" || return 1
+  if ! git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
+    mkdir -p "$root/.git/info" && printf '.superpowers/\n' >> "$root/.git/info/exclude"
+  fi
+  for f in "$CODEV_DIR"/codev-prompt-*.txt "$CODEV_DIR"/codev-out-*.txt "$CODEV_DIR"/codev-err-*.txt "$CODEV_DIR"/codev-metrics-*.json; do
+    [ -f "$f" ] && cp "$f" "$dest/"
+  done
+  echo "已归档到 ${dest}（已被 git 忽略）"
 }
 
 # codev_report <agent> <rc> <errfile> — 打印完成行 + 【按类别显式上报】+ 记账本。
@@ -176,12 +307,13 @@ codev_ledger_recent() {
 # 超时(124)/额度/鉴权/turn/报错/空输出都清楚标注，并附 stderr 里的错误行原句（含 429 的重置时间）。
 # 若调用方设了 CODEV_T0（epoch 秒，codev_bg_* 会设），完成行附"用时 Ns"；能取到 token 就附。
 codev_report() {
-  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk
+  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note=""
   cls=$(codev_classify "$agent" "$rc" "$out" "$err")
   [ -n "${CODEV_T0:-}" ] && secs=$(( $(date +%s) - CODEV_T0 ))
   tk=$(codev_tokens "$agent")
   [ -n "$secs" ] && extra="用时 ${secs}s"
   [ -n "$tk" ] && extra="${extra:+$extra | }$tk"
+  cost=$(codev_cost "$agent"); [ -n "$cost" ] && extra="${extra:+$extra | }$cost"
   # 全角括号不能紧贴 ${extra:+…}：bash 在 UTF-8 locale 下会把 `extra（` 一起当变量名（实测 set -u 下
   # 报 "extra（: unbound variable"）。先用普通赋值把括号包好，再以 %s 传给 printf。
   [ -n "$extra" ] && extra="（${extra}）"
@@ -204,7 +336,11 @@ codev_report() {
              if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/  /'; elif [ -s "$err" ]; then tail -n 5 "$err" 2>/dev/null | sed 's/^/  /'; else echo "  (无 stderr)"; fi
              case "$lines" in *"context canceled"*) echo "  → reasonix 上游断流/被掐，多为提示词过大；缩到 ≤45KB 或改路径引用后重试一次";; esac ;;
   esac
-  codev_ledger_append "$agent" "$cls" "$rc" "${secs:-0}"
+  if [ "$cls" = quota ]; then
+    note=$(codev_reset_note "$lines
+$( [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out" )")
+  fi
+  codev_ledger_append "$agent" "$cls" "$rc" "${secs:-0}" "$note"
 }
 
 # codev_repo_copy <sbox> — 在沙盒里铺一份【只读仓库副本】到 <sbox>/repo。
@@ -516,4 +652,5 @@ codev_probe() {
   done
   echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
   [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
+  [ -s "$CODEV_FINDINGS" ] && echo "发现台账 -> ${CODEV_FINDINGS}（codev_stats 看每个 agent/模型的 P1 亲验成立率）"
 }

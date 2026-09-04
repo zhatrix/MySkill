@@ -18,7 +18,8 @@
 | 让模型扮演攻击者，尽力打破你的代码/方案 | `/codev challenge [焦点]` |
 | 把一个技术问题问多个模型，汇总观点 | `/codev consult <问题>` |
 | 让多个模型评审一份 spec / 实施计划 / 方案文档（无 diff） | `/codev review docs/xxx.md [关注点]` |
-| 第 N 轮评审（带上一轮回归核对 + 轮间自审 + 收敛判据） | `/codev review docs/xxx.md --round 3` |
+| 第 N 轮评审（带上一轮回归核对 + 两版 diff + fresh-subagent 自审） | `/codev review docs/xxx.md --round 3` |
+| 自动连跑多轮直到收敛（开始只问一次，每轮自动 commit） | `/codev review docs/xxx.md --auto --max-rounds 3` |
 | 指定 agent 组合、不再弹窗确认 | `… --agents codex,reasonix` |
 | 从设计到编码到评审走完整流程 | `/codev <一段需求描述>` |
 | 不带参数，让它看你当前改动、问你要干嘛 | `/codev` |
@@ -56,7 +57,12 @@ brew install coreutils      # 提供 gtimeout
 - `CODEV_TIMEOUT`（默认 600s）：单次 agent 调用的兜底超时。核实型评审、大文档评审建议 `export CODEV_TIMEOUT=1200`。
 - 近期结果账本 `~/.local/state/codev/ledger.tsv`：每次调用记一行类别（ok/quota/auth/turns/timeout/empty/error）。
   `/codev` 探测时会给每个 agent 标"近期 3 次结果"，连续额度耗尽的 agent 不会被推荐。设 `CODEV_LEDGER` 可改路径。
-- 改了 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`（bash/zsh 均可）。
+- 发现台账 `~/.local/state/codev/findings.tsv`：每条外部发现的裁决与亲验结果；`codev_stats` 看每个 agent/模型的
+  "声称 P1 里亲验成立的比例"和"独家成立"数（这是选模型的依据，不是采纳条数）。
+- 每轮回流 commit 只提交文档 pathspec，trailer 带 `Codev-Round` / `Codev-Reviewed-By: codex(gpt-5.6-sol), …` /
+  `Codev-Verified-P1: k (prev j)`，`git log --grep '^Codev-Round: 2'` 可直接查；评审原文归档到 gitignored 的
+  `.superpowers/codev/<文档>/r<N>/`，不进仓库。
+- 改了 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`（bash/zsh 均可）；改文案按 `TESTING.md` 跑微测试与真机清单。
 
 ### 2.4 shell 说明
 skill 已对 **zsh** 做过兼容（用 `run()` 函数封装超时，而非 `$TP` 变量前缀——后者在 zsh 下会失败）。
