@@ -10,7 +10,7 @@
 #
 # 卫生规则（务必遵守，否则 source 进调用方 shell 会污染/中断它）：
 #   - 不要 set -e / set -u / trap / 改 IFS / 改 PATH（umask 已收进各函数的子 shell，不外泄）。
-#   - source 时【不执行任何命令】，只做函数定义 + CODEV_TO / CODEV_DIR 两个赋值。
+#   - source 时【不执行任何命令】，只做函数定义 + CODEV_TO / CODEV_DIR / CODEV_TIMEOUT / CODEV_LEDGER 等赋值。
 #   - 所有函数前缀 codev_、所有全局变量前缀 CODEV_。
 #   - bash/zsh 通用：用 local/[ ]/"$@"，不用 bash 数组下标（注意 local 非 POSIX，仅保证 bash/zsh）。
 
@@ -47,28 +47,164 @@ case "${CODEV_MAX_COPY_KB:-}" in
     CODEV_MAX_COPY_KB=102400 ;;
 esac
 
+# 单次 agent 调用的超时秒数。默认 600 只是"兜底真正卡死的进程"的安全网，不是能力上限——后台执行
+# 本来就不受前台 300s 工具超时约束。核实型评审（要求 agent 进 ./repo 逐条核实、60+ 次工具调用）和
+# 大文档任务实测经常撞 600s（codex/reasonix/codebuddy 都出过 124 零输出），这类任务在调用前
+# `export CODEV_TIMEOUT=1200`。范围 60..3000：上限 3000（50 分钟）是为了让 codev_sbox_gc 的
+# "60 分钟前的沙盒必然已死"这条推断继续成立；非法值退回 600 并告警（同 CODEV_MAX_COPY_KB 的理由）。
+case "${CODEV_TIMEOUT:-}" in
+  '' ) CODEV_TIMEOUT=600 ;;
+  *[!0-9]* )
+    echo "⚠️ CODEV_TIMEOUT='$CODEV_TIMEOUT' 不是纯数字，已退回默认 600s" >&2
+    CODEV_TIMEOUT=600 ;;
+  * )
+    if [ "$CODEV_TIMEOUT" -lt 60 ] || [ "$CODEV_TIMEOUT" -gt 3000 ]; then
+      echo "⚠️ CODEV_TIMEOUT=$CODEV_TIMEOUT 超出 60..3000，已退回默认 600s" >&2
+      CODEV_TIMEOUT=600
+    fi ;;
+esac
+
+# 跨会话【近期结果账本】：每次 codev_report 追加一行 TSV（时间 agent 类别 rc 用时秒 提示词字节 输出字节），
+# codev_probe 读它给每个 agent 标"近期 3 次结果"。解决的实测痛点：qoderclicn 额度死透、codebuddy 连续
+# 429 后，下一会话仍按过期的默认组合把它们推荐上去、白跑一轮才发现。账本只记类别与字节数，不记内容。
+CODEV_LEDGER="${CODEV_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/ledger.tsv}"
+
 # codev_run <cmd...> — 超时封装。取代 `$TP <cmd>` 变量前缀：
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
 # 「timeout 600」的单个文件执行而失败；用函数 + "$@" 传参，bash/zsh 都对。
-# 600s 只兜底真正卡死的进程——慢模型靠【后台执行】跑完，不受此约束。
+# CODEV_TIMEOUT（默认 600s）只兜底真正卡死的进程——慢模型靠【后台执行】跑完，不受前台 300s 约束；核实型评审可调到 1200。
 codev_run() {
-  if [ -n "$CODEV_TO" ]; then "$CODEV_TO" 600 "$@"; else "$@"; fi
+  if [ -n "$CODEV_TO" ]; then "$CODEV_TO" "$CODEV_TIMEOUT" "$@"; else "$@"; fi
 }
 
-# codev_report <agent> <rc> <errfile> — 打印完成行 + 【非零退出显式上报】。
-# 关键：让调用方（Claude）不会把"无输出"误判成模型卡死；超时(124)/报错都清楚标注。
-codev_report() {
-  local agent="$1" rc="$2" err="$3"
-  if [ "$rc" = "124" ]; then
-    echo "⏭ $agent 跳过（超时 124，撞 600s 安全网）→ 可降强度/精简提示词后重试"
-  elif [ "$rc" != "0" ]; then
-    # 用 printf %s 传 $rc（不要写 "exit=$rc："——UTF-8 locale 下 bash 会把紧跟的全角字符与
-    # 变量展开一起误扫，吞掉退出码；ASCII 冒号 + printf 稳）。stderr 只印一次头 5 行，空文件显式提示。
-    printf '⚠️ %s 非零退出 exit=%s（stderr 头 5 行）:\n' "$agent" "$rc"
-    if [ -s "$err" ]; then head -n 5 "$err" 2>/dev/null | sed 's/^/  /'; else echo "  (无 stderr)"; fi
-  else
-    echo "✔ $agent 完成 exit=0"
+# codev_classify <agent> <rc> <outfile> <errfile> — 把一次调用归成一个类别（只输出类别名）：
+#   timeout | quota | auth | turns | error | empty | ok
+# 为什么不能只看退出码（均为实测事故）：
+#   - qoderclicn 额度耗尽时把 "You've reached your credit usage limit" 打到【stdout】且 exit 0
+#     → 旧逻辑判 ✔，那句话会被当成评审逐字呈现；
+#   - codex 撞用量上限时 stdout 空、错误行在 1MB stderr 的【尾部】（头 5 行只是 banner）；
+#   - codebuddy 429 的错误串里带【重置时间】，不显示出来用户就得自己翻 err 文件；
+#   - reasonix "context canceled"、codebuddy "Max turns (N) exceeded" 都是 stdout 空 + 一行 stderr。
+# 误报防护：stdout 只在【很短】（<600 字节）时才拿去匹配额度模式——正常评审正文里出现 "quota"/"429"
+# （比如被评审的代码就是限流模块）不该被误判；stderr 只看"错误行"（以 ERROR/error/错误/三位状态码开头的行），
+# 不扫 codex 回显的提示词和文件清单。
+codev_classify() {
+  local agent="$1" rc="$2" out="$3" err="$4" osz=0 short="" errlines="" c=""
+  [ "$rc" = "124" ] && { echo timeout; return 0; }
+  [ -s "$out" ] && osz=$(wc -c < "$out" | tr -d ' ')
+  [ "$osz" -gt 0 ] && [ "$osz" -lt 600 ] && short=$(cat "$out" 2>/dev/null)
+  errlines=$(codev_err_lines "$err")
+  # ① 很短的 stdout 本身就是错误串（qoderclicn 额度、某些 CLI 把登录提示打到 stdout）→ 按其类别。
+  c=$(codev_match_class "$short"); [ -n "$c" ] && { echo "$c"; return 0; }
+  # ② stdout 为空：stderr 错误行决定类别；没有错误行且 rc=0 → empty。
+  if [ "$osz" -eq 0 ]; then
+    c=$(codev_match_class "$errlines"); [ -n "$c" ] && { echo "$c"; return 0; }
+    if [ "$rc" != "0" ] || [ -n "$errlines" ]; then echo error; else echo empty; fi
+    return 0
   fi
+  # ③ stdout 有正文：即使 stderr 有额度错误也算 ok（正文可能只是被截断——codev_report 会附警告让人核对），
+  #    不能把已经产出的评审整份作废。
+  [ "$rc" != "0" ] && { echo error; return 0; }
+  echo ok
+}
+
+# codev_match_class <text> — 文本命中已知致命模式时输出 quota / auth / turns，否则输出空串。
+codev_match_class() {
+  local t="$1"
+  [ -n "$t" ] || return 0
+  if printf '%s' "$t" | grep -qiE 'usage limit|rate limit|credit usage|quota|额度|频率限制|too many requests|insufficient (balance|credit|funds)|resource.?exhausted|(^|[^0-9])(429|402)([^0-9]|$)'; then
+    echo quota; return 0
+  fi
+  if printf '%s' "$t" | grep -qiE 'unauthorized|not logged in|please (log ?in|login)|invalid api key|authentication|鉴权|认证失败|登录已过期|(^|[^0-9])401([^0-9]|$)'; then
+    echo auth; return 0
+  fi
+  if printf '%s' "$t" | grep -qiE 'max turns'; then echo turns; return 0; fi
+  return 0
+}
+
+# codev_err_lines <errfile> — 从 stderr 里抽"错误行"（最多 6 行）：以 ERROR/Error/error/错误/Err 或三位
+# HTTP 状态码开头的行，外加 "context canceled"/"Max turns" 这类无前缀的已知致命句。
+codev_err_lines() {
+  local err="$1"
+  [ -s "$err" ] || return 0
+  grep -aE '^[[:space:]]*(ERROR|Error|error|Err|错误|FATAL|fatal|panic)[:：[:space:]]|^[[:space:]]*[0-9]{3}[[:space:]]|context canceled|[Mm]ax turns' "$err" 2>/dev/null | tail -n 6
+}
+
+# codev_tokens <agent> — 能拿到才输出 "tokens N"（拿不到输出空串，调用方省略该字段，绝不编造）：
+#   codex   : stderr 末尾的 "tokens used" 下一行；
+#   reasonix: 调用时带 --metrics "$CODEV_DIR/codev-metrics-reasonix.json"（实测 v1.35 可用），
+#             取 prompt_tokens + completion_tokens。
+codev_tokens() {
+  local agent="$1" err="$CODEV_DIR/codev-err-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" n="" a b
+  case "$agent" in
+    codex)
+      n=$(grep -aiA1 'tokens used' "$err" 2>/dev/null | tail -n 1 | tr -cd '0-9') ;;
+    *)
+      if [ -s "$m" ]; then
+        # 只取【第一次出现】：metrics JSON 里同名键会在嵌套的 per-provider 段重复出现，
+        # 不加 head -n1 会把多个数字串接成一个天文数字（实测 5826 → 58265848）。
+        a=$(grep -o '"prompt_tokens"[^0-9]*[0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
+        b=$(grep -o '"completion_tokens"[^0-9]*[0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
+        [ -n "$a" ] && n=$(( ${a:-0} + ${b:-0} ))
+      fi ;;
+  esac
+  [ -n "$n" ] && printf 'tokens %s' "$n"
+  return 0
+}
+
+# codev_ledger_append <agent> <class> <rc> <secs> — 追加一行到跨会话账本（失败静默，不影响主流程）。
+codev_ledger_append() {
+  local agent="$1" cls="$2" rc="$3" secs="$4" pb=0 ob=0 d
+  d=$(dirname "$CODEV_LEDGER"); mkdir -p "$d" 2>/dev/null || return 0
+  [ -s "$CODEV_DIR/codev-prompt-$agent.txt" ] && pb=$(wc -c < "$CODEV_DIR/codev-prompt-$agent.txt" | tr -d ' ')
+  [ -s "$CODEV_DIR/codev-out-$agent.txt" ] && ob=$(wc -c < "$CODEV_DIR/codev-out-$agent.txt" | tr -d ' ')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M)" "$agent" "$cls" "$rc" "$secs" "$pb" "$ob" >> "$CODEV_LEDGER" 2>/dev/null
+  return 0
+}
+
+# codev_ledger_recent <agent> — 该 agent 最近 3 次类别（旧→新）+ 最近一次时间，如 "quota quota ok (最近 09-04T14:10)"。
+codev_ledger_recent() {
+  local agent="$1" rows
+  [ -s "$CODEV_LEDGER" ] || return 0
+  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | tail -n 3)
+  [ -n "$rows" ] || return 0
+  printf '%s (最近 %s)' "$(printf '%s\n' "$rows" | cut -f3 | tr '\n' ' ' | sed 's/ $//')" "$(printf '%s\n' "$rows" | tail -n 1 | cut -f1 | cut -c6-)"
+}
+
+# codev_report <agent> <rc> <errfile> — 打印完成行 + 【按类别显式上报】+ 记账本。
+# 关键：让调用方（Claude）不会把"无输出"误判成模型卡死、也不会把额度耗尽误判成成功；
+# 超时(124)/额度/鉴权/turn/报错/空输出都清楚标注，并附 stderr 里的错误行原句（含 429 的重置时间）。
+# 若调用方设了 CODEV_T0（epoch 秒，codev_bg_* 会设），完成行附"用时 Ns"；能取到 token 就附。
+codev_report() {
+  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk
+  cls=$(codev_classify "$agent" "$rc" "$out" "$err")
+  [ -n "${CODEV_T0:-}" ] && secs=$(( $(date +%s) - CODEV_T0 ))
+  tk=$(codev_tokens "$agent")
+  [ -n "$secs" ] && extra="用时 ${secs}s"
+  [ -n "$tk" ] && extra="${extra:+$extra | }$tk"
+  # 全角括号不能紧贴 ${extra:+…}：bash 在 UTF-8 locale 下会把 `extra（` 一起当变量名（实测 set -u 下
+  # 报 "extra（: unbound variable"）。先用普通赋值把括号包好，再以 %s 传给 printf。
+  [ -n "$extra" ] && extra="（${extra}）"
+  lines=$(codev_err_lines "$err")
+  # 用 printf %s 传变量（不要写 "exit=$rc："——UTF-8 locale 下 bash 会把紧跟的全角字符与变量展开
+  # 一起误扫，吞掉退出码；ASCII 冒号 + printf 稳）。
+  case "$cls" in
+    ok)      printf '✔ %s 完成 exit=0%s\n' "$agent" "$extra"
+             [ -n "$lines" ] && { printf '  ⚠️ 但 stderr 含错误行（输出可能被截断，核对正文是否完整）:\n'; printf '%s\n' "$lines" | sed 's/^/  /'; } ;;
+    timeout) printf '⏭ %s 跳过（超时 124，撞 CODEV_TIMEOUT=%ss 安全网%s）→ 缩小核实范围/改路径引用少内联/或 export CODEV_TIMEOUT=1200 后重试\n' "$agent" "$CODEV_TIMEOUT" "${secs:+，用时 ${secs}s}" ;;
+    quota)   printf '⛔ %s 额度/限流（exit=%s，本轮无效，勿当评审呈现）:\n' "$agent" "$rc"
+             { [ -n "$lines" ] && printf '%s\n' "$lines"; [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out"; } | sed 's/^/  /'
+             echo "  → 跳过该 agent；错误串里若有重置时间，之后再试；换其它 agent 补位" ;;
+    auth)    printf '⛔ %s 鉴权失败（exit=%s）→ 按 agents.md 的登录命令处理后重试:\n' "$agent" "$rc"
+             printf '%s\n' "$lines" | sed 's/^/  /' ;;
+    turns)   printf '⚠️ %s turn 预算耗尽（exit=%s，终稿未产出）→ 调高 --max-turns 并收窄核实范围到 3-5 条后重试:\n' "$agent" "$rc"
+             printf '%s\n' "$lines" | sed 's/^/  /' ;;
+    empty)   printf '⚠️ %s 空输出（exit=0，stdout/stderr 均无内容，本轮无效）→ 先看 %s 分诊，勿当成"无问题"\n' "$agent" "$err" ;;
+    error)   printf '⚠️ %s 非零退出/报错 exit=%s%s（stderr 错误行）:\n' "$agent" "$rc" "${secs:+，用时 ${secs}s}"
+             if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/  /'; elif [ -s "$err" ]; then tail -n 5 "$err" 2>/dev/null | sed 's/^/  /'; else echo "  (无 stderr)"; fi
+             case "$lines" in *"context canceled"*) echo "  → reasonix 上游断流/被掐，多为提示词过大；缩到 ≤45KB 或改路径引用后重试一次";; esac ;;
+  esac
+  codev_ledger_append "$agent" "$cls" "$rc" "${secs:-0}"
 }
 
 # codev_repo_copy <sbox> — 在沙盒里铺一份【只读仓库副本】到 <sbox>/repo。
@@ -297,6 +433,7 @@ codev_bg_sandboxed() {
   # （实测 echo "…（$mode）" 只输出到"启动（"就截断）。同 codev_report 里 $rc 的处理。
   printf '▶ %s 启动: %s\n' "$agent" "$mode"
   # umask 077 放进子 shell：输出含 diff/可能密钥仅本人可读，且【不把 umask 泄漏给调用方 shell】。
+  CODEV_T0=$(date +%s)
   ( umask 077; cd "$sbox" && codev_run "$@" < /dev/null > "$out" 2>"$err" ); rc=$?
   # 副本被 chmod a-w，rm 需要先恢复目录写权限；空值守卫防 mktemp 失败时 rm -rf ""
   [ -n "$sbox" ] && { chmod -R u+w "$sbox" 2>/dev/null; rm -rf "$sbox"; }
@@ -317,6 +454,7 @@ codev_bg_native() {
   fi
   local rc
   # umask 077 放进子 shell：不把 umask 泄漏给调用方 shell（前台/内联退化场景会残留 0600）。
+  CODEV_T0=$(date +%s)
   ( umask 077; codev_run "$@" < /dev/null > "$out" 2>"$err" ); rc=$?
   codev_report "$agent" "$rc" "$err"
 }
@@ -324,11 +462,11 @@ codev_bg_native() {
 # codev_sbox_gc — 清理【残留沙盒】。正常路径下 codev_bg_sandboxed 收尾会删掉自己的沙盒，但
 # 进程被杀时（前台工具超时、Ctrl-C、机器重启）收尾跑不到，沙盒就漏在 TMPDIR 里。
 # 空目录时代漏了无所谓，现在沙盒里有整份仓库副本 → 会堆磁盘、也留代码残迹，所以要定期扫。
-# 只删【60 分钟前】的：codev_run 上限 600s，超过 60 分钟的必然是死掉的，不会误删并发 run 的活沙盒。
+# 只删【60 分钟前】的：codev_run 上限 CODEV_TIMEOUT ≤ 3000s（50 分钟），超过 60 分钟的必然是死掉的，不会误删并发 run 的活沙盒。
 codev_sbox_gc() {
   local t="${TMPDIR:-/tmp}" d n=0
   # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
-  # 只扫【沙盒】：沙盒天生短命（单次 agent 调用，最长 600s），超 60 分钟必是死掉的。
+  # 只扫【沙盒】：沙盒天生短命（单次 agent 调用，最长 CODEV_TIMEOUT≤3000s），超 60 分钟必是死掉的。
   # ⚠️ 【不要】把会话目录 codev.* 也按 60 分钟扫：会话目录是长命的（用户看完输出、讨论、再跑一轮
   #    很容易超过 1 小时），且并发的另一个 /codev run 的会话目录同样匹配 —— 那样会删掉别人正在用的
   #    母本/提示词/输出。会话目录由 skill 收尾的 `rm -rf "$CODEV_DIR"` 负责（母本就在里面，一并清）；
@@ -366,14 +504,16 @@ codev_auth_codex() {
 # codex 命中时顺带跑 codev_auth_codex 附上鉴权结论（AUTH_OK/AUTH_FAILED），
 # 便于 Claude 把未鉴权的 codex 提前剔出可选项，不浪费一轮后台任务。
 codev_probe() {
-  local c
+  local c r
   codev_sbox_gc          # 顺手回收上一轮被杀进程漏下的沙盒（含仓库副本，会堆磁盘）
   for c in codex gemini reasonix qoderclicn opencode codebuddy; do
     if command -v "$c" >/dev/null 2>&1; then
-      if [ "$c" = codex ]; then echo "OK   codex ($(codev_auth_codex))"; else echo "OK   $c"; fi
+      r=$(codev_ledger_recent "$c")
+      if [ "$c" = codex ]; then echo "OK   codex ($(codev_auth_codex))${r:+  近期: $r}"; else echo "OK   $c${r:+  近期: $r}"; fi
     else
       echo "MISS $c"
     fi
   done
-  echo "timeout -> ${CODEV_TO:-MISSING}"
+  echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
+  [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
 }

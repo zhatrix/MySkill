@@ -17,6 +17,9 @@
 | 让多个模型评审你的代码改动 | `/codev review [关注点]` |
 | 让模型扮演攻击者，尽力打破你的代码/方案 | `/codev challenge [焦点]` |
 | 把一个技术问题问多个模型，汇总观点 | `/codev consult <问题>` |
+| 让多个模型评审一份 spec / 实施计划 / 方案文档（无 diff） | `/codev review docs/xxx.md [关注点]` |
+| 第 N 轮评审（带上一轮回归核对 + 轮间自审 + 收敛判据） | `/codev review docs/xxx.md --round 3` |
+| 指定 agent 组合、不再弹窗确认 | `… --agents codex,reasonix` |
 | 从设计到编码到评审走完整流程 | `/codev <一段需求描述>` |
 | 不带参数，让它看你当前改动、问你要干嘛 | `/codev` |
 
@@ -49,7 +52,13 @@ brew install coreutils      # 提供 gtimeout
 ```
 装完 `/codev` 的探测会显示 `timeout -> /opt/homebrew/bin/timeout`。
 
-### 2.3 shell 说明
+### 2.3 超时与账本
+- `CODEV_TIMEOUT`（默认 600s）：单次 agent 调用的兜底超时。核实型评审、大文档评审建议 `export CODEV_TIMEOUT=1200`。
+- 近期结果账本 `~/.local/state/codev/ledger.tsv`：每次调用记一行类别（ok/quota/auth/turns/timeout/empty/error）。
+  `/codev` 探测时会给每个 agent 标"近期 3 次结果"，连续额度耗尽的 agent 不会被推荐。设 `CODEV_LEDGER` 可改路径。
+- 改了 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`（bash/zsh 均可）。
+
+### 2.4 shell 说明
 skill 已对 **zsh** 做过兼容（用 `run()` 函数封装超时，而非 `$TP` 变量前缀——后者在 zsh 下会失败）。
 bash/zsh 都能正常跑。
 
@@ -142,7 +151,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | 提示"未检测到任何外部 agent CLI" | 一个都没装，按第 2.1 节装并登录 |
 | `timeout -> MISSING` | 没装 coreutils，`brew install coreutils`；不装则慢 agent 会被跳过 |
 | 某 agent 超时被跳过 | 已默认后台+medium；仍超时可降强度/精简范围重试。不阻塞其它 agent |
-| codebuddy 无输出/超时 | 加 `--effort minimal --max-turns 12 --tools "Read,Glob,Grep"` 后实测已恢复正常（此前多半是放开全部工具+高 effort 导致兜圈）。仍不行则自动跳过 |
+| codebuddy 无输出/超时 | 先看翻牌类别：`⛔ 额度/限流`（429，错误串带重置时间）到点再试；`⚠️ turn 预算耗尽` 用 `--max-turns 64` + 核实清单收窄到 3-5 条；提示词压到 25KB 内。仍不行则跳过 |
 | opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
 | 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟的 |

@@ -32,13 +32,18 @@
 | `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo`，**每会话只做一次**。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
 | `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
-| `codev_report <agent> <rc> <errfile>` | 完成行 + **非零退出显式上报**（124→超时跳过；≠0→`⚠️ exit=N`+stderr 头 5 行；0→`✔`）。防"无输出"被误判成模型卡死。 |
+| `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
+| `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；stderr 只看以 ERROR/错误/三位状态码开头的"错误行"，不扫 codex 回显的提示词。 |
+| `codev_tokens <agent>` | 能取到才输出 `tokens N`：codex 取 stderr "tokens used"；reasonix 取 `--metrics` 写的 JSON（prompt+completion）。取不到输出空串。 |
+| `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；TSV：时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟**（沙盒天生短命，上限 600s，不会误删并发 run 的活沙盒）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟**（沙盒天生短命，上限 CODEV_TIMEOUT ≤ 3000s，不会误删并发 run 的活沙盒）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
-600s 只兜底真正卡死的进程——**慢模型靠后台执行**（Bash `run_in_background`）跑完，不受前台工具超时约束。
+超时由 `CODEV_TIMEOUT` 控制（默认 600s，范围 60..3000，非法值退回 600）：只兜底真正卡死的进程——**慢模型靠后台执行**
+（Bash `run_in_background`）跑完，不受前台工具超时约束。核实型评审 / 大文档任务在每个后台调用里
+`export CODEV_TIMEOUT=1200`（后台 shell 不继承，须逐调用设）。库有回归测试 `bash tests/test-lib.sh`（bash/zsh 都跑）。
 库的卫生规则见文件头注释（不 `set -e/-u`、不改 IFS/PATH、`umask` 收进子 shell、前缀 `codev_`/`CODEV_`、
 bash/zsh 通用——注意 `local` 非 POSIX，仅保证这两个 shell）。下文各 agent 用 `codev_bg_*` 一行式给出精确命令。
 
@@ -52,7 +57,7 @@ PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$P
 > 若临时另建文件，注意 macOS/BSD `mktemp` 只替换**结尾**的 X（`mktemp /tmp/foo-XXXXXX.txt` 原样生成、并行相撞），
 > 一律用 `mktemp -t codev-<role>` 形式。
 > **注意**：`"$(cat "$PROMPT")"` 只解决注入，**不能**避免 `ARG_MAX`（内容仍作 argv）。防 ARG_MAX 要靠
-> 阈值：发送前 `wc -c "$PROMPT"`，超大（如 > 100KB）就按文件筛选/缩小范围，或改用支持 stdin 的 CLI。
+> 阈值（实测）：发送前 `wc -c "$PROMPT"`，通用 ≤50KB、reasonix ≤45KB、codebuddy ≤25KB；超了先改路径引用，再按文件筛选/缩小范围。
 
 **输出路径由库统一管理**：`codev_bg_*` 把 stdout/stderr 写到**会话目录内字面路径**
 `$CODEV_DIR/codev-out-<agent>.txt` / `$CODEV_DIR/codev-err-<agent>.txt`（后台独立 shell 靠字面路径读，
@@ -250,14 +255,18 @@ fi
 - **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
-  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
+  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
   ```
-  可选 `--budget <usd>` 设美元上限、`-m <id>` 指定模型（如 deepseek-v4-flash）。
+  `--metrics <path>` 写一份 JSON（prompt_tokens / completion_tokens / steps / cost CNY，v1.35 实测可用），
+  `codev_report` 据此附 tokens。可选 `--max-steps <n>` 限工具调用轮数、`--model <id>` 指定模型。
   `-p` 只打印最终回答（省掉工具调用流水，逐字呈现更干净）。
+- **⚠️ 提示词 ≤ 45KB**：近 7 次实测 27-48KB 六次成功，一次 40KB 双大文档任务 stderr 只剩一行
+  `错误： context canceled`、stdout 空（`codev_report` 归为 error 并提示）。窄任务稳，"两份大文档一起核对"必超时——
+  用路径引用 + 核实清单收窄。
 - **⚠️ `--effort medium` 在 DeepSeek thinking 模型上会直接报错退出**（实测 exit=1：
   `provider "deepseek-pro" uses DeepSeek thinking; effort must be high, max, or disabled`）。
   **reasonix 是全局"默认 medium"规则的例外**：给它 `high`（或 `max`/不传）。传 medium 等于白跑一轮。
-- **⚠️ `--permission-mode plan` 非交互不可用**（实测 exit=2：`requires an interactive session`），
+- **⚠️ `--permission-mode plan` 非交互不可用**（v1.35 复测仍 exit=2：`requires an interactive session`），
   别照搬 gemini 的 plan 模式思路。非交互下用默认 `ask` 模式（无人应答即不放行写操作）。
 - **只读保证**：**无可用的非交互只读旗标** → 靠 `codev_bg_sandboxed` 沙盒（真仓库不在 cwd、
   `./repo` 副本 `chmod a-w`）+ 提示词强约束，且不给它 auto-approve / `bypassPermissions`。
@@ -280,6 +289,8 @@ fi
   就白铺了，agent 重新变瞎。`--tools ""` 只在刻意要"纯文本问答、不给任何代码视野"时才用。
   不要用 `--dangerously-skip-permissions` / `--permission-mode bypass_permissions`。
 - **推理强度**：`--reasoning-effort`；默认 `medium`，`--xhigh` 用 `max`。
+- **⚠️ 额度耗尽时把 `You've reached your credit usage limit…` 打到 stdout 且 exit 0**（131 字节）。旧版会判 ✔ 并把
+  这句当评审逐字呈现；现在 `codev_classify` 归为 `quota`。账本里连续 quota 就别推荐它，订阅额度按月重置。
 - **鉴权**：Qoder 账号登录。`--list-models` 可查可用模型。
 - **角色**：代码理解、评审。
 
@@ -295,7 +306,7 @@ fi
   多样性的意义）。
 - **⚠️ 本机实测极慢/疑似挂起**：给它一个"读一个文件、列出函数名"的最小任务，**15 分钟仍未返回**
   （同样的任务 reasonix / qoderclicn / codebuddy 都是秒级完成）。原因未查清（可能是沙盒 cwd 下
-  初始化慢、或等某个交互）。→ **必须后台执行**，并预期它经常撞 600s 安全网被判超时跳过。
+  初始化慢、或等某个交互）。→ **必须后台执行**，并预期它经常撞 CODEV_TIMEOUT 安全网被判超时跳过。
   把它当"有则加分、没有也不影响"的可选 agent，别放进默认推荐组合、也别让它阻塞综合。
 - **只读保证**：`--agent plan` + 沙盒。
   ⚠️ **`--agent plan` 不够格当"原生只读"，别把它移到 `codev_bg_native` 去真仓库里跑。**
@@ -327,18 +338,20 @@ fi
   核实型评审实际需要 **60+ 次 Read/Grep**（两次成功轮分别 63、65 次调用才出稿），
   `--max-turns 12` 下终稿一个字没写就被掐掉（stderr `Max turns (12) exceeded`、stdout 空）。
   且 **turn ≠ 调用数**：模型合批时 12 turns 能发 23 次调用，不合批时 40 turns 就只有 40 次——
-  同参数成败全看当轮是否合批，这就是"时好时坏"的来源。另一头是 `codev_run` 的 600s 上限：
+  同参数成败全看当轮是否合批，这就是"时好时坏"的来源。另一头是 `codev_run` 的 CODEV_TIMEOUT 上限（默认 600s）：
   不限 turns 实测 86 次调用后被超时杀掉（同样零输出）。所以两条都要做：
-  **① 评审用 64 turns；② 用下面的"收窄核实范围"把调用数压进 600s 窗口**。
+  **① 评审用 64 turns；② 用下面的"收窄核实范围"把调用数压进超时窗口**（核实型可 `export CODEV_TIMEOUT=1200`）。
   `--effort minimal` 与 `--tools` 白名单仍是必备（放开全部工具 + 默认高 effort 曾致无限兜圈）。
-- **收窄核实范围（评审提示词必做）**：不要笼统写"逐条到 ./repo 核实"——那会把 turn 和 600s
+- **收窄核实范围（评审提示词必做）**：不要笼统写"逐条到 ./repo 核实"——那会把 turn 和超时
   都烧穿。在提示词里明确：**只核实最关键的 3-5 个论断（点名文件/函数），其余凭 diff/摘录判断**；
   或把关键代码片段直接内联进提示词（注意下条体积上限），少读盘。
-- **控制提示词体积**：codebuddy 对大提示词最敏感。给它的 prompt 建议**压到 30KB 以内**
-  （比全局 100KB 阈值更严）——有了 `./repo` 副本，大段代码可让它自己读，但读盘吃 turn，
+- **控制提示词体积**：codebuddy 对大提示词最敏感（阈值见下条 25KB）——有了 `./repo` 副本，大段代码可让它自己读，但读盘吃 turn，
   取舍标准：少数关键片段内联省 turn，全量代码靠 `./repo` + 收窄核实范围。
-- 仍然空输出/超时时：**先读 `codev-err-codebuddy.txt` 分诊**，别一律归因登录：
-  `Max turns (N) exceeded` → turn 预算问题，按上两条调档/收窄后重试一次；
+- **提示词 ≤ 25KB**（比通用 50KB 更严）：成功案例都是 2-25KB 的收窄版；26-30KB 全量版近三次全败（其中含 429）。
+- 仍然空输出/超时时：**先看 `codev_report` 的类别再读 `codev-err-codebuddy.txt`**，别一律归因登录：
+  `429 您的使用量已超出频率限制，将在 <时间> 重置` → 归 `quota`，错误串里的重置时间会被翻牌行带出，
+  到点再试，之前用别家补位；
+  `Max turns (N) exceeded` → 归 `turns`，按上两条调档/收窄后重试一次；
   `400 invalid parameter value` → 服务端拒首条请求，多为 CLI 版本过旧（2026-08-11 实测
   升级 CLI 后消失），提示用户升级 codebuddy；其余（空 stderr / 鉴权字样）才判不可用，
   **跳过它**并如实告诉用户"codebuddy 无输出/超时，已跳过；可运行 `codebuddy` 交互登录后重试"。
@@ -347,13 +360,21 @@ fi
 
 ---
 
-## 失败 / 超时 / 空输出处理（统一话术）
+## 失败 / 超时 / 空输出处理（按 `codev_report` 的类别）
 
-- **超时**（timeout 返回 124，即撞到 600s 安全网）：先确认是否**已用后台执行**——前台短超时误杀是
-  最常见原因。仍超时则告知"<agent> 超过 600s 未返回，已跳过。可降推理强度到 medium/精简提示词后重试。"
-- **鉴权失败**：给出对应登录命令，跳过该 agent，继续其余。
-- **空输出**：跳过并说明（见 codebuddy 条）。
-- **任一 agent 失败都不阻塞其它**；最终综合时注明"本轮实际参与的 agent：X、Y（Z 已跳过）"。
+| 类别 | 翻牌 | 处置 |
+|---|---|---|
+| `timeout` | `⏭ 超时 124，撞 CODEV_TIMEOUT` | 先确认已后台执行；改路径引用少内联、核实清单收窄到 3-8 条、`export CODEV_TIMEOUT=1200` 后重试一次 |
+| `quota` | `⛔ 额度/限流` + 错误行原句 | 本轮无效，**不呈现其输出**；有重置时间就记下到点再试；换别家补位；账本会标记，下次默认不推荐 |
+| `auth` | `⛔ 鉴权失败` | 给对应登录命令，跳过 |
+| `turns` | `⚠️ turn 预算耗尽` | codebuddy 调 `--max-turns 64` + 收窄核实范围后重试一次 |
+| `empty` | `⚠️ 空输出 exit 0` | 本轮无效，**不得当成"无问题"**；读 err 分诊，多为上游断流；重试一次或跳过 |
+| `error` | `⚠️ 非零退出` + 错误行 | reasonix `context canceled` → 缩提示词到 ≤45KB 重试一次；其余按错误行处理 |
+| `ok` 但附"stderr 含错误行" | `✔` + ⚠️ | 正文可能被截断（codex 出过：核对全做完、输出阶段撞额度）；呈现前确认有完整结论段 |
+
+- **任一 agent 失败都不阻塞其它**；最终综合时注明"本轮实际参与的 agent：X、Y（Z：<类别>）"。
+- **有效参与 < 2 家时**（实测一轮 4 家里 2 家额度死、只剩 1-1 分歧）：不做矩阵，按 synthesis.md §0 单模型口径，
+  并建议用户等额度重置后补一轮而不是硬判。
 
 ## 只读风险总结
 
