@@ -357,8 +357,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
    一致率。
 7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
-   修复后的 commit 同样走 `codev_commit_round <pathspec> …`：首参是一个 git pathspec，多文件时给它们的公共目录
-   （函数会打印暂存的 `--stat`，核对没有把用户的无关改动带进去；有就先 `git reset -- <无关文件>`）。
+   修复后的 commit 同样走 `codev_commit_round <文件列表> …`：首参是【空格分隔的具体文件路径】，多文件就都列出来。
+   **不要给目录**——工作树里常有用户自己未提交的改动，给目录会把它们一起提交，函数为此直接拒收目录并返回 1。
 
 ## Step 2F — 文档评审（spec / 实施计划 / 方案文档，无 diff）
 
@@ -385,7 +385,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
    全文 grep 同步**，版本号 +0.1；然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的
    `.superpowers/codev/`，不进 git）+ `codev_commit_round "$DOC" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
-   "Co-Authored-By: …"`（**只提交该文档 pathspec**，工作树里用户的其它改动不碰；trailer 由库写）。
+   "Co-Authored-By: …"`（**只提交显式列出的文件**，工作树里用户的其它改动不碰；trailer 由库写）。
    非 `--auto` → 问用户是否开下一轮；`--auto` → 按 synthesis.md §6.3 判停/续。
 
 ## Step 2C — challenge（对抗式挑战）

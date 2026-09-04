@@ -148,30 +148,69 @@ case "$r" in *"codex"*"gpt-5.6-sol"*) ok "stats 含 codex";; *) bad "stats 缺 c
 case "$r" in *"2/3"*) ok "P1 精确率 2/3";; *) bad "精确率错" "$r";; esac
 case "$r" in *"reasonix"*"0/0"*) ok "reasonix 无 P1 显示 0/0";; *) bad "reasonix 行错" "$r";; esac
 
-echo "19. 回流 commit：只提交 pathspec，trailer 带轮次/评审方/P1 数；无关脏文件不入库；能按 trailer 找回上一轮 commit"
+# 中间产物一律放 $CODEV_DIR（每次运行独立的临时目录），不要用固定的 /tmp 路径：
+# 固定路径会让两次并发运行互相污染，也会让子 shell 失败时的断言读到上一轮的残留文件而误报通过。
+T="$CODEV_DIR"
+
+echo "19. 回流 commit：只提交显式列出的文件，trailer 带轮次/评审方/P1 数；无关脏文件不入库；能按 trailer 找回上一轮 commit"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
   && mkdir -p docs src && echo v1 > docs/spec.md && echo a > src/a.py && git add -A && git commit -qm init \
   && echo v1.1 > docs/spec.md && echo dirty > src/a.py \
   && codev_commit_round docs/spec.md 1 "codex(gpt-5.6-sol), reasonix(deepseek-v4)" 2 - "spec v1.0→v1.1：回流 2 条 P1" "Co-Authored-By: X <x@y>" >/dev/null \
-  && git status --porcelain > /tmp/codev-st.txt && git log -1 --format=%B > /tmp/codev-msg.txt \
+  && git status --porcelain > "$T/codev-st.txt" && git log -1 --format=%B > "$T/codev-msg.txt" \
   && echo v1.2 > docs/spec.md \
   && codev_commit_round docs/spec.md 2 "codex(gpt-5.6-sol)" 0 2 "spec v1.1→v1.2" >/dev/null \
-  && codev_prev_round_commit docs/spec.md 2 > /tmp/codev-prev.txt \
-  && git log --format=%H -2 > /tmp/codev-hashes.txt )
-grep -q '^ M src/a.py' /tmp/codev-st.txt && ok "无关脏文件未入库" || bad "脏文件被提交" "$(cat /tmp/codev-st.txt)"
-grep -q '^Codev-Round: 1$' /tmp/codev-msg.txt && ok "Codev-Round trailer" || bad "缺 Codev-Round" "$(cat /tmp/codev-msg.txt)"
-grep -q '^Codev-Reviewed-By: codex(gpt-5.6-sol), reasonix(deepseek-v4)$' /tmp/codev-msg.txt && ok "Reviewed-By" || bad "缺 Reviewed-By" "$(cat /tmp/codev-msg.txt)"
-grep -q '^Codev-Verified-P1: 2 (prev -)$' /tmp/codev-msg.txt && ok "Verified-P1" || bad "缺 Verified-P1" "$(cat /tmp/codev-msg.txt)"
-grep -q '^Co-Authored-By: X <x@y>$' /tmp/codev-msg.txt && ok "额外 trailer 透传" || bad "缺额外 trailer" "$(cat /tmp/codev-msg.txt)"
-[ "$(cat /tmp/codev-prev.txt)" = "$(sed -n 2p /tmp/codev-hashes.txt)" ] && ok "找回第 1 轮 commit" || bad "prev commit 错" "$(cat /tmp/codev-prev.txt) vs $(cat /tmp/codev-hashes.txt)"
-rm -rf "$REPO" /tmp/codev-st.txt /tmp/codev-msg.txt /tmp/codev-prev.txt /tmp/codev-hashes.txt
+  && codev_prev_round_commit docs/spec.md 2 > "$T/codev-prev.txt" \
+  && git log --format=%H -2 > "$T/codev-hashes.txt" ) && ok "回流 commit 流程整体成功" || bad "回流 commit 子流程失败（下面的断言不可信）"
+grep -q '^ M src/a.py' "$T/codev-st.txt" && ok "无关脏文件未入库" || bad "脏文件被提交" "$(cat "$T/codev-st.txt" 2>&1)"
+grep -q '^Codev-Round: 1$' "$T/codev-msg.txt" && ok "Codev-Round trailer" || bad "缺 Codev-Round" "$(cat "$T/codev-msg.txt" 2>&1)"
+grep -q '^Codev-Reviewed-By: codex(gpt-5.6-sol), reasonix(deepseek-v4)$' "$T/codev-msg.txt" && ok "Reviewed-By" || bad "缺 Reviewed-By" "$(cat "$T/codev-msg.txt" 2>&1)"
+grep -q '^Codev-Verified-P1: 2 (prev -)$' "$T/codev-msg.txt" && ok "Verified-P1" || bad "缺 Verified-P1" "$(cat "$T/codev-msg.txt" 2>&1)"
+grep -q '^Co-Authored-By: X <x@y>$' "$T/codev-msg.txt" && ok "额外 trailer 透传" || bad "缺额外 trailer" "$(cat "$T/codev-msg.txt" 2>&1)"
+[ -s "$T/codev-prev.txt" ] && [ "$(cat "$T/codev-prev.txt")" = "$(sed -n 2p "$T/codev-hashes.txt")" ] && ok "找回第 1 轮 commit" || bad "prev commit 错" "$(cat "$T/codev-prev.txt" 2>&1) vs $(cat "$T/codev-hashes.txt" 2>&1)"
+rm -rf "$REPO" "$T/codev-st.txt" "$T/codev-msg.txt" "$T/codev-prev.txt" "$T/codev-hashes.txt"
+
+echo "19b. 回流 commit 拒收目录：给目录会把同目录下用户未提交的无关改动一起卷进来"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && mkdir -p docs && echo v1 > docs/spec.md && echo w1 > docs/wip.md && git add -A && git commit -qm init \
+  && echo v1.1 > docs/spec.md && echo w2 > docs/wip.md \
+  && codev_commit_round docs 1 codex 1 - "给目录" > "$T/codev-dir.txt" 2>&1; echo "rc=$?" >> "$T/codev-dir.txt"
+  git -C "$REPO" status --porcelain >> "$T/codev-dir.txt" )
+grep -q '^rc=1$' "$T/codev-dir.txt" && ok "目录 pathspec 被拒" || bad "目录未被拒" "$(cat "$T/codev-dir.txt" 2>&1)"
+grep -q '^ M docs/wip.md' "$T/codev-dir.txt" && ok "无关文件仍未提交" || bad "无关文件被提交" "$(cat "$T/codev-dir.txt" 2>&1)"
+rm -rf "$REPO" "$T/codev-dir.txt"
 
 echo "20. 归档：codev_archive 把本会话 prompt/out/err/metrics 复制到 <repo>/.superpowers/codev/<slug>/r<N>/，并保证被 git 忽略"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); mk codex "body" "err"; printf 'p' > "$CODEV_DIR/codev-prompt-codex.txt"
-( cd "$REPO" && git init -q && codev_archive spec-a 2 >/dev/null && ls .superpowers/codev/spec-a/r2/ > /tmp/codev-ar.txt && git check-ignore -q .superpowers/codev/spec-a/r2/codev-out-codex.txt && echo ignored >> /tmp/codev-ar.txt )
-grep -q 'codev-out-codex.txt' /tmp/codev-ar.txt && ok "已归档" || bad "未归档" "$(cat /tmp/codev-ar.txt)"
-grep -q '^ignored$' /tmp/codev-ar.txt && ok "被 git 忽略（.git/info/exclude）" || bad "未忽略" "$(cat /tmp/codev-ar.txt)"
-rm -rf "$REPO" /tmp/codev-ar.txt
+( cd "$REPO" && git init -q && codev_archive spec-a 2 > "$T/codev-ar.txt" && ls .superpowers/codev/spec-a/r2/ >> "$T/codev-ar.txt" \
+  && git check-ignore -q .superpowers/codev/spec-a/r2/codev-out-codex.txt && echo ignored >> "$T/codev-ar.txt" ) \
+  && ok "归档流程整体成功" || bad "归档子流程失败（下面的断言不可信）" "$(cat "$T/codev-ar.txt" 2>&1)"
+grep -q 'codev-out-codex.txt' "$T/codev-ar.txt" && ok "已归档" || bad "未归档" "$(cat "$T/codev-ar.txt" 2>&1)"
+grep -q '^ignored$' "$T/codev-ar.txt" && ok "被 git 忽略（.git/info/exclude）" || bad "未忽略" "$(cat "$T/codev-ar.txt" 2>&1)"
+grep -q '已被 git 忽略' "$T/codev-ar.txt" && ok "归档提示与实际一致" || bad "归档提示不对" "$(cat "$T/codev-ar.txt" 2>&1)"
+rm -rf "$REPO" "$T/codev-ar.txt"
+
+echo "20b. 归档在 worktree 里（.git 是文件）：exclude 要写进真正的 gitdir，且提示不许谎称已忽略"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); WT=$(mktemp -d -t codevwt.XXXXXX); rm -rf "$WT"
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && echo a > a.txt && git add -A && git commit -qm init && git worktree add -q "$WT" -b wt2 >/dev/null 2>&1 )
+( cd "$WT" && codev_archive spec-a 3 > "$T/codev-wt.txt" 2>&1; echo "rc=$?" >> "$T/codev-wt.txt"
+  git -C "$WT" check-ignore -q .superpowers/codev/spec-a/r3/codev-out-codex.txt && echo ignored >> "$T/codev-wt.txt" )
+grep -q '^rc=0$' "$T/codev-wt.txt" && ok "worktree 归档成功" || bad "worktree 归档失败" "$(cat "$T/codev-wt.txt" 2>&1)"
+grep -q '^ignored$' "$T/codev-wt.txt" && ok "worktree 里也真的被忽略" || bad "worktree 未忽略" "$(cat "$T/codev-wt.txt" 2>&1)"
+grep -q '已被 git 忽略' "$T/codev-wt.txt" && ok "worktree 提示与实际一致" || bad "提示不对" "$(cat "$T/codev-wt.txt" 2>&1)"
+git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1; rm -rf "$REPO" "$WT" "$T/codev-wt.txt"
+
+echo "21. 回归：probe 在没有发现台账时返回 0；cost/tokens 遇到 null 值不串到下一个数字；账本兼容旧 7 列"
+( CODEV_FINDINGS="$CODEV_DIR/no-such-findings.tsv"; codev_probe >/dev/null 2>&1 ) && ok "probe 无台账时 rc=0" || bad "probe 无台账时 rc≠0"
+printf '{"model":"x","cost": null, "currency": null, "prompt_tokens": 4210, "completion_tokens": 7}\n' > "$CODEV_DIR/codev-metrics-nul.json"
+c=$(codev_cost nul); [ -z "$c" ] && ok "cost=null 不报假成本" || bad "cost=null 被当成数字" "$c"
+t=$(codev_tokens nul); case "$t" in "tokens 4217") ok "tokens 仍按锚定后的键取";; *) bad "tokens 解析错" "$t";; esac
+LEG="$CODEV_DIR/legacy-ledger.tsv"
+printf '2026-09-01T10:00\tcodex\tquota\t1\t3\t10\t0\n2026-09-01T10:05\tcodex\tok\t0\t9\t10\t20\n' > "$LEG"
+r=$(CODEV_LEDGER="$LEG" codev_ledger_recent codex)
+case "$r" in *"quota ok"*"最近 09-01T10:05"*) ok "旧 7 列账本仍可读";; *) bad "旧账本行被丢弃" "$r";; esac
+codev_finding_add ntms spec-a 1 codex m id P1 A 采纳 成立 独家 未加引号的 描述 2>/dev/null && bad "多余实参未被拒" || ok "finding_add 拒收未加引号的描述"
 
 rm -rf "$CODEV_DIR"
 echo; echo "pass=$pass fail=$fail"

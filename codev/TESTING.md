@@ -6,13 +6,16 @@
 ## 1. 库回归测试（必跑）
 
 ```bash
-bash tests/test-lib.sh          # bash
-zsh -c 'bash tests/test-lib.sh' # 本机默认 shell 是 zsh，两边都要绿
+bash tests/test-lib.sh   # bash
+zsh  tests/test-lib.sh   # 本机默认 shell 是 zsh，两边都要绿
+# 注意别写成 zsh -c 'bash tests/test-lib.sh'——那只是起个 zsh 立刻转交 bash，脚本从没在 zsh 下跑过。
+# zsh 特有的坑（path 是绑定 $PATH 的特殊数组、glob 无匹配默认报错）只有真跑 zsh 才暴露得出来。
 ```
 末行 `pass=N fail=0` 即通过。覆盖：七类翻牌（含 qoderclicn 额度写 stdout、codex 错误在 1MB stderr 尾部、
 codebuddy 429 重置时间、Max turns、context canceled、空输出、部分输出+截断警告）、`CODEV_TIMEOUT` 生效与非法值、
 账本 12 列与 probe 摘要、tokens/成本解析（含 JSON 同名键重复）、模型识别、发现台账与 `codev_stats`、
-`codev_commit_round`（pathspec 隔离脏文件、trailer、找回上一轮 commit）、`codev_archive`（归档 + git 忽略）。
+`codev_commit_round`（隔离脏文件、拒收目录、trailer、找回上一轮 commit）、`codev_archive`（归档 + git 忽略，
+含 worktree 场景）、probe 空台账返回 0、cost/tokens 遇 null 不串号、账本兼容旧 7 列。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。

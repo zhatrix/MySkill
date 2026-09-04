@@ -146,8 +146,9 @@ codev_tokens() {
       if [ -s "$m" ]; then
         # 只取【第一次出现】：metrics JSON 里同名键会在嵌套的 per-provider 段重复出现，
         # 不加 head -n1 会把多个数字串接成一个天文数字（实测 5826 → 58265848）。
-        a=$(grep -o '"prompt_tokens"[^0-9]*[0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
-        b=$(grep -o '"completion_tokens"[^0-9]*[0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
+        # 同 codev_cost：冒号后紧跟数字，否则 "prompt_tokens": null 会串到下一个键的数字上。
+        a=$(grep -o '"prompt_tokens"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
+        b=$(grep -o '"completion_tokens"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
         [ -n "$a" ] && n=$(( ${a:-0} + ${b:-0} ))
       fi ;;
   esac
@@ -173,8 +174,9 @@ codev_model_of() {
 codev_cost() {
   local m="$CODEV_DIR/codev-metrics-$1.json" c u
   [ -s "$m" ] || return 0
-  c=$(grep -o '"cost"[^0-9]*[0-9][0-9.]*' "$m" 2>/dev/null | head -n 1 | sed 's/.*[^0-9.]\([0-9][0-9.]*\)$/\1/')
-  u=$(grep -o '"currency"[^"]*"[A-Za-z]*"' "$m" 2>/dev/null | head -n 1 | sed 's/.*"\([A-Za-z]*\)"$/\1/')
+  # 冒号后必须【紧跟】数字：不锚定的话 "cost": null 会一路吃到同一行下一个数字（实测把 4210 个 token 当成 4210.000 CNY 报出去）。
+  c=$(grep -o '"cost"[[:space:]]*:[[:space:]]*[0-9][0-9.]*' "$m" 2>/dev/null | head -n 1 | sed 's/.*[^0-9.]\([0-9][0-9.]*\)$/\1/')
+  u=$(grep -o '"currency"[[:space:]]*:[[:space:]]*"[A-Za-z]*"' "$m" 2>/dev/null | head -n 1 | sed 's/.*"\([A-Za-z]*\)"$/\1/')
   [ -n "$c" ] && printf '%.3f %s' "$c" "${u:-?}"
   return 0
 }
@@ -206,7 +208,9 @@ codev_ledger_append() {
 codev_ledger_recent() {
   local agent="$1" rows
   [ -s "$CODEV_LEDGER" ] || return 0
-  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | awk -F'\t' -v a="$agent" '$3==a' | tail -n 3)
+  # 兼容升级前写下的旧行：7 列布局是 时间 agent 类别 rc 用时 提示词字节 输出字节（agent 在第 2 列、类别在第 3 列）。
+  # 只认 12 列的话，老用户升级后 probe 的"近期 3 次结果"会整片消失，连续 quota 的 agent 就拦不住了。
+  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | awk -F'\t' -v a="$agent" 'NF>=12 && $3==a { print } NF==7 && $2==a { print $1 "\t-\t" $2 "\t-\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t-\t-\t-" }' | tail -n 3)
   [ -n "$rows" ] || return 0
   printf '%s (最近 %s)' \
     "$(printf '%s\n' "$rows" | awk -F'\t' '{ if ($5=="quota" && $12!="-") printf "%s(%s) ", $5, $12; else printf "%s ", $5 }' | sed 's/ $//')" \
@@ -227,7 +231,8 @@ codev_session_summary() {
 #   severity: P1/P2/P3   column: A/B（agent 自报的已查证/待核实）   verdict: 采纳/驳回/存疑
 #   verified: 成立/不成立/待定（Claude 亲验结果）   unique: 独家/共同（是否只有这一家发现）
 codev_finding_add() {
-  [ $# -ge 12 ] || { echo "用法: codev_finding_add repo doc round agent model id severity column verdict verified unique desc" >&2; return 1; }
+  # 必须是 -eq：-ge 会放过没加引号的多词描述（"漏 tenant_id" 拆成 3 个实参），写出 13 列以外的坏行。
+  [ $# -eq 12 ] || { echo "用法: codev_finding_add repo doc round agent model id severity column verdict verified unique desc（12 个实参，描述记得加引号）" >&2; return 1; }
   local d f
   d=$(dirname "$CODEV_FINDINGS"); mkdir -p "$d" 2>/dev/null || return 1
   printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_FINDINGS"
@@ -252,16 +257,18 @@ codev_stats() {
     END { for (k in n) { split(k, kk, "\t"); printf "  %-10s %-18s P1 %d/%d  独家成立 %d  总 %d  采纳 %d\n", kk[1], kk[2], ok[k]+0, p1[k]+0, u[k]+0, n[k], a[k]+0 } }' "$CODEV_FINDINGS" | sort
 }
 
-# codev_commit_round <path> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
-# 一轮回流后的 commit：【只提交 <path>（pathspec）】，绝不 add -A——工作树里常有用户自己未提交的无关改动。
+# codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
+# 一轮回流后的 commit：【只提交 <files> 里显式列出的文件】，绝不 add -A，也【不收目录】——工作树里常有
+# 用户自己未提交的无关改动，给目录会把它们一起卷进来，而且 add/commit 在同一次调用里，调用方来不及干预。
+# <files> = 空格或换行分隔的文件路径列表（因此路径不能含空格）；传目录直接报错返回 1。
 # 提交信息 = <summary> + 空行 + trailer 块（Codev-Round / Codev-Reviewed-By / Codev-Verified-P1 + 透传的额外 trailer，
 # 如 Co-Authored-By）。trailer 让 `git log --grep '^Codev-Round: 2'` 能直接回答"第 2 轮评了谁、剩几条 P1"。
 codev_commit_round() {
-  [ $# -ge 6 ] || { echo "用法: codev_commit_round path round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
-  local path="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t; shift 6
-  git add -- "$path" || return 1
-  if git diff --cached --quiet -- "$path"; then echo "⚠️ $path 没有待提交的改动，跳过 commit" >&2; return 1; fi
-  git diff --cached --stat -- "$path" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件（pathspec 是目录时尤其要核对）
+  [ $# -ge 6 ] || { echo "用法: codev_commit_round files round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
+  # 变量名【绝不能叫 path】：zsh 里 path 是绑定 $PATH 的特殊数组，local path=… 会把 PATH 换成该路径，
+  # 函数体内 git/mktemp/sed 全部 command not found。同理见 codev_prev_round_commit。
+  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc noglob=
+  shift 6                                   # 剩下的位置参数是要透传的 trailer，先写进 msg 再复用位置参数装文件列表
   msg=$(mktemp -t codev-msg.XXXXXX) || return 1
   {
     printf '%s\n\n' "$summary"
@@ -270,7 +277,19 @@ codev_commit_round() {
     printf 'Codev-Verified-P1: %s (prev %s)\n' "$p1" "$prev"
     for t in "$@"; do printf '%s\n' "$t"; done
   } > "$msg"
-  git commit -q -F "$msg" -- "$path"; local rc=$?
+  case "$-" in *f*) noglob=1;; esac         # 拆词时关通配，路径按字面走；原来开着就别关回去
+  set -f; set -- $files; [ -n "$noglob" ] || set +f
+  if [ $# -lt 1 ]; then echo "⚠️ 没有给任何文件路径" >&2; rm -f "$msg"; return 1; fi
+  for t in "$@"; do
+    if [ -d "$t" ]; then
+      echo "⚠️ $t 是目录：codev_commit_round 只收具体文件，否则会把工作树里无关的脏文件一并提交" >&2
+      rm -f "$msg"; return 1
+    fi
+  done
+  git add -- "$@" || { rm -f "$msg"; return 1; }
+  if git diff --cached --quiet -- "$@"; then echo "⚠️ $files 没有待提交的改动，跳过 commit" >&2; rm -f "$msg"; return 1; fi
+  git diff --cached --stat -- "$@" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件
+  git commit -q -F "$msg" -- "$@"; rc=$?
   rm -f "$msg"
   [ "$rc" = 0 ] && echo "✔ 已提交第 $round 轮回流：$(git log -1 --format=%h) $summary"
   return $rc
@@ -279,27 +298,38 @@ codev_commit_round() {
 # codev_prev_round_commit <path> <round> — 找触及 <path> 且 trailer 为 Codev-Round: <round-1> 的最近 commit（找不到输出空）。
 # 用途：第 N 轮提示词里内联 `git diff <该 commit> -- <path>`，让 agent 看到两版之间的真实差异而不是手写的"改动章节"。
 codev_prev_round_commit() {
-  local path="$1" round="$2" prev
+  local f="$1" round="$2" prev                 # 变量名不能叫 path：zsh 里它绑定 $PATH，见 codev_commit_round 的注释
   prev=$((round - 1)); [ "$prev" -ge 1 ] || return 0
-  git log --format=%H --grep="^Codev-Round: $prev\$" -- "$path" 2>/dev/null | head -n 1
+  git log --format=%H --grep="^Codev-Round: $prev\$" -- "$f" 2>/dev/null | head -n 1
 }
 
 # codev_archive <slug> <round> — 把本会话的 prompt/out/err/metrics 归档到 <仓库根>/.superpowers/codev/<slug>/r<N>/。
-# 会话目录 24h 后被 GC，归档让"第 3 轮 codex 当时原话是什么"仍可查；目录用 .git/info/exclude 保证不入库
-# （本地生效、不改仓库的 .gitignore）。评审原文不进 git：几十 KB × 多家 × 多轮会堆满仓库。
+# 会话目录 24h 后被 GC，归档让"第 3 轮 codex 当时原话是什么"仍可查；目录用 common gitdir 的 info/exclude
+# 保证不入库（本地生效、不改仓库的 .gitignore）。评审原文不进 git：几十 KB × 多家 × 多轮会堆满仓库。
 codev_archive() {
-  local slug="$1" round="$2" root dest f
+  local slug="$1" round="$2" root gitdir dest
   root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "⚠️ 非 git 仓库，跳过归档" >&2; return 1; }
+  # 不能硬写 $root/.git：worktree / submodule 里 .git 是【文件】，mkdir 会失败，exclude 就写不进去。
+  # 要的是 common dir 而不是 --absolute-git-dir：linked worktree 的 info/exclude 只认共享 gitdir，
+  # 写进 .git/worktrees/<name>/info/exclude 是不生效的（实测 check-ignore 仍为 NOT）。
+  gitdir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null)
+  case "$gitdir" in ''|/*) ;; *) gitdir="$root/$gitdir";; esac
   slug=$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-')
   dest="$root/.superpowers/codev/$slug/r$round"
   mkdir -p "$dest" || return 1
   if ! git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
-    mkdir -p "$root/.git/info" && printf '.superpowers/\n' >> "$root/.git/info/exclude"
+    [ -n "$gitdir" ] && mkdir -p "$gitdir/info" && printf '.superpowers/\n' >> "$gitdir/info/exclude"
   fi
-  for f in "$CODEV_DIR"/codev-prompt-*.txt "$CODEV_DIR"/codev-out-*.txt "$CODEV_DIR"/codev-err-*.txt "$CODEV_DIR"/codev-metrics-*.json; do
-    [ -f "$f" ] && cp "$f" "$dest/"
-  done
-  echo "已归档到 ${dest}（已被 git 忽略）"
+  # 用 find 而不是 for f in "$CODEV_DIR"/xxx-*：zsh 默认 NOMATCH，glob 匹配不到文件时直接报错终止函数
+  # （只有 metrics 缺失就整个归档失败）。find 还顺带能扛住路径里的空格。
+  find "$CODEV_DIR" -maxdepth 1 -type f \( -name 'codev-prompt-*.txt' -o -name 'codev-out-*.txt' \
+    -o -name 'codev-err-*.txt' -o -name 'codev-metrics-*.json' \) -exec cp {} "$dest/" \; 2>/dev/null
+  # 只有真的忽略掉了才这么说——评审原文含仓库 diff，被误 `git add -A` 进仓库比不归档更糟。
+  if git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
+    echo "已归档到 ${dest}（已被 git 忽略）"
+  else
+    echo "已归档到 ${dest}（⚠️ 未能写进 git 忽略，请勿 git add -A，自行确认它不进仓库）"
+  fi
 }
 
 # codev_report <agent> <rc> <errfile> — 打印完成行 + 【按类别显式上报】+ 记账本。
@@ -653,4 +683,5 @@ codev_probe() {
   echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
   [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
   [ -s "$CODEV_FINDINGS" ] && echo "发现台账 -> ${CODEV_FINDINGS}（codev_stats 看每个 agent/模型的 P1 亲验成立率）"
+  return 0   # 上面两行是可选提示，没有台账文件时它的假值不能变成 probe 的失败状态
 }
