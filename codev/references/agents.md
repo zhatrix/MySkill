@@ -43,7 +43,7 @@
 | `codev_archive <slug> <round>` | 把本会话 prompt/out/err/metrics 复制到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`，并把 `.superpowers/` 写进 **common gitdir**（`git rev-parse --git-common-dir`，worktree 里 `.git` 是文件）的 `info/exclude` 保证不入库；写不进去时提示会如实说"未能写进 git 忽略"，不会谎称已忽略。 |
 | `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间；`codev_ledger_recent` 同时兼容升级前的旧 7 列布局 时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着一律不删；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时且目录内 24 小时内无任何文件写入**（会话目录没有单一持有者 pid，按活动时间判活；且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着不删，但**超 7 天不看 pid 一律删**——pid 会被复用；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时且目录内 24 小时内无任何文件写入**（会话目录没有单一持有者 pid，按活动时间判活；且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ `self`（本 agent 的 fresh-subagent，总是可用）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
@@ -210,6 +210,7 @@ fi
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high -p
   ```
   （`--effort high` 不是笔误：reasonix 拒绝 `medium`，见下方 reasonix 条目。）
@@ -278,6 +279,7 @@ fi
 - **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
   ```
   `--metrics <path>` 写一份 JSON（prompt_tokens / completion_tokens / steps / cost CNY，v1.35 实测可用），
@@ -302,6 +304,7 @@ fi
 - **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed qoderclicn qoderclicn --reasoning-effort medium --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   ```
   可选 `-m <model>`。注意 `--tools` 是变长参数，**必须用 `-p` 把它与 query 隔开**（把 `-p …` 放最后）。
@@ -322,6 +325,7 @@ fi
 - **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed opencode opencode run --agent plan "$(cat "$PROMPT")"
   ```
   默认纯文本便于逐字呈现；`--format json` 输出事件流（可读性差，仅需解析时用）。
@@ -350,8 +354,10 @@ fi
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   # 轻量咨询 / 纯 diff 意见（不要求逐条进 ./repo 核实）：
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 12 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   # 核实型评审（提示词要求"读 ./repo 核实事实"，spec/多轮评审都算）：
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
   codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 64 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   ```
 - **只读保证**：`--tools "Read,Glob,Grep"`（只读工具白名单，同 qoderclicn 的 harness 级强制）
@@ -404,7 +410,8 @@ fi
 | agent | 只读保障级别 | 实测旗标 | 运行位置 |
 |---|---|---|---|
 | codex | **沙盒级**（进程被限制） | `-s read-only`（`review` 子命令天然只读，不吃 `-s`） | 真实仓库 `codev_bg_native` |
-| self（本 agent 的 fresh-subagent，SKILL 通用机制 G） | **弱**（提示词只读 + 发出前后 `git status --porcelain` 快照核对，与 opencode 同档） | Agent 工具 general-purpose，提示词写明禁止改文件 | 真实仓库（Agent 工具的 cwd） |
+| check（G1 自查 subagent） | **弱**（同 self：提示词只读 + 双快照核对；它独占真仓库，归因无歧义） | Agent 工具 general-purpose | 真实仓库 |
+| self（本 agent 的 fresh-subagent，SKILL 通用机制 G） | **弱**（保障级别同 opencode；提示词只读 + 发出前后 `git status --porcelain` 与 `git diff HEAD \| codev_hash` 双快照核对） | Agent 工具 general-purpose，提示词写明禁止改文件 | 真实仓库（Agent 工具的 cwd）；能与外审并行是因为同期在真仓库里的只有沙盒级只读的 codex/gemini，快照差异可唯一归因到 self |
 | gemini | **沙盒级** | `--approval-mode plan` | 真实仓库 `codev_bg_native` |
 | qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
 | codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |

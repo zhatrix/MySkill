@@ -73,7 +73,7 @@ case "${CODEV_TIMEOUT:-}" in
     fi ;;
 esac
 
-# 跨会话【近期结果账本】：每次 codev_report 追加一行 TSV（时间 agent 类别 rc 用时秒 提示词字节 输出字节），
+# 跨会话【近期结果账本】：每次 codev_report 追加一行 TSV（12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注），
 # codev_probe 读它给每个 agent 标"近期 3 次结果"。解决的实测痛点：qoderclicn 额度死透、codebuddy 连续
 # 429 后，下一会话仍按过期的默认组合把它们推荐上去、白跑一轮才发现。账本只记类别与字节数，不记内容。
 CODEV_LEDGER="${CODEV_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/ledger.tsv}"
@@ -117,10 +117,14 @@ codev_classify() {
     c=$(codev_match_class "$short"); [ -n "$c" ] && { echo "$c"; return 0; }
   fi
   # ①' 长 stdout（≥600 字节）不能一律放行：额度/登录页也可能是一整页 HTML/说明文（三轮评审都提了这条）。
-  #    条件收紧为两条同时成立：【开头 600 字节】命中错误串，且【全文】没有任何评审结论标记——真评审再长也会有
-  #    P1/P2/PASS/FAIL/标题之一，错误页则不会。
+  #    但也不能用 ① 的宽模式：consult 式的长散文回答里讨论 "429 / rate limit" 很正常、又没有 P 级/标题标记，
+  #    会被误杀成 quota（第 4 轮自查实测 860 字节散文 → quota）。所以三条同时成立才判：
+  #    【全文】无评审结论标记、【开头 600 字节】命中【强】错误短语（不设总长上限：5KB 的 HTML 额度页也见过）——
+  #    只认"用量/额度已耗尽、请登录、密钥无效"这类整句，不认 rate limit / 429 / 401 / authentication 这类可能出现在正文里的词。
   if [ "$osz" -ge 600 ] && ! grep -qE '(^|[^A-Za-z])(PASS|FAIL|LGTM|P[123])([^A-Za-z]|$)|✔|结论|发现|^#' "$out" 2>/dev/null; then
-    c=$(codev_match_class "$(head -c 600 "$out" 2>/dev/null)"); [ -n "$c" ] && { echo "$c"; return 0; }
+    # 只认整句：评审限流模块的散文里也会出现 "usage limit" / "quota limit" 这种词，要的是 "you've reached your usage limit" 这种句子。
+    if head -c 600 "$out" 2>/dev/null | grep -qiE "(you('ve| have)|has been|have been) (reached|exceeded|hit) (your |the )?(daily |monthly )?(usage|credit|quota|rate|request) limit|credit usage limit|quota (has been )?exceeded|额度(已)?(用尽|耗尽|不足)|insufficient (balance|credit|funds)|resource.?exhausted|upgrade your (subscription|plan)"; then echo quota; return 0; fi
+    if head -c 600 "$out" 2>/dev/null | grep -qiE 'not logged in|please (log ?in|login)|invalid api key|login (required|expired)|登录已过期|认证失败|请先登录'; then echo auth; return 0; fi
   fi
   # ② stdout 为空：stderr 错误行决定类别；没有错误行且 rc=0 → empty。
   if [ "$osz" -eq 0 ]; then
@@ -403,7 +407,7 @@ codev_report() {
     timeout) printf '⏭ %s 跳过（超时 rc=%s%s，撞 CODEV_TIMEOUT=%ss 安全网%s）→ 缩小核实范围/改路径引用少内联/或 export CODEV_TIMEOUT=1200 后重试\n' \
                "$agent" "$rc" "$([ "$rc" = 137 ] && printf '，进程 trap 了 TERM 由 -k 补 KILL')" "$CODEV_TIMEOUT" "${secs:+，用时 ${secs}s}" ;;
     quota)   printf '⛔ %s 额度/限流（exit=%s，本轮无效，勿当评审呈现）:\n' "$agent" "$rc"
-             { [ -n "$lines" ] && printf '%s\n' "$lines"; [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out"; } | sed 's/^/  /'
+             { [ -n "$lines" ] && printf '%s\n' "$lines"; [ -s "$out" ] && head -c 600 "$out"; } | sed 's/^/  /'   # 长额度页只显示开头 600 字节
              echo "  → 跳过该 agent；错误串里若有重置时间，之后再试；换其它 agent 补位" ;;
     auth)    printf '⛔ %s 鉴权失败（exit=%s）→ 按 agents.md 的登录命令处理后重试:\n' "$agent" "$rc"
              printf '%s\n' "$lines" | sed 's/^/  /' ;;
@@ -445,7 +449,9 @@ CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 # 碰撞可人为构造，撞上就静默复用错树；没有 shasum 才退回 POSIX 的 cksum。
 # shasum 存在但跑不动（perl 环境坏）时也要能退到 cksum：先把 stdin 落到临时文件，依次尝试，谁先有输出用谁。
 codev_hash() {
-  local t h; t=$(mktemp -t codev-hash.XXXXXX) || return 1; cat > "$t"
+  # 临时文件放会话目录：输入含 git diff + 未跟踪文件全文，放 $TMPDIR 的话进程被杀就永久留一份工作区内容，GC 也不收它；
+  # 会话目录随收尾 / 24h GC 一起删。CODEV_DIR 不可写时才退到 $TMPDIR。
+  local t h; t=$(mktemp "$CODEV_DIR/codev-hash.XXXXXX" 2>/dev/null || mktemp -t codev-hash.XXXXXX) || return 1; cat > "$t"
   h=$(shasum < "$t" 2>/dev/null | cut -c1-40); [ -n "$h" ] || h=$(cksum < "$t" 2>/dev/null | tr -cd '0-9')
   rm -f "$t"; printf '%s' "$h"
 }
@@ -484,7 +490,11 @@ codev_master_path() {
 # 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
 codev_repo_master() {
   codev_master_path || return 1     # 先按仓库+工作区状态定母本路径，避免复用到别的树
-  [ -d "$CODEV_MASTER" ] && return 0        # 已铺好，复用
+  if [ -d "$CODEV_MASTER" ]; then           # 已铺好，复用
+    # 上一个 builder 若在 mv 之后、chmod 之前被杀，母本是可写的；复用前补一次 a-w（只有发布者会碰母本，补权限无竞争）。
+    [ -n "$(find "$CODEV_MASTER" \( -type f -o -type d \) -perm -u+w 2>/dev/null | head -1)" ] && chmod -R a-w "$CODEV_MASTER" 2>/dev/null
+    return 0
+  fi
   # holder 必须在这里【一次性】声明：写成循环体内的 `local holder` 会在 zsh 下每轮打印
   # 「holder=<pid>」污染输出——zsh 未设 TYPESET_SILENT 时，对【已存在】的变量再执行不带赋值的
   # local/typeset 会显示它的当前值（实测等待循环每秒吐一行）。bash 无此行为。
@@ -608,6 +618,8 @@ codev_repo_master() {
               # 目录项（只可能是 submodule 挂载点，ls-files 对普通目录不输出）直通：过滤只挡【文件】，
               # 名叫 vendor.env 的 submodule 不该因为名字被整棵挡掉；--no-recursion 只建空目录、不下钻。
               [ -d "$f" ] && [ ! -L "$f" ] && { printf '%s\0' "$f"; continue; }
+              # 只收普通文件与 symlink（symlink 稍后统一删）：FIFO/socket/设备文件进了副本，agent 一 cat 就阻塞到超时。
+              { [ -f "$f" ] || [ -L "$f" ]; } || continue
               # 这份清单必须与下面 find -iname 那轮【一一对应】（那轮补大小写变体）。改一边就同步另一边。
               case "${f##*/}" in
                 .env|*.env|.env.*|.envrc|*.pem|*.key|*.p12|*.pfx|id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|\
@@ -656,7 +668,9 @@ codev_repo_master() {
     # mv 失败但母本已在：别人先发布并已 chmod a-w，我的 mv 被 EACCES 挡住——那是好事，复用即可，别退回 text。
     # 快照一致性：签名是进临界区前算的，tar 期间工作区若被改，母本就是新旧混合的树、却挂着旧签名。
     # 构建完再算一次，不一致就丢掉这份（exit 2 让外层重试一次），一致才发布。子 shell 里重算只改子 shell 的 CODEV_MASTER。
-    codev_master_path 2>/dev/null; if [ "$CODEV_MASTER" != "${part%.partial.*}" ]; then rm -rf "$part"; exit 2; fi
+    # 复算失败（哈希都没输出）也按"变了"处理：函数在赋值前就 return 1，CODEV_MASTER 保持旧值会被误判成"没变"而放行。
+    codev_master_path 2>/dev/null || { rm -rf "$part"; exit 2; }
+    if [ "$CODEV_MASTER" != "${part%.partial.*}" ]; then rm -rf "$part"; exit 2; fi
     mv "$part" "$CODEV_MASTER" || { rm -rf "$part"; [ -d "$CODEV_MASTER" ] && exit 0; exit 1; }
     # 双 builder 极窄窗口（上一行 -e 与 mv 之间别人先发布、且还没来得及 chmod）：mv 会把我的 .partial 移【进】它里面。
     # 母本已是 a-w，先给顶层 u+w 才能删掉嵌进去的那份。
@@ -673,8 +687,9 @@ codev_repo_master() {
     # 注意此时母本已 mv 到位，until 里的等待者可能在下面 rm 之前看到它并开始 clone——它们 clone 出的副本
     # 会在 codev_repo_copy 自己的校验里再被拦一次，所以不会有 agent 拿到可写副本，只是白干一次。
     # 除了看 mode 位，再做一次【有效权限】探针：ACL/特殊文件系统可能在 u+w 清掉后仍允许写。能在母本根建目录就是没锁住。
-    if [ -n "$(find "$CODEV_MASTER" \( -type f -o -type d \) -perm -u+w 2>/dev/null | head -1)" ] \
-       || { mkdir "$CODEV_MASTER/.codev-probe" 2>/dev/null && rmdir "$CODEV_MASTER/.codev-probe" 2>/dev/null; }; then
+    # 探针：mkdir 成功就是不安全，rmdir 成败不参与判定（原来写 mkdir && rmdir，rmdir 失败反而判成安全、还留下探针目录）。
+    probe=; if mkdir "$CODEV_MASTER/.codev-probe" 2>/dev/null; then probe=1; rmdir "$CODEV_MASTER/.codev-probe" 2>/dev/null; fi
+    if [ -n "$probe" ] || [ -n "$(find "$CODEV_MASTER" \( -type f -o -type d \) -perm -u+w 2>/dev/null | head -1)" ]; then
       echo "⚠️ 母本 chmod -R a-w 未完全生效，放弃副本模式" >&2
       chmod -R u+w "$CODEV_MASTER" 2>/dev/null; rm -rf "$CODEV_MASTER"; exit 1
     fi
@@ -697,8 +712,14 @@ codev_repo_master() {
 }
 
 codev_repo_copy() {
-  local sbox="$1"
+  local sbox="$1" probe
   codev_repo_master || return 1              # 母本（每个工作区签名只 tar 一次，已 chmod -R a-w）
+  # secret 扫描钉住的母本（SKILL 2B 第 3 步写 codev-scanned-master）：扫描与 fan-out 之间工作区被改，签名就变、
+  # 母本就是另一份没扫过的树——拒发，退回 text 并告警，别把没扫过的内容发出去。没有钉子（未扫或 text 模式）就不拦。
+  if [ -s "$CODEV_DIR/codev-scanned-master" ] && [ "$(cat "$CODEV_DIR/codev-scanned-master")" != "$CODEV_MASTER" ]; then
+    echo "⚠️ 工作区在 secret 扫描之后又变了（母本 $(basename "$CODEV_MASTER") ≠ 已扫描的 $(basename "$(cat "$CODEV_DIR/codev-scanned-master")")），拒绝铺副本；重扫后再发" >&2
+    return 1
+  fi
   # 从母本给这个 agent 拷一份【独立】副本：`cp -c` 在 APFS 上走 clonefile（写时复制）——
   # 秒级完成、几乎不占额外磁盘，但各 agent 之间【互不影响】（实测改 clone1 不影响母本和 clone2）。
   # 非 APFS / 不支持 -c 的平台自动退回普通 cp -R（-c 失败时重试一次）。
@@ -714,8 +735,8 @@ codev_repo_copy() {
     || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null; } \
     || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; return 1; }   # 失败也自清理：否则 text 模式下会残留半个 repo
   chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
-  if [ -n "$(find "$sbox/repo" \( -type f -o -type d \) -perm -u+w 2>/dev/null | head -1)" ] \
-     || { mkdir "$sbox/repo/.codev-probe" 2>/dev/null && rmdir "$sbox/repo/.codev-probe" 2>/dev/null; }; then   # mode 位 + 有效权限探针
+  probe=; if mkdir "$sbox/repo/.codev-probe" 2>/dev/null; then probe=1; rmdir "$sbox/repo/.codev-probe" 2>/dev/null; fi   # mkdir 成功即不安全
+  if [ -n "$probe" ] || [ -n "$(find "$sbox/repo" \( -type f -o -type d \) -perm -u+w 2>/dev/null | head -1)" ]; then   # mode 位 + 有效权限探针
     chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; return 1
   fi
   return 0
@@ -795,7 +816,7 @@ codev_bg_native() {
 # codev_sbox_gc — 清理【残留沙盒】。正常路径下 codev_bg_sandboxed 收尾会删掉自己的沙盒，但
 # 进程被杀时（前台工具超时、Ctrl-C、机器重启）收尾跑不到，沙盒就漏在 TMPDIR 里。
 # 空目录时代漏了无所谓，现在沙盒里有整份仓库副本 → 会堆磁盘、也留代码残迹，所以要定期扫。
-# 判死两步：先看 .codev-owner 里的 pid 是否还活着（活着一律不删），再看 mtime 是否超 60 分钟（老版本沙盒没有
+# 判死三步：先看 .codev-owner 里的 pid 是否还活着（活着不删——但超 7 天不看 pid 一律删，pid 会被复用），再看 mtime 是否超 60 分钟（老版本沙盒没有
 # owner 标记时的兜底启发；CODEV_TIMEOUT ≤ 3000s 让它"多半已死"，但母本等待/构建阶段没有 timeout 管，所以不是证明）。
 codev_sbox_gc() {
   local t="${TMPDIR:-/tmp}" d n=0 o
@@ -811,7 +832,7 @@ codev_sbox_gc() {
   # （注：命令替换在 bash 和 zsh 下【都会】词拆分，这不是 zsh 特有问题——别被"zsh 不拆分"
   #   的说法误导，那条只适用于未加引号的【变量】展开。）
   while IFS= read -r -d '' d; do
-    # owner 还活着就不删：60 分钟只是"多半已死"的启发，不是证明（见 codev_bg_sandboxed 写标记处的注释）。
+    # owner 还活着就不删（7 天内）：60 分钟只是"多半已死"的启发，不是证明（见 codev_bg_sandboxed 写标记处的注释）。
     o=$(cat "$d/.codev-owner" 2>/dev/null)
     # pid 会被复用：owner 早死、pid 落到别的长命进程头上，沙盒就永远"活着"。超过 7 天不管 pid 一律删（CODEV_TIMEOUT 上限 50 分钟）。
     if [ -z "$(find "$d" -maxdepth 0 -mmin +10080 2>/dev/null)" ]; then
@@ -858,7 +879,7 @@ codev_probe() {
       echo "MISS $c"
     fi
   done
-  r=$(codev_ledger_recent self); echo "OK   self（本 agent 的 fresh-subagent：G1 自查 + G2 自评，不耗外部额度，见 SKILL 通用机制 G）${r:+  近期: $r}"
+  r=$(codev_ledger_recent self); echo "OK   self（本 agent 的 fresh-subagent 做 G2 自评，不耗外部额度；G1 自查另以 check 记台账。见 SKILL 通用机制 G）${r:+  近期: $r}"
   echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
   [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
   [ -s "$CODEV_FINDINGS" ] && echo "发现台账 -> ${CODEV_FINDINGS}（codev_stats 看每个 agent/模型的 P1 亲验成立率）"
