@@ -18,14 +18,14 @@
 CODEV_TO=$(command -v timeout || command -v gtimeout || true)
 
 # 输出/库文件的基目录 = 本次会话专属目录（Step 0 用 mktemp -d 建，每个后台调用开头用字面值
-# `CODEV_DIR=<会话目录>` 前置）。好处：并发的两个 /codev run 不互相覆盖 out/err，收尾
-# `rm -rf "$CODEV_DIR"` 也不会误删对方文件。
+# `CODEV_DIR=<会话目录>` 前置）。好处：并发的两个 /codev run 不互相覆盖 out/err，
+# 收尾 `chmod -R u+w "$CODEV_DIR"; rm -rf "$CODEV_DIR"`（母本是 a-w 的）也不会误删对方文件。
 # ⚠️ 【不再默认 /tmp】。原来写 `${CODEV_DIR:-/tmp}`，漏设时三个后果都很严重（均实测）：
 #   1) 母本变成固定的 /tmp/codev-master-repo，而 codev_repo_master 开头是【无条件复用】——
 #      在 repoA 跑完再去 repoB 跑，repoB 的 agent 看到的是 repoA 的代码（实测 repoB 的
 #      agent 只看到 secret_a.js、自己的 only_in_b.js 一个都没有）。既外泄 A 的代码，
 #      又让 B 的评审整个建立在错误的树上，而 ▶ 行仍显示"只读仓库副本"，完全静默。
-#   2) 文档里的收尾命令 `rm -rf "$CODEV_DIR"` 展开成 `rm -rf "/tmp"`（实测展开结果）。
+#   2) 文档里的收尾命令 `chmod -R u+w "$CODEV_DIR"; rm -rf "$CODEV_DIR"` 展开成对 /tmp 动手（实测展开结果）。
 #   3) /tmp 是 1777，任何本地用户都能预先建好 /tmp/codev-master-repo 决定所有 agent 读到什么。
 # 故改为【未设置就报错退出】：宁可让调用方立刻失败，也不能静默走上以上任一条。
 if [ -z "${CODEV_DIR:-}" ]; then
@@ -46,8 +46,8 @@ case "${CODEV_MAX_COPY_KB:-}" in
     echo "⚠️ CODEV_MAX_COPY_KB='$CODEV_MAX_COPY_KB' 不是纯数字，已退回默认 102400 KB" >&2
     CODEV_MAX_COPY_KB=102400 ;;
 esac
-# 上限 1 GB：闸门无上限就能让母本构建拖过 codev_sbox_gc 的 60 分钟死亡判定（构建阶段没有 timeout 管），
-# 另一会话的 GC 会把正在构建的活沙盒当残留删掉。GC 现在还会按 owner pid 判活，这条是双保险。
+# 上限 1 GB：闸门无上限就能让母本构建拖过 codev_sbox_gc 的 60 分钟启发式（构建阶段没有 timeout 管）；
+# GC 主要靠 owner pid 判活，这条只是双保险，顺带防误设成天文数字把磁盘拷满。
 # 位数也要限：超过 2^63 的纯数字会让 [ -gt ] 本身报错被 2>/dev/null 吞掉，上限和后面的闸门一起静默失效
 # （bash 放行一切；zsh 当浮点解析反而全挡）。18 位以内才交给 -gt。
 if [ "${#CODEV_MAX_COPY_KB}" -gt 18 ] || [ "$CODEV_MAX_COPY_KB" -gt 1048576 ] 2>/dev/null; then
@@ -66,7 +66,8 @@ case "${CODEV_TIMEOUT:-}" in
     echo "⚠️ CODEV_TIMEOUT='$CODEV_TIMEOUT' 不是纯数字，已退回默认 600s" >&2
     CODEV_TIMEOUT=600 ;;
   * )
-    if [ "$CODEV_TIMEOUT" -lt 60 ] || [ "$CODEV_TIMEOUT" -gt 3000 ]; then
+    # 位数守卫同 CODEV_MAX_COPY_KB：20 位数字让 bash 的 [ -lt ] 报错为假、原值穿透，timeout 收到天文数字 rc=125，agent 从未运行。
+    if [ "${#CODEV_TIMEOUT}" -gt 18 ] || [ "$CODEV_TIMEOUT" -lt 60 ] || [ "$CODEV_TIMEOUT" -gt 3000 ]; then
       echo "⚠️ CODEV_TIMEOUT=$CODEV_TIMEOUT 超出 60..3000，已退回默认 600s" >&2
       CODEV_TIMEOUT=600
     fi ;;
@@ -85,7 +86,7 @@ CODEV_FINDINGS="${CODEV_FINDINGS:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/fi
 # 「timeout 600」的单个文件执行而失败；用函数 + "$@" 传参，bash/zsh 都对。
 # CODEV_TIMEOUT（默认 600s）只兜底真正卡死的进程——慢模型靠【后台执行】跑完，不受前台 300s 约束；核实型评审可调到 1200。
 # -k 15：先发 TERM、15 秒后补 KILL。不加的话 trap 了 SIGTERM 的 CLI（Node/Python 的优雅退出处理器）
-# 会活过 CODEV_TIMEOUT，沙盒跟着活过 codev_sbox_gc 的 60 分钟死亡判定，被另一个会话的 GC 连 ./repo 一起 rm 掉。
+# 会活过 CODEV_TIMEOUT，超时就成了摆设（GC 已按 owner pid 判活，不会因此误删活沙盒，但进程会一直挂着）。
 codev_run() {
   if [ -n "$CODEV_TO" ]; then "$CODEV_TO" -k 15 "$CODEV_TIMEOUT" "$@"; else "$@"; fi
 }
@@ -417,9 +418,10 @@ $( [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out" )"
 # 视野、又保住物理隔离：它们的任何写入都落在副本上，真仓库根本不在 cwd 里，也就不需要快照/归因。
 # 布局：<sbox> 本身可写（当 cwd，免得某些 CLI 往 cwd 写日志/会话就崩），<sbox>/repo 只读。
 # 副本内容 = tracked + 未被 .gitignore 忽略的 untracked（即工作区当前状态，含待评审的未提交改动），
-# 不含 .git（省体积；agent 跑不了 git 命令，diff 由提示词提供），且过滤掉明显的密钥文件（见下 --exclude）。
+# 不含 .git（省体积；agent 跑不了 git 命令，diff 由提示词提供），且过滤掉明显的密钥文件（喂 tar 前按 basename
+# 的 case 清单 + 解包后两轮 find，见 codev_repo_master 内注释）。
 # ⚠️ 隐私边界变了：以前空目录只发提示词里那点文本，现在【整个工作区都可能被 agent 读取并发给它的模型】。
-# 凡进副本的内容都要当作"已经发出去了"。--exclude 只挡常见密钥文件名，挡不住硬编码在源码里的密钥——
+# 凡进副本的内容都要当作"已经发出去了"。文件名过滤只挡常见密钥文件名，挡不住硬编码在源码里的密钥——
 # Step 2B 的 secret 扫描仍然必须做。仓库确实敏感就用 CODEV_SANDBOX_MODE=text 退回只喂文本。
 # 返回 0=已铺好，1=跳过（非 git 仓库 / 超体积闸门 / 拷贝失败），由调用方退回 text 模式。
 # 【每个（仓库 + 工作区内容）签名只 tar 一次】：母本铺在会话目录里、路径带签名哈希（codev_master_path），
@@ -429,6 +431,10 @@ $( [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out" )"
 # 额外 5 份副本的真实磁盘增量仅 6MB（df 实测；du 会虚报 ~280MB，它数不出共享块）。
 CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 
+# codev_hash — stdin 的摘要（十六进制/数字串）。优先 shasum（macOS 自带 perl 版，Linux 也常有）：cksum 是 32 位 CRC，
+# 碰撞可人为构造，撞上就静默复用错树；没有 shasum 才退回 POSIX 的 cksum。
+codev_hash() { if command -v shasum >/dev/null 2>&1; then shasum | cut -c1-40; else cksum | tr -cd '0-9'; fi; }
+
 # codev_master_path — 把母本路径【按仓库根 + 工作区状态】区分开，回填 CODEV_MASTER。
 # 为什么需要：codev_repo_master 开头是无条件复用「母本已存在就直接用」。只要 CODEV_DIR 被复用
 # （漏设时的固定路径、或用户在同一会话里换仓库/改完代码再评一轮），复用就会给出【错的树】：
@@ -436,7 +442,7 @@ CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 #   - 同仓库二轮：改完代码再 review，agent 仍读第一轮的快照，把已修的问题当现存报、
 #     新代码的缺陷全看不见（agents.md 里正是用这条理由否掉 git worktree 的）。
 # 做法：哈希「仓库根 + HEAD + 工作区改动摘要」。任一变化 → 换一个母本目录 → 自然重铺；
-# 没变化 → 命中同一个目录 → 保住"每会话只 tar 一次"的收益。
+# 没变化 → 命中同一个目录 → 保住"每个签名只 tar 一次"的收益。
 codev_master_path() {
   local root sig h
   root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
@@ -445,16 +451,17 @@ codev_master_path() {
   # tracked 的已暂存/未暂存改动，未跟踪文件直接 cat）。只哈希 porcelain 是不够的：它只有状态字母 + 路径，
   # 同一个已脏文件再改几行，porcelain 一个字节都不变 → 命中旧母本 → agent 读到上一轮快照（实测三次连改同路径）。
   # 成本只与脏文件规模相关，干净仓库几乎为零。xargs -r：GNU 空输入不执行，BSD 本就不执行且接受 -r 为空操作。
-  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$( { git status --porcelain --untracked-files=all
+  # 整段在仓库根算：`git ls-files --others` 只列 cwd 之下，从子目录调用签名会不同——同一工作区铺两份母本，
+  # 只改子目录之外的未跟踪文件时还会命中旧母本。cd 放在子 shell 里，不改调用方 cwd。
+  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$( cd "$root" 2>/dev/null && { git status --porcelain --untracked-files=all
         git diff HEAD --binary --no-color --no-ext-diff
-        git ls-files --others --exclude-standard -z | xargs -0 -r cat -- ; } 2>/dev/null | cksum)"
-  # cksum 是 POSIX、bash/zsh/macOS/Linux 都有（不用 md5/sha1sum：前者 macOS 无 -r 之外差异、后者 macOS 没有）。
-  h=$(printf '%s' "$sig" | cksum | tr -cd '0-9')
+        git ls-files --others --exclude-standard -z | xargs -0 -r cat -- ; } 2>/dev/null | codev_hash)"
+  h=$(printf '%s' "$sig" | codev_hash | tr -cd '0-9a-f' | cut -c1-16)
   CODEV_MASTER="$CODEV_DIR/codev-master-repo.${h:-0}"
   return 0
 }
 
-# codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（只做一次，已存在就直接复用）。
+# codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（每个签名只做一次，已存在就直接复用；建成后 chmod -R a-w）。
 # 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
 codev_repo_master() {
   codev_master_path || return 1     # 先按仓库+工作区状态定母本路径，避免复用到别的树
@@ -462,7 +469,7 @@ codev_repo_master() {
   # holder 必须在这里【一次性】声明：写成循环体内的 `local holder` 会在 zsh 下每轮打印
   # 「holder=<pid>」污染输出——zsh 未设 TYPESET_SILENT 时，对【已存在】的变量再执行不带赋值的
   # local/typeset 会显示它的当前值（实测等待循环每秒吐一行）。bash 无此行为。
-  local root sz holder lock="$CODEV_MASTER.lock" waited=0 me
+  local root sz holder lock="$CODEV_MASTER.lock" waited=0 me rp
   # 【并发护栏】fan-out 时 N 个 agent 是 N 个独立 shell、会同时进到这里。没有锁的话它们会
   # 同时往同一个母本目录 tar，解出交错/截断的文件（agent 读到半个文件比读不到更糟）。
   # mkdir 是原子的：抢到的铺母本，没抢到的等它铺完再复用。
@@ -490,10 +497,13 @@ codev_repo_master() {
         # 然后 rm 掉旧锁、放掉子锁、照常去抢 $lock——抢不到（有人比我快）也无妨，谁 mkdir 成功谁是唯一 builder。
         # 旧持锁者的 .partial 这里不碰：每个 builder 用带自己 pid 的 .partial.<pid>，死掉的由赢家按 pid 判活清掉。
         if mkdir "$lock.reclaim" 2>/dev/null; then
-          sh -c 'echo $PPID' > "$lock.reclaim/pid" 2>/dev/null   # 子锁也记 owner，让下面的陈旧判定能 kill -0
+          # 子锁也记 owner，让下面的陈旧判定能 kill -0。写不进去就放弃这次回收：没 owner 的子锁 3 分钟后
+          # 会被别人当陈旧删掉再回收，而我若恰好停顿到那之后才动手，删的就是别人的新锁。
+          sh -c 'echo $PPID' > "$lock.reclaim/pid" 2>/dev/null; rp=$(cat "$lock.reclaim/pid" 2>/dev/null)
           holder=$(cat "$lock/pid" 2>/dev/null)
-          if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] \
-             && { [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; }; then rm -rf "$lock"; fi
+          if [ -n "$rp" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] \
+             && { [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; } \
+             && [ "$(cat "$lock.reclaim/pid" 2>/dev/null)" = "$rp" ]; then rm -rf "$lock"; fi   # 动手前再确认子锁还是我的
           rm -rf "$lock.reclaim" 2>/dev/null
         elif [ -n "$(find "$lock.reclaim" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
           # 回收者自己死在半路（极窄窗口）：子锁也会陈旧。同样先 kill -0 判活，活着的不碰。
@@ -636,6 +646,11 @@ codev_repo_master() {
     # 能改写母本，后启动的 agent 从被改母本 clone 出副本、评审建立在被篡改的代码上。
     # 会话收尾 rm -rf 前要先 chmod -R u+w（agents.md 收尾清理段与 codev_sbox_gc 都已这么做）。
     chmod -R a-w "$CODEV_MASTER" 2>/dev/null
+    # chmod 失败（ACL/只读挂载/部分 I/O 错）不能静默：还有可写文件就当铺失败，删掉退回 text，别让 ▶ 行谎称只读。
+    if [ -n "$(find "$CODEV_MASTER" -type f -perm -u+w 2>/dev/null | head -1)" ]; then
+      echo "⚠️ 母本 chmod -R a-w 未完全生效，放弃副本模式" >&2
+      chmod -R u+w "$CODEV_MASTER" 2>/dev/null; rm -rf "$CODEV_MASTER"; exit 1
+    fi
   ); rc=$?
   # 放锁：无论上面成败都执行。用 rm -rf 而不是 rmdir——锁目录里有 pid 文件（非空），
   # rmdir 会静默失败（实测：锁泄漏 → 同会话后续每个 agent 白等 300s 再退回 text 模式，
@@ -666,6 +681,9 @@ codev_repo_copy() {
     || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null; } \
     || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; return 1; }   # 失败也自清理：否则 text 模式下会残留半个 repo
   chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
+  if [ -n "$(find "$sbox/repo" -type f -perm -u+w 2>/dev/null | head -1)" ]; then   # 校验：chmod 失败不能静默说"只读"
+    chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; return 1
+  fi
   return 0
 }
 
@@ -691,7 +709,10 @@ codev_bg_sandboxed() {
   sbox=$(mktemp -d -t codev-sbox.XXXXXX) || { echo "⚠️ $agent mktemp 失败"; return 1; }
   # owner 标记：codev_sbox_gc 删 60 分钟以上的沙盒前先 kill -0 这个 pid，活着的沙盒不删。
   # 光靠 mtime 不够——母本等待/构建阶段没有 timeout 管，加上 CODEV_TIMEOUT 最大 3000s，是能拖过 60 分钟的。
-  sh -c 'echo $PPID' > "$sbox/.codev-owner" 2>/dev/null
+  if ! sh -c 'echo $PPID' > "$sbox/.codev-owner" 2>/dev/null; then
+    # 标记写不进去 = 沙盒目录不可写，agent 也没法在里面干活；且没标记的活沙盒超 60 分钟会被 GC 当残留删掉。
+    echo "⚠️ $agent 沙盒不可写（owner 标记写入失败），跳过"; rm -rf "$sbox" 2>/dev/null; return 1
+  fi
   if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
     # 副本可能【建成了但里面没东西】：空仓库、或全部文件都命中密钥过滤（实测两种都 rc=0、0 文件）。
     # 此时提示词还在承诺"可以读 ./repo 核实"，agent 找不到任何代码 → 又回到"瞎子"状态，
@@ -740,14 +761,16 @@ codev_bg_native() {
 # codev_sbox_gc — 清理【残留沙盒】。正常路径下 codev_bg_sandboxed 收尾会删掉自己的沙盒，但
 # 进程被杀时（前台工具超时、Ctrl-C、机器重启）收尾跑不到，沙盒就漏在 TMPDIR 里。
 # 空目录时代漏了无所谓，现在沙盒里有整份仓库副本 → 会堆磁盘、也留代码残迹，所以要定期扫。
-# 只删【60 分钟前】的：codev_run 上限 CODEV_TIMEOUT ≤ 3000s（50 分钟），超过 60 分钟的必然是死掉的，不会误删并发 run 的活沙盒。
+# 判死两步：先看 .codev-owner 里的 pid 是否还活着（活着一律不删），再看 mtime 是否超 60 分钟（老版本沙盒没有
+# owner 标记时的兜底启发；CODEV_TIMEOUT ≤ 3000s 让它"多半已死"，但母本等待/构建阶段没有 timeout 管，所以不是证明）。
 codev_sbox_gc() {
   local t="${TMPDIR:-/tmp}" d n=0 o
   # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
-  # 只扫【沙盒】：沙盒天生短命（单次 agent 调用，最长 CODEV_TIMEOUT≤3000s），超 60 分钟必是死掉的。
+  # 只扫【沙盒】：沙盒天生短命（单次 agent 调用），60 分钟 + owner pid 已死才删。
   # ⚠️ 【不要】把会话目录 codev.* 也按 60 分钟扫：会话目录是长命的（用户看完输出、讨论、再跑一轮
   #    很容易超过 1 小时），且并发的另一个 /codev run 的会话目录同样匹配 —— 那样会删掉别人正在用的
-  #    母本/提示词/输出。会话目录由 skill 收尾的 `rm -rf "$CODEV_DIR"` 负责（母本就在里面，一并清）；
+  #    母本/提示词/输出。会话目录由 skill 收尾的 `chmod -R u+w "$CODEV_DIR"; rm -rf "$CODEV_DIR"` 负责
+  #    （母本就在里面且是 a-w 的，先恢复写权限再删）；
   #    进程被杀漏下的由下面 24 小时那轮兜底。
   # 用 -print0 + read -d '' 而不是 `for d in $(find …)`：后者依赖词拆分，$TMPDIR 含空格/换行时
   # 会把一个路径拆成多个删除目标（如 `/tmp/work dir/codev-sbox.x` → 试图删 `/tmp/work`）。
@@ -761,8 +784,11 @@ codev_sbox_gc() {
   done < <(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 -print0 2>/dev/null)
   # 会话目录（含母本，可能几十 MB）用 24 小时这档兜底：够长，不会撞上"用户慢慢看输出"或并发 run；
   # 且显式跳过【本次会话】自己的目录。
+  # 会话目录没有单一持有者 pid（编排器每次 Bash 调用都是新 shell），用【活动时间】判活：目录里任一文件 24 小时内
+  # 被写过（新的 out/err/metrics/提示词）就还在用，不删——目录本身的 mtime 只在增删条目时变，不够。
   while IFS= read -r -d '' d; do
     [ "$d" = "$CODEV_DIR" ] && continue
+    [ -n "$(find "$d" -type f -mmin -1440 2>/dev/null | head -1)" ] && continue
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
   done < <(find "$t" -maxdepth 1 -type d -name 'codev.*' -mmin +1440 -print0 2>/dev/null)
   [ "$n" -gt 0 ] && echo "已清理 $n 个残留沙盒/会话目录（沙盒超 60 分钟、会话目录超 24 小时）"
