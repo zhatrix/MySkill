@@ -65,7 +65,7 @@ brew install coreutils      # 提供 gtimeout
 - 改了 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`（bash/zsh 均可）；改文案按 `TESTING.md` 跑微测试与真机清单。
 
 ### 2.4 shell 说明
-skill 已对 **zsh** 做过兼容（用 `run()` 函数封装超时，而非 `$TP` 变量前缀——后者在 zsh 下会失败）。
+skill 已对 **zsh** 做过兼容（用 `codev_run` 函数封装超时，而非 `$TP` 变量前缀——后者在 zsh 下会失败）。
 bash/zsh 都能正常跑。
 
 ---
@@ -90,7 +90,9 @@ bash/zsh 都能正常跑。
 
 - codex 用原生 `codex review`（只读，从仓库根跑，自己跑 `git diff`）。
 - 其余 agent 在**隔离沙盒**里跑：cwd 不是真仓库，但沙盒里有一份 `./repo` —— 工作区（含未提交
-  改动）的**只读副本**。它们能读全部代码来核实跨文件问题，写入又只落在副本上、用完即删。
+  改动）的**只读副本**。它们能读全部代码来核实跨文件问题，写入默认只落在副本上、用完即删。
+  这是 cwd 隔离 + 副本与母本 `chmod -R a-w`，**不是 OS 级沙盒**：防误写，防不了同用户进程刻意枚举 `$TMPDIR`
+  再改回权限的恶意 agent。仓库敏感就设 `CODEV_SANDBOX_MODE=text` 只喂提示词文本。
 
 ### challenge — 对抗式挑战
 ```
@@ -225,7 +227,7 @@ codev/
 副本超过 100MB（`CODEV_MAX_COPY_KB`）或当前不是 git 仓库时，会自动退回空目录模式，
 启动行 `▶` 会标出实际用的是哪种。
 
-**每个 agent 拿到的是独立副本**：整个会话只铺一份"母本"，各 agent 从母本 `cp -c`
+**每个 agent 拿到的是独立副本**：每个（仓库 + 工作区内容）签名只铺一份"母本"（改了代码再评自动换新母本），各 agent 从母本 `cp -c`
 （APFS 写时复制）clone 一份自己的。所以它们互不干扰——某个 agent 就算绕过只读权限改了文件，
 也只影响自己那份，其它 agent 和母本不受影响（实测改一份，另一份和母本都没变）。
 实测 55MB/2000 文件、6 个 agent：比"每个 agent 各自全量拷" 5.06s → 2.72s，
