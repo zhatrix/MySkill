@@ -21,7 +21,7 @@ codebuddy 429 重置时间、Max turns、context canceled、空输出、部分�
 `CODEV_MAX_COPY_KB` 校验/上限与体积闸门、`CODEV_TIMEOUT` 位数守卫、沙盒 GC 按 owner pid 判活 + 会话目录按活动时间判活、
 回流 commit 拒收部分暂存 + 失败时只撤回本次 add 的文件、rc=137 翻牌如实、母本签名与 cwd 无关、
 母本 chmod 校验失败退回 text（chmod 被替身、母本不铺）、签名哈希皆空时不铺母本、长额度页判 quota 而长评审仍 ok、
-shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不看 pid 直接删。
+shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不看 pid 直接删、`self`（本 agent 的自评）走同一套翻牌/账本/probe。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。

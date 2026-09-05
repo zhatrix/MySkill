@@ -85,7 +85,8 @@ bash/zsh 都能正常跑。
 /codev review 并发安全和错误处理   # 带关注点
 ```
 流程：自动定 base（`@{u}` → `origin/HEAD` → `main`… 回退链，会验证 commit 存在）→ **secret 扫描**
-→ 各 agent 评审 → **事实核查回填**（把 agent 标注的"需核实假设"逐条查证）→ 综合出
+→ **Claude 自查**（不带对话上下文的 subagent 先过一遍，明显问题先修）→ 外部 agent 与 **Claude 自评**（同一份提示词、
+另一个 fresh subagent，标签 `self`）并行评审 → **事实核查回填**（把 agent 标注的"需核实假设"逐条查证）→ 综合出
 **一致性矩阵 + PASS/FAIL 门禁**（出现 P1/critical 即 FAIL）→ 问你要不要让 Claude 修复确认的问题。
 
 - codex 用原生 `codex review`（只读，从仓库根跑，自己跑 `git diff`）。
@@ -198,7 +199,8 @@ codev/
 
 ## 9. 隔离沙盒与只读仓库副本
 
-六个 agent 按只读保障分四档跑（后三档都在隔离沙盒里）：
+六个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里），此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
+参与，和 opencode 同档（提示词只读 + 前后 `git status` 快照核对）、跑在真实仓库：
 
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|

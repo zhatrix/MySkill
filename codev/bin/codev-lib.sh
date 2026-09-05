@@ -858,6 +858,7 @@ codev_probe() {
       echo "MISS $c"
     fi
   done
+  r=$(codev_ledger_recent self); echo "OK   self（本 agent 的 fresh-subagent：G1 自查 + G2 自评，不耗外部额度，见 SKILL 通用机制 G）${r:+  近期: $r}"
   echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
   [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
   [ -s "$CODEV_FINDINGS" ] && echo "发现台账 -> ${CODEV_FINDINGS}（codev_stats 看每个 agent/模型的 P1 亲验成立率）"

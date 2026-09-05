@@ -44,7 +44,7 @@
 | `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间；`codev_ledger_recent` 同时兼容升级前的旧 7 列布局 时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
 | `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着一律不删；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时且目录内 24 小时内无任何文件写入**（会话目录没有单一持有者 pid，按活动时间判活；且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
-| `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
+| `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ `self`（本 agent 的 fresh-subagent，总是可用）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
 超时由 `CODEV_TIMEOUT` 控制（默认 600s，范围 60..3000，非法值退回 600）：只兜底真正卡死的进程——**慢模型靠后台执行**
@@ -404,6 +404,7 @@ fi
 | agent | 只读保障级别 | 实测旗标 | 运行位置 |
 |---|---|---|---|
 | codex | **沙盒级**（进程被限制） | `-s read-only`（`review` 子命令天然只读，不吃 `-s`） | 真实仓库 `codev_bg_native` |
+| self（本 agent 的 fresh-subagent，SKILL 通用机制 G） | **弱**（提示词只读 + 发出前后 `git status --porcelain` 快照核对，与 opencode 同档） | Agent 工具 general-purpose，提示词写明禁止改文件 | 真实仓库（Agent 工具的 cwd） |
 | gemini | **沙盒级** | `--approval-mode plan` | 真实仓库 `codev_bg_native` |
 | qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
 | codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
