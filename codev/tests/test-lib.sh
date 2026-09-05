@@ -260,10 +260,12 @@ for drop in credentials.json credentials gcp-credentials.yml credentials.yml.enc
 done
 chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-mst.txt" "$CODEV_DIR"/codev-master-repo.*
 
+# 一个【保证已死】的 pid：起个后台进程等它结束再用它的 pid。不用 999999：Linux 的 pid_max 可到 4194304，可能真活着。
+sleep 0 & DEAD=$!; wait "$DEAD" 2>/dev/null
 echo "26. 母本锁：陈旧锁（持锁 pid 已死）被多个等待者同时发现时只能有一个赢家；放锁只放自己的"
 REPO=$(mktemp -d -t codevrepo.XXXXXX)
 ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && for i in $(seq 1 60); do echo "f$i" > "f$i.txt"; done && git add -A && git commit -qm init >/dev/null )
-( cd "$REPO" && codev_master_path && mkdir -p "$CODEV_MASTER.lock" && echo 999999 > "$CODEV_MASTER.lock/pid" \
+( cd "$REPO" && codev_master_path && mkdir -p "$CODEV_MASTER.lock" && echo "$DEAD" > "$CODEV_MASTER.lock/pid" \
   && touch -t 202001010000 "$CODEV_MASTER.lock" \
   && for i in 1 2 3 4 5 6 7 8; do ( codev_repo_master; echo "rc=$?" >> "$T/codev-lock.txt" ) & done; wait
   n=$(cd "$CODEV_MASTER" && find . -type f | wc -l | tr -d ' '); echo "files=$n" >> "$T/codev-lock.txt"
@@ -274,7 +276,15 @@ grep -q '^files=60$' "$T/codev-lock.txt" && ok "母本完整（60 个文件）" 
 grep -q '^partials=0$' "$T/codev-lock.txt" && ok "没有残留 .partial" || bad "残留 .partial" "$(cat "$T/codev-lock.txt")"
 grep -q 'lock-leaked' "$T/codev-lock.txt" && bad "锁泄漏" || ok "锁已释放"
 nb=$(cat "$CODEV_DIR"/codev-master-repo.*.builders 2>/dev/null | wc -l | tr -d ' '); [ "$nb" = 1 ] && ok "只有 1 个 builder 进过临界区（直接计数）" || bad "进入临界区的 builder 数=$nb" "$(cat "$T/codev-lock.txt")"
-[ -w "$(ls -d "$CODEV_DIR"/codev-master-repo.[0-9]* | head -1)/f1.txt" ] && bad "母本仍可写" || ok "母本已 chmod a-w"
+m=$(find "$CODEV_DIR" -maxdepth 1 -type d -name 'codev-master-repo.*' ! -name '*.lock' ! -name '*.partial.*' | head -1)
+[ -f "$m/f1.txt" ] && [ ! -w "$m/f1.txt" ] && ok "母本已 chmod a-w" || bad "母本不存在或仍可写" "m=$m"
+
+echo "26b. codev_repo_copy：从 a-w 母本 clone 出 ./repo，文件齐全且只读；沙盒清理能删干净"
+SB=$(mktemp -d -t codev-sbox.XXXXXX)
+( cd "$REPO" && codev_repo_copy "$SB" ) && ok "repo_copy rc=0" || bad "repo_copy 失败"
+[ "$(find "$SB/repo" -type f 2>/dev/null | wc -l | tr -d ' ')" = 60 ] && ok "副本 60 个文件" || bad "副本文件数不对"
+[ -f "$SB/repo/f1.txt" ] && [ ! -w "$SB/repo/f1.txt" ] && ok "副本只读" || bad "副本可写"
+chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB"; [ -e "$SB" ] && bad "沙盒删不掉" || ok "沙盒已清理"
 chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-lock.txt" "$CODEV_DIR"/codev-master-repo.*
 
 echo "27. 体积闸门：CODEV_MAX_COPY_KB 非法值退回默认、超 1GB 截到上限；超闸门时 codev_repo_master 返回 1 且不铺母本"
@@ -291,7 +301,7 @@ chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/co
 
 echo "28. 沙盒 GC：超 60 分钟但 owner 进程还活着的沙盒不删；owner 已死的删"
 GCD="$CODEV_DIR/gc"; mkdir -p "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
-echo $$ > "$GCD/codev-sbox.alive/.codev-owner"; echo 999999 > "$GCD/codev-sbox.dead/.codev-owner"
+echo $$ > "$GCD/codev-sbox.alive/.codev-owner"; echo "$DEAD" > "$GCD/codev-sbox.dead/.codev-owner"
 touch -t 202001010000 "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
 ( TMPDIR="$GCD"; codev_sbox_gc >/dev/null )
 [ -d "$GCD/codev-sbox.alive" ] && ok "owner 活着 → 保留" || bad "活沙盒被 GC 删了"

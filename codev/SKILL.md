@@ -335,7 +335,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
      || { echo "text 模式需要 BASE（否则 git diff 会误把范围当成 working-vs-index），先回第 1 步"; exit 1; }
    # 先确认枚举本身成功：管道里 git ls-files 失败被 2>/dev/null 吞掉后 grep 收到空输入会返回 1，
    # 那会被下面当成"干净"。非 git 目录 / 仓库损坏必须在这里就停。
-   n=$(git ls-files 2>/dev/null | wc -l | tr -d ' '); [ "${n:-0}" -gt 0 ] || { echo "SCAN: 枚举失败（非 git 仓库或空仓库），按命中处理"; exit 1; }
+   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "SCAN: 不在 git 仓库内，按命中处理"; exit 1; }
+   n=$({ git ls-files; git ls-files --others --exclude-standard; } 2>/dev/null | wc -l | tr -d ' ')
+   [ "${n:-0}" -gt 0 ] || { echo "SCAN: 枚举为空（tracked 与未忽略 untracked 都没有），按命中处理"; exit 1; }
    # 空输入用 `|| true` 吞退出码（macOS 的 BSD xargs 其实接受 -r 且空输入本就不执行，这里不依赖它只是少一个假设）；
    # `cat --` 防 `-` 开头文件名被当选项。
    if [ "${CODEV_SANDBOX_MODE:-repo}" = repo ]; then
@@ -346,8 +348,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
      { git ls-files; git ls-files --others --exclude-standard
        { git ls-files -z; git ls-files --others --exclude-standard -z; } | { xargs -0 cat -- 2>/dev/null || true; }; }
    else
-     # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件。
+     # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件（路径清单也会进 codex 提示词，所以文件名同样要扫）。
      { git diff "$BASE"
+       git ls-files --others --exclude-standard
        git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; } }
    fi | grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'
    case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 扫描本身出错，按命中处理";; esac
@@ -396,8 +399,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    走路径引用；否则（仓库外 / 被 ignore）才内联全文。`wc -c "$DOC"` 与 `grep -n '^#' "$DOC"` 拿体积与章节目录。
    **例外：沙盒没有 `./repo` 时必须内联**——`CODEV_SANDBOX_MODE=text`、仓库超体积闸门、非 git 仓库都会让
    `codev_bg_sandboxed` 自动退回空目录模式（▶ 行标"隔离空目录"），此时路径引用等于什么都没给，agent 只能
-   输出"无法验证"。发起前先判：`[ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && codev_master_path && [ -d "$CODEV_MASTER" ]`
-   不成立、或首个 ▶ 行显示空目录，就对沙盒 agent 改用 DOC_START/DOC_END 内联（codex/gemini 在真仓库，仍路径引用）。
+   输出"无法验证"。发起前先判（母本是发起时才懒铺的，不能只看目录在不在，要真的铺一次）：
+   `[ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && ( cd "$(git rev-parse --show-toplevel)" && codev_repo_master )`
+   返回非 0（非 git / 超闸门 / 铺失败）、或首个 ▶ 行显示空目录，就对沙盒 agent 改用 DOC_START/DOC_END 内联
+   （codex/gemini 在真仓库，仍路径引用）。铺好的母本随后被各 agent 直接复用，不多花时间。
 2. 选 agent（A）。`--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就
    让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
    （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），

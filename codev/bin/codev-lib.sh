@@ -48,7 +48,9 @@ case "${CODEV_MAX_COPY_KB:-}" in
 esac
 # 上限 1 GB：闸门无上限就能让母本构建拖过 codev_sbox_gc 的 60 分钟死亡判定（构建阶段没有 timeout 管），
 # 另一会话的 GC 会把正在构建的活沙盒当残留删掉。GC 现在还会按 owner pid 判活，这条是双保险。
-if [ "$CODEV_MAX_COPY_KB" -gt 1048576 ] 2>/dev/null; then
+# 位数也要限：超过 2^63 的纯数字会让 [ -gt ] 本身报错被 2>/dev/null 吞掉，上限和后面的闸门一起静默失效
+# （bash 放行一切；zsh 当浮点解析反而全挡）。18 位以内才交给 -gt。
+if [ "${#CODEV_MAX_COPY_KB}" -gt 18 ] || [ "$CODEV_MAX_COPY_KB" -gt 1048576 ] 2>/dev/null; then
   echo "⚠️ CODEV_MAX_COPY_KB=$CODEV_MAX_COPY_KB 超过上限 1048576 KB（1 GB），已截到上限" >&2
   CODEV_MAX_COPY_KB=1048576
 fi
@@ -313,14 +315,19 @@ CODEV_EOF
       rm -f "$msg"; return 1
     fi
   done
-  local was_unstaged=; git diff --cached --quiet -- "$@" 2>/dev/null && was_unstaged=1   # add 之前 index 干净 → 失败时能安全恢复
+  # 逐文件记下 add 之前 index 就干净的那些：commit 失败时只撤回它们（用户自己整文件暂存好的那份不动）。
+  local to_reset=
+  for t in "$@"; do git diff --cached --quiet -- "$t" 2>/dev/null && to_reset="$to_reset
+$t"; done
   git add -- "$@" || { rm -f "$msg"; return 1; }
   if git diff --cached --quiet -- "$@"; then echo "⚠️ $files 没有待提交的改动，跳过 commit" >&2; rm -f "$msg"; return 1; fi
   git diff --cached --stat -- "$@" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件
   git commit -q -F "$msg" -- "$@"; rc=$?
   rm -f "$msg"
-  # commit 失败时把刚 add 进去的撤回，别给用户留一个它没做过的暂存状态（只在 add 之前 index 本来干净时才撤）。
-  [ "$rc" != 0 ] && [ -n "$was_unstaged" ] && git reset -q -- "$@" 2>/dev/null
+  # commit 失败时把刚 add 进去的撤回，别给用户留一个它没做过的暂存状态（只撤 add 之前 index 本来干净的那些文件）。
+  if [ "$rc" != 0 ] && [ -n "$to_reset" ]; then
+    printf '%s\n' "$to_reset" | while IFS= read -r t; do [ -n "$t" ] && git reset -q -- "$t" 2>/dev/null; done
+  fi
   [ "$rc" = 0 ] && echo "✔ 已提交第 $round 轮回流：$(git log -1 --format=%h) $summary"
   return $rc
 }
@@ -617,8 +624,9 @@ codev_repo_master() {
     # mv 前守卫：目标已存在时 `mv dir existingdir` 会把源【移进】目标里（实测 rc=0，
     # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
     [ -e "$CODEV_MASTER" ] && { rm -rf "$part"; exit 0; }   # 别人已铺好，复用
-    mv "$part" "$CODEV_MASTER" || { rm -rf "$part"; exit 1; }
-    # 双 builder 极窄窗口（上一行 -e 与 mv 之间别人先发布）：mv 会把我的 .partial 移【进】它里面。
+    # mv 失败但母本已在：别人先发布并已 chmod a-w，我的 mv 被 EACCES 挡住——那是好事，复用即可，别退回 text。
+    mv "$part" "$CODEV_MASTER" || { rm -rf "$part"; [ -d "$CODEV_MASTER" ] && exit 0; exit 1; }
+    # 双 builder 极窄窗口（上一行 -e 与 mv 之间别人先发布、且还没来得及 chmod）：mv 会把我的 .partial 移【进】它里面。
     # 母本已是 a-w，先给顶层 u+w 才能删掉嵌进去的那份。
     if [ -d "$CODEV_MASTER/${part##*/}" ]; then
       chmod u+w "$CODEV_MASTER" 2>/dev/null; chmod -R u+w "$CODEV_MASTER/${part##*/}" 2>/dev/null
@@ -642,7 +650,7 @@ codev_repo_master() {
 
 codev_repo_copy() {
   local sbox="$1"
-  codev_repo_master || return 1              # 母本（每会话只 tar 一次）
+  codev_repo_master || return 1              # 母本（每个工作区签名只 tar 一次，已 chmod -R a-w）
   # 从母本给这个 agent 拷一份【独立】副本：`cp -c` 在 APFS 上走 clonefile（写时复制）——
   # 秒级完成、几乎不占额外磁盘，但各 agent 之间【互不影响】（实测改 clone1 不影响母本和 clone2）。
   # 非 APFS / 不支持 -c 的平台自动退回普通 cp -R（-c 失败时重试一次）。
@@ -652,9 +660,11 @@ codev_repo_copy() {
   # 个别 inode 不支持 clonefile），紧接着的 `cp -R src dst`【dst 已存在】语义变成"拷进 dst 内部"
   # → $sbox/repo/codev-master-repo/…，且 rc=0（实测）。agent 看到的 ./repo 布局全错、
   # 提示词里承诺的路径全部失效，而 ▶ 行仍显示"只读仓库副本"，故障完全静默。
+  # ⚠️ 母本是 a-w 的，cp/clone 会原样带过来权限位；残缺目标 rm -rf 之前必须先 chmod -R u+w，
+  # 否则 rm 在只读子树上失败、残缺目录还在，下一步 cp -R 就又变成"拷进内部"（实测 rm 报 Permission denied）。
   cp -c -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null \
-    || { rm -rf "$sbox/repo"; cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null; } \
-    || { rm -rf "$sbox/repo"; return 1; }   # 失败也自清理：否则 text 模式下会残留半个 repo
+    || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; cp -R "$CODEV_MASTER" "$sbox/repo" 2>/dev/null; } \
+    || { chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo"; return 1; }   # 失败也自清理：否则 text 模式下会残留半个 repo
   chmod -R a-w "$sbox/repo" 2>/dev/null   # 纵深防御：误写立即报错，而不是静默改副本
   return 0
 }
@@ -694,7 +704,7 @@ codev_bg_sandboxed() {
   else
     # 兜底清残留：copy 失败路径已自清理，这里再保一手——否则 agent 被告知"空目录"，
     # cwd 里却躺着半个 repo，它若发现了就会基于残缺代码评审（比看不到更糟）。
-    rm -rf "$sbox/repo" 2>/dev/null
+    chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo" 2>/dev/null   # 残留可能是 a-w 的
     mode="隔离空目录（只喂提示词文本）"
   fi
   # 用 printf 传 $mode：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
