@@ -3,6 +3,8 @@
 # 断言"额度耗尽被判成功"等历史事故不再发生。运行：bash tests/test-lib.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
+# 当前是哪个 shell 在跑测试：子测试要用同一个 shell 起子进程，zsh 跑的时候才真的验到 zsh 路径
+if [ -n "${ZSH_VERSION:-}" ]; then TEST_SH=zsh; else TEST_SH=bash; fi
 LIB="$HERE/../bin/codev-lib.sh"
 export CODEV_DIR=$(mktemp -d -t codevtest.XXXXXX)
 export CODEV_LEDGER="$CODEV_DIR/ledger.tsv"      # 测试不碰真账本
@@ -358,12 +360,16 @@ mk x "$(printf 'You have reached your credit usage limit for today. %s' "$(head 
 r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = quota ] && ok "长额度页 → quota" || bad "长额度页判成 $r"
 mk x "$(printf '## Review\nThe 429 rate limit retry path is fine. P2: minor. %s' "$(head -c 700 /dev/zero | tr '\0' 'y')")" ""
 r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "长评审含 429 仍 → ok" || bad "长评审判成 $r"
+mk x "$(printf 'The retry path uses a token bucket; when the upstream returns 429 or a rate limit header we back off exponentially and the authentication cache is refreshed. %s' "$(head -c 700 /dev/zero | tr '\0' 'z')")" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "无标记的长散文含 429/rate limit → 仍 ok（只认强错误短语）" || bad "长散文被误杀成 $r"
 h=$(printf 'abc' | { shasum() { return 1; }; codev_hash; }); case "$h" in [0-9]*) ok "shasum 坏 → cksum 兜底（${h}）";; *) bad "cksum 兜底失效" "[$h]";; esac
 
 echo "34. 未跟踪的 FIFO 不会让签名计算挂死；沙盒超 7 天即使 owner pid 活着也删"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo a > a.txt && git add -A && git commit -qm i && mkfifo pipe.fifo \
-  && timeout 20 bash -c '. "'"$LIB"'"; codev_master_path' >/dev/null 2>&1; echo "rc=$?" > "$T/codev-fifo.txt" )
+  && "$CODEV_TO" 20 "$TEST_SH" -c '. "'"$LIB"'"; codev_master_path' >/dev/null 2>&1; echo "rc=$?" > "$T/codev-fifo.txt"
+  "$CODEV_TO" 60 "$TEST_SH" -c 'CODEV_DIR="'"$CODEV_DIR"'"; . "'"$LIB"'"; codev_repo_master >/dev/null 2>&1 && find "$CODEV_MASTER" -type p | wc -l | tr -d " "' >> "$T/codev-fifo.txt" 2>/dev/null )
 grep -q '^rc=0$' "$T/codev-fifo.txt" && ok "有 FIFO 时 codev_master_path 秒回 rc=0" || bad "FIFO 让签名挂死/失败" "$(cat "$T/codev-fifo.txt")"
+[ "$(sed -n 2p "$T/codev-fifo.txt")" = 0 ] && ok "FIFO 不进母本" || bad "FIFO 进了母本" "$(cat "$T/codev-fifo.txt")"; rm_masters
 rm -rf "$REPO" "$T/codev-fifo.txt"
 GCD="$CODEV_DIR/gc3"; mkdir -p "$GCD/codev-sbox.ancient"; echo $$ > "$GCD/codev-sbox.ancient/.codev-owner"; touch -t 202001010000 "$GCD/codev-sbox.ancient"
 ( TMPDIR="$GCD"; codev_sbox_gc >/dev/null ); [ -d "$GCD/codev-sbox.ancient" ] && bad "7 天以上的沙盒因 pid 活着未删" || ok "超 7 天沙盒不看 pid 直接删"; rm -rf "$GCD"
@@ -375,6 +381,34 @@ r=$(report self 0); case "$r" in *"✔ self 完成"*) ok "self 翻牌 ✔";; *) 
 grep -q "	self	claude-test-model	ok	" "$CODEV_LEDGER" && ok "账本 agent=self 模型=CODEV_MODEL_self" || bad "self 未进账本" "$(tail -1 "$CODEV_LEDGER")"
 unset CODEV_MODEL_self
 codev_probe 2>/dev/null | grep -q '^OK   self' && ok "probe 列出 self" || bad "probe 未列 self"
+
+echo "37. 复用母本时若发现可写（上个 builder 在 mv 后、chmod 前被杀）→ 补 a-w；长额度页翻牌行显示开头"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
+  && codev_repo_master >/dev/null 2>&1 && chmod -R u+w "$CODEV_MASTER" && codev_repo_master >/dev/null 2>&1; echo "w=$([ -w "$CODEV_MASTER/f.txt" ] && echo yes || echo no)" > "$T/codev-reuse.txt" )
+grep -q '^w=no$' "$T/codev-reuse.txt" && ok "复用时补回 a-w" || bad "复用的母本仍可写" "$(cat "$T/codev-reuse.txt")"; rm -rf "$REPO" "$T/codev-reuse.txt"; rm_masters
+mk x "$(printf "You've reached your usage limit for today, upgrade your plan. %s" "$(head -c 700 /dev/zero | tr '\0' 'q')")" ""
+r=$(report x 0); case "$r" in *"⛔ x 额度"*"reached your usage limit"*) ok "长额度页翻牌带开头原句";; *) bad "长额度页翻牌没显示原因" "$r";; esac
+mk x "$(printf 'When the quota limit of the upstream API is hit we degrade gracefully and the usage limit counter resets at midnight. %s' "$(head -c 700 /dev/zero | tr '\0' 'w')")" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "散文里的 quota limit/usage limit 词不误杀" || bad "散文被判成 $r"
+
+echo "36. 扫描钉住的母本与当前母本不一致（扫完工作区又被改）→ codev_repo_copy 拒发 rc=1；一致或无钉子 → 正常"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); SB=$(mktemp -d -t codev-sbox.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
+  && codev_master_path && printf '%s' "$CODEV_MASTER" > "$CODEV_DIR/codev-scanned-master" && codev_repo_copy "$SB" >/dev/null 2>&1; echo "match rc=$?" > "$T/codev-pin.txt"
+  chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB/repo"; echo changed >> f.txt && codev_repo_copy "$SB" >/dev/null 2>&1; echo "mismatch rc=$?" >> "$T/codev-pin.txt"
+  rm -f "$CODEV_DIR/codev-scanned-master"; chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB/repo"; codev_repo_copy "$SB" >/dev/null 2>&1; echo "nopin rc=$?" >> "$T/codev-pin.txt" )
+grep -q '^match rc=0$' "$T/codev-pin.txt" && ok "钉子一致 → 铺副本" || bad "一致时被拒" "$(cat "$T/codev-pin.txt")"
+grep -q '^mismatch rc=1$' "$T/codev-pin.txt" && ok "扫后工作区变了 → 拒发" || bad "不一致未拒" "$(cat "$T/codev-pin.txt")"
+grep -q '^nopin rc=0$' "$T/codev-pin.txt" && ok "无钉子 → 不拦" || bad "无钉子被拒" "$(cat "$T/codev-pin.txt")"
+chmod -R u+w "$SB" 2>/dev/null; rm -rf "$REPO" "$SB" "$T/codev-pin.txt"; rm_masters
+
+echo "32b. 探针 mkdir 成功但 rmdir 失败（ACL 允许建不允许删）→ 仍判不安全、不铺母本"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
+  && chmod() { case "$*" in *a-w*) return 0;; *) command chmod "$@";; esac; } && rmdir() { return 1; } && codev_repo_master >/dev/null 2>&1; echo "rc=$?" > "$T/codev-pr.txt"
+  echo "masters=$(find "$CODEV_DIR" -maxdepth 1 -type d -name 'codev-master-repo.*' ! -name '*.lock' | wc -l | tr -d ' ')" >> "$T/codev-pr.txt" )
+grep -q '^rc=1$' "$T/codev-pr.txt" && ok "rmdir 失败仍 rc=1" || bad "rmdir 失败被判安全" "$(cat "$T/codev-pr.txt")"
+grep -q '^masters=0$' "$T/codev-pr.txt" && ok "未留下母本" || bad "留下了母本" "$(cat "$T/codev-pr.txt")"
+rm -rf "$REPO" "$T/codev-pr.txt"; rm_masters
 
 echo "32. 母本 chmod -R a-w 未生效（用替身 chmod 模拟 ACL/只读挂载失败）→ 不铺母本、退回 text；签名哈希皆空 → 不铺母本"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \

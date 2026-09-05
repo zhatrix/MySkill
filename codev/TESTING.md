@@ -21,7 +21,9 @@ codebuddy 429 重置时间、Max turns、context canceled、空输出、部分�
 `CODEV_MAX_COPY_KB` 校验/上限与体积闸门、`CODEV_TIMEOUT` 位数守卫、沙盒 GC 按 owner pid 判活 + 会话目录按活动时间判活、
 回流 commit 拒收部分暂存 + 失败时只撤回本次 add 的文件、rc=137 翻牌如实、母本签名与 cwd 无关、
 母本 chmod 校验失败退回 text（chmod 被替身、母本不铺）、签名哈希皆空时不铺母本、长额度页判 quota 而长评审仍 ok、
-shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不看 pid 直接删、`self`（本 agent 的自评）走同一套翻牌/账本/probe。
+shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不看 pid 直接删、`self`（本 agent 的自评）走同一套翻牌/账本/probe、长散文回答含 429/rate limit 仍判 ok、FIFO 不进母本、
+探针 rmdir 失败仍判不安全、扫描钉住的母本与当前不一致时拒铺副本、复用可写母本时补 a-w、长额度页翻牌带开头、
+散文里的 quota limit 词不误杀；子测试用当前 shell（`TEST_SH`）与探测到的 `CODEV_TO` 起子进程。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。
@@ -66,4 +68,4 @@ tests/microtest/score.sh <out_root>/<label>-*                                   
 | 日期 | 版本/commit | 库测试 | 微测试 | 真机清单 | 备注 |
 |---|---|---|---|---|---|
 | 2026-09-04 | 5b711d1 | 18/18 | 首轮场景 基线 0/3 → 对照 3/3 | 未跑（ntms 当日额度受限） | 七类翻牌/账本/CODEV_TIMEOUT/文档评审模式 |
-| 2026-09-04 | 第二批 | 40/40（现 104/104，bash/zsh） | 第 2 轮场景 基线 0/3 → 对照 3/3（diff 段 2/3） | 待跑（ntms 当日 codex/codebuddy 额度受限） | 编号/diff/trailer commit/归档/自动多轮/发现台账；样本在会话 scratchpad microtest/r2-* |
+| 2026-09-04 | 第二批 | 40/40（现 115/115，bash/zsh） | 第 2 轮场景 基线 0/3 → 对照 3/3（diff 段 2/3） | 待跑（ntms 当日 codex/codebuddy 额度受限） | 编号/diff/trailer commit/归档/自动多轮/发现台账；样本在会话 scratchpad microtest/r2-* |

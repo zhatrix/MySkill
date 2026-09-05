@@ -27,7 +27,8 @@
 **铁律（安全保障，始终生效）**
 - Claude 是**唯一改文件的人**。外部 agent 一律**只读**运行，只输出方案/评审/质疑。
 - 发给外部模型前会做 **secret 扫描**，命中疑似密钥会停下让你确认或脱敏。
-- 每次 fan-out（并行调多个 agent）前会用弹窗让你**确认调用哪些**（消耗各自账号额度）。
+- fan-out（并行调多个外部 agent）前会用弹窗让你**确认调用哪些**（消耗各自账号额度）；显式 `--agents` 跳过确认，
+  `--auto` 多轮只在开始问一次。Claude 自己的 `self` 不耗额度、不在弹窗里。
 - 外部 agent 的输出**逐字呈现**，不总结、不裁剪，清楚标注来源与模型。
 
 ---
@@ -51,7 +52,7 @@ macOS 原生没有 `timeout`。**不装后台慢模型无兜底会永久挂起**
 ```bash
 brew install coreutils      # 提供 gtimeout
 ```
-装完 `/codev` 的探测会显示 `timeout -> /opt/homebrew/bin/timeout`。
+装完 `/codev` 的探测会显示 `timeout -> /opt/homebrew/bin/gtimeout`（或已把 gnubin 加进 PATH 时的 `…/timeout`）。
 
 ### 2.3 超时与账本
 - `CODEV_TIMEOUT`（默认 600s）：单次 agent 调用的兜底超时。核实型评审、大文档评审建议 `export CODEV_TIMEOUT=1200`。
@@ -84,9 +85,9 @@ bash/zsh 都能正常跑。
 /codev review                 # 评审当前全部改动
 /codev review 并发安全和错误处理   # 带关注点
 ```
-流程：自动定 base（`@{u}` → `origin/HEAD` → `main`… 回退链，会验证 commit 存在）→ **secret 扫描**
-→ **Claude 自查**（不带对话上下文的 subagent 先过一遍，明显问题先修）→ 外部 agent 与 **Claude 自评**（同一份提示词、
-另一个 fresh subagent，标签 `self`）并行评审 → **事实核查回填**（把 agent 标注的"需核实假设"逐条查证）→ 综合出
+流程：自动定 base（`@{u}` → `origin/HEAD` → `main`… 回退链，会验证 commit 存在）
+→ **Claude 自查**（不带对话上下文的 subagent 先过一遍，明显问题先修）→ 组提示词 → **secret 扫描**（扫的是修完之后的版本）
+→ 外部 agent 与 **Claude 自评**（同一份提示词、另一个 fresh subagent，标签 `self`）并行评审 → **事实核查回填**（把 agent 标注的"需核实假设"逐条查证）→ 综合出
 **一致性矩阵 + PASS/FAIL 门禁**（出现 P1/critical 即 FAIL）→ 问你要不要让 Claude 修复确认的问题。
 
 - codex 用原生 `codex review`（只读，从仓库根跑，自己跑 `git diff`）。
@@ -98,6 +99,7 @@ bash/zsh 都能正常跑。
   text 模式对它们不起作用。
 
 ### challenge — 对抗式挑战
+（和 review、文档评审一样，Claude 先自查、再与外部 agent 并行自评，见 SKILL 通用机制 G。）
 ```
 /codev challenge lib/auth/token.dart
 ```
@@ -165,7 +167,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | codebuddy 无输出/超时 | 先看翻牌类别：`⛔ 额度/限流`（429，错误串带重置时间）到点再试；`⚠️ turn 预算耗尽` 用 `--max-turns 64` + 核实清单收窄到 3-5 条；提示词压到 25KB 内。仍不行则跳过 |
 | opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
-| 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟且 owner 进程已死的（会话目录 `codev.*` 则是超 24 小时且无文件活动） |
+| 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟且 owner 进程已死的，超 7 天的不看进程一律清（会话目录 `codev.*` 则是超 24 小时且无文件活动） |
 | gemini 报网络错误 | 本机 gemini 偶发 503/fetch failed，属它自身网络问题，重试或换 agent |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
 | 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型 |
@@ -177,7 +179,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 ```
 codev/
 ├── README.md              # 本文件：使用文档
-├── SKILL.md               # 给 Claude 执行的主规范（流程 / 铁律 / 通用机制 A–F）
+├── SKILL.md               # 给 Claude 执行的主规范（流程 / 铁律 / 通用机制 A–G）
 ├── bin/
 │   └── codev-lib.sh       # 共享 shell 函数库：timeout 封装 / 沙盒 / 输出捕获 / RC 上报 / 探测
 ├── references/
@@ -199,8 +201,8 @@ codev/
 
 ## 9. 隔离沙盒与只读仓库副本
 
-六个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里），此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
-参与，和 opencode 同档（提示词只读 + 前后 `git status` 快照核对）、跑在真实仓库：
+六个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里）。此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
+参与：保障级别与 opencode 同为"弱"（提示词只读 + 前后快照核对），但它跑在真实仓库而不是沙盒：
 
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|
