@@ -148,6 +148,10 @@ case "$r" in *"codex"*"gpt-5.6-sol"*) ok "stats 含 codex";; *) bad "stats 缺 c
 case "$r" in *"2/3"*) ok "P1 精确率 2/3";; *) bad "精确率错" "$r";; esac
 case "$r" in *"reasonix"*"0/0"*) ok "reasonix 无 P1 显示 0/0";; *) bad "reasonix 行错" "$r";; esac
 
+# 清母本：zsh 默认 NOMATCH，`rm -rf … codev-master-repo.*` 在没铺母本的用例里会让【整条清理命令】中止
+# （2>/dev/null 挡不住 shell 级错误），$REPO 跟着泄漏（实测每跑一次留一个 300KB 仓库）。用 find 不走 glob；
+# 母本是 a-w 的，先恢复写权限。
+rm_masters() { find "$CODEV_DIR" -maxdepth 1 -name 'codev-master-repo.*' -exec chmod -R u+w {} + 2>/dev/null; find "$CODEV_DIR" -maxdepth 1 -name 'codev-master-repo.*' -exec rm -rf {} + 2>/dev/null; }
 # 中间产物一律放 $CODEV_DIR（每次运行独立的临时目录），不要用固定的 /tmp 路径：
 # 固定路径会让两次并发运行互相污染，也会让子 shell 失败时的断言读到上一轮的残留文件而误报通过。
 T="$CODEV_DIR"
@@ -258,7 +262,7 @@ done
 for drop in credentials.json credentials gcp-credentials.yml credentials.yml.enc server.key UPPER.KEY .ENV; do
   grep -qx "$drop" "$T/codev-mst.txt" && bad "漏挡 $drop" "$(cat "$T/codev-mst.txt")" || ok "挡住 $drop"
 done
-chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-mst.txt" "$CODEV_DIR"/codev-master-repo.*
+rm -rf "$REPO" "$T/codev-mst.txt"; rm_masters
 
 # 一个【保证已死】的 pid：起个后台进程等它结束再用它的 pid。不用 999999：Linux 的 pid_max 可到 4194304，可能真活着。
 sleep 0 & DEAD=$!; wait "$DEAD" 2>/dev/null
@@ -269,7 +273,7 @@ REPO=$(mktemp -d -t codevrepo.XXXXXX)
   && touch -t 202001010000 "$CODEV_MASTER.lock" \
   && for i in 1 2 3 4 5 6 7 8; do ( codev_repo_master; echo "rc=$?" >> "$T/codev-lock.txt" ) & done; wait
   n=$(cd "$CODEV_MASTER" && find . -type f | wc -l | tr -d ' '); echo "files=$n" >> "$T/codev-lock.txt"
-  ls -d "$CODEV_MASTER".partial.* 2>/dev/null | wc -l | tr -d ' ' | sed 's/^/partials=/' >> "$T/codev-lock.txt"
+  find "$CODEV_DIR" -maxdepth 1 -type d -name "$(basename "$CODEV_MASTER").partial.*" | wc -l | tr -d ' ' | sed 's/^/partials=/' >> "$T/codev-lock.txt"   # 不用 ls glob：zsh 无匹配会报错
   [ -d "$CODEV_MASTER.lock" ] && echo lock-leaked >> "$T/codev-lock.txt" )
 [ "$(grep -c '^rc=0$' "$T/codev-lock.txt")" = 8 ] && ok "8 个等待者全部 rc=0" || bad "有等待者失败" "$(cat "$T/codev-lock.txt")"
 grep -q '^files=60$' "$T/codev-lock.txt" && ok "母本完整（60 个文件）" || bad "母本不完整" "$(cat "$T/codev-lock.txt")"
@@ -285,7 +289,7 @@ SB=$(mktemp -d -t codev-sbox.XXXXXX)
 [ "$(find "$SB/repo" -type f 2>/dev/null | wc -l | tr -d ' ')" = 60 ] && ok "副本 60 个文件" || bad "副本文件数不对"
 [ -f "$SB/repo/f1.txt" ] && [ ! -w "$SB/repo/f1.txt" ] && ok "副本只读" || bad "副本可写"
 chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB"; [ -e "$SB" ] && bad "沙盒删不掉" || ok "沙盒已清理"
-chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-lock.txt" "$CODEV_DIR"/codev-master-repo.*
+rm -rf "$REPO" "$T/codev-lock.txt"; rm_masters
 
 echo "27. 体积闸门：CODEV_MAX_COPY_KB 非法值退回默认、超 1GB 截到上限；超闸门时 codev_repo_master 返回 1 且不铺母本"
 r=$(CODEV_MAX_COPY_KB=abc; source "$LIB" 2>/dev/null; echo "$CODEV_MAX_COPY_KB"); [ "$r" = 102400 ] && ok "非法值 → 102400" || bad "非法值未退回" "$r"
@@ -297,7 +301,8 @@ REPO=$(mktemp -d -t codevrepo.XXXXXX)
   echo "masters=$(find "$CODEV_DIR" -maxdepth 1 -type d -name 'codev-master-repo.*' ! -name '*.lock' | wc -l | tr -d ' ')" >> "$T/codev-gate.txt" )
 grep -q '^rc=1$' "$T/codev-gate.txt" && ok "超闸门 rc=1" || bad "超闸门未拒绝" "$(cat "$T/codev-gate.txt")"
 grep -q '^masters=0$' "$T/codev-gate.txt" && ok "未铺母本" || bad "超闸门仍铺了母本" "$(cat "$T/codev-gate.txt")"
-chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-gate.txt" "$CODEV_DIR"/codev-master-repo.* 2>/dev/null
+rm -rf "$REPO" "$T/codev-gate.txt"; rm_masters
+r=$(CODEV_MAX_COPY_KB=99999999999999999999; source "$LIB" 2>/dev/null; echo "$CODEV_MAX_COPY_KB"); [ "$r" = 1048576 ] && ok "20 位数字（超 2^63）也截到上限" || bad "超长数字逃过上限" "$r"
 
 echo "28. 沙盒 GC：超 60 分钟但 owner 进程还活着的沙盒不删；owner 已死的删"
 GCD="$CODEV_DIR/gc"; mkdir -p "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
@@ -317,6 +322,31 @@ REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config
 [ "$(sed -n 2p "$T/codev-ps.txt")" = 1 ] && ok "index 仍是用户暂存的 v2" || bad "index 被动了" "$(cat "$T/codev-ps.txt")"
 [ "$(sed -n 3p "$T/codev-ps.txt")" = 1 ] && ok "没有产生 commit" || bad "产生了 commit" "$(cat "$T/codev-ps.txt")"
 rm -rf "$REPO" "$T/codev-ps.txt"
+
+echo "29b. 回流 commit 失败时只撤回本次 add 的文件：用户自己整文件暂存的 a.md 留在 index，b.md 被撤回"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && echo a1 > a.md && echo b1 > b.md && git add -A && git commit -qm i && echo a2 > a.md && git add a.md && echo b2 > b.md \
+  && printf '#!/bin/sh\nexit 1\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit \
+  && codev_commit_round "a.md b.md" 1 codex 0 - msg >/dev/null 2>&1; echo "rc=$?" > "$T/codev-rb.txt"; git diff --cached --name-only >> "$T/codev-rb.txt" )
+grep -q '^rc=1$' "$T/codev-rb.txt" && ok "hook 失败 rc=1" || bad "rc 不对" "$(cat "$T/codev-rb.txt")"
+grep -qx 'a.md' "$T/codev-rb.txt" && ok "用户暂存的 a.md 仍在 index" || bad "a.md 被撤回了" "$(cat "$T/codev-rb.txt")"
+grep -qx 'b.md' "$T/codev-rb.txt" && bad "本次 add 的 b.md 未撤回" "$(cat "$T/codev-rb.txt")" || ok "本次 add 的 b.md 已撤回"
+rm -rf "$REPO" "$T/codev-rb.txt"
+
+echo "31. 第 2 轮回流：CODEV_TIMEOUT 位数守卫；会话目录 GC 按活动时间判活；母本签名与调用 cwd 无关"
+r=$(CODEV_TIMEOUT=99999999999999999999; source "$LIB" 2>/dev/null; echo "$CODEV_TIMEOUT"); [ "$r" = 600 ] && ok "20 位 CODEV_TIMEOUT → 600" || bad "超长 CODEV_TIMEOUT 穿透" "$r"
+GCD="$CODEV_DIR/gc2"; mkdir -p "$GCD/codev.active/sub" "$GCD/codev.stale"
+echo x > "$GCD/codev.active/sub/codev-out-x.txt"; echo y > "$GCD/codev.stale/old.txt"
+touch -t 202001010000 "$GCD/codev.active" "$GCD/codev.stale" "$GCD/codev.stale/old.txt"   # 目录 mtime 都很旧；active 里有个新文件
+( TMPDIR="$GCD"; codev_sbox_gc >/dev/null )
+[ -d "$GCD/codev.active" ] && ok "24h 内有文件活动的会话目录保留" || bad "活会话目录被 GC 删了"
+[ -d "$GCD/codev.stale" ] && bad "24h 无活动的会话目录未删" || ok "无活动会话目录 → 删"
+rm -rf "$GCD"
+REPO=$(mktemp -d -t codevrepo.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && mkdir -p a/b && echo 1 > top.txt && echo 2 > a/b/deep.txt && git add -A && git commit -qm i \
+  && echo u > untracked-top.txt && codev_master_path && printf '%s\n' "$CODEV_MASTER" && cd a/b && codev_master_path && printf '%s\n' "$CODEV_MASTER" ) > "$T/codev-cwd.txt"
+[ "$(sort -u "$T/codev-cwd.txt" | wc -l | tr -d ' ')" = 1 ] && ok "根目录与子目录算出同一母本路径" || bad "签名随 cwd 变" "$(cat "$T/codev-cwd.txt")"
+rm -rf "$REPO" "$T/codev-cwd.txt"
 
 echo "30. 翻牌行：rc=137 的超时写明 rc=137 而不是写死 124"
 mk x "" ""; r=$(report x 137); case "$r" in *"rc=137"*) ok "137 如实显示";; *) bad "仍写死 124" "$r";; esac

@@ -35,7 +35,9 @@ allowed-tools:
     `./repo` —— 工作区（含未提交改动）的**只读副本**。它们既能读全部代码，写入默认只落到副本上、
     随沙盒删掉。再叠加各自的只读/禁工具旗标（见 `agents.md` 表格）+ 提示词边界，共三层。
     **这是 cwd 隔离 + 副本/母本 `a-w`，不是 OS 级沙盒**：防的是误写；同用户进程刻意枚举 `$TMPDIR`
-    仍能找到并改回权限，防不了恶意 agent。仓库敏感就用 `CODEV_SANDBOX_MODE=text`。
+    仍能找到并改回权限，防不了恶意 agent。**仓库敏感时要做两件事**：`CODEV_SANDBOX_MODE=text` 让四个沙盒 agent
+    只拿提示词文本；**同时 `--agents` 排除 codex/gemini**——它们在真实仓库里跑，`-s read-only` 只挡写不挡读，
+    `.gitignore` 掉的 `.env`、客户数据它们照样读得到，text 模式对它们没有任何作用。
   - **别把第二组挪进真实仓库**，除非确认其旗标是**沙盒级**而非"框架答应不调用写工具"
     （opencode `--agent plan` 就是反例：`edit` 禁了但 `bash` 没禁）。确需如此则必须逐 agent
     前后 `git status --porcelain` 快照核对 + 串行，发现改动即停下、逐字上报用户由其处置
@@ -183,9 +185,20 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 **评审/挑战/文档评审模板还要带「两档结论」**：强制 agent 把结论分成【已查证】和【需进一步核实的假设】
 两栏，别因为看不到某处代码就给整体 FAIL。第二栏由 F 之前的事实核查环节收口（见 synthesis.md 0.5）。
 
-**发送前 secret 扫描——所有 fan-out 模式都做，不只 review。** `codev_bg_sandboxed` 铺 `./repo` 副本
-**不分模式**：brainstorm / challenge / consult 同样把整个工作区发给沙盒 agent。副本模式（默认）下先跑
-Step 2B 第 3 步的整仓扫描；`CODEV_SANDBOX_MODE=text` 下扫将发送的提示词文件。命中就停下问用户。
+**发送前 secret 扫描——所有 fan-out 模式都做，不只 review；顺序固定：写完全部提示词 → 扫 → 才 fan-out。**
+两个范围都要扫：
+1. **提示词文件本身**（所有模式、所有 agent）：用户的问题/关注点、Claude 的 v0 方案、内联的 diff 都在里面，
+   从别处粘来的 token 会随它直接外发。用 `find -exec` 而不是 `"$CODEV_DIR"/codev-prompt-*.txt` glob：zsh 无匹配时
+   glob 报错、grep 根本不跑、`$?` 为 1，会被下面判成"干净"。
+   ```bash
+   n=$(find "$CODEV_DIR" -maxdepth 1 -name 'codev-prompt-*.txt' | wc -l | tr -d ' ')
+   [ "${n:-0}" -gt 0 ] || { echo "SCAN: 还没有提示词文件——先写提示词再扫"; exit 1; }
+   find "$CODEV_DIR" -maxdepth 1 -name 'codev-prompt-*.txt' -exec grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' {} +
+   case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac
+   ```
+2. **将进副本的整个工作区**（副本模式，即默认）：`codev_bg_sandboxed` 铺 `./repo` **不分模式**，brainstorm /
+   challenge / consult 同样把整个工作区发给沙盒 agent。跑 Step 2B 第 3 步的整仓扫描（它不依赖 BASE）。
+命中就停下问用户。
 README 对用户的承诺是"发给外部模型前会做 secret 扫描"，这一条让它在每个模式都成立。
 
 ### C. 并行调用（后台执行，避免超时）
@@ -215,7 +228,7 @@ codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metr
 #   opencode   run --agent plan          （很慢，务必后台）
 # 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 沙盒 + ./repo 只读副本 /
 #            umask 077(子shell内) / 捕 agent 退出码 / 收尾删沙盒 / ✔或⚠️上报。
-# 副本超体积闸门（默认 100MB）或非 git 仓库时自动退回空目录模式，▶ 行会标出；
+# 副本超体积闸门（默认 100MB，CODEV_MAX_COPY_KB 可调、上限 1GB）或非 git 仓库时自动退回空目录模式，▶ 行会标出；
 # 想强制旧的"空目录只喂文本"：调用前 export CODEV_SANDBOX_MODE=text。
 
 # —— 原生只读 agent（codex/gemini）：无需沙盒，在仓库根跑 ——
@@ -370,14 +383,14 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"，并告知用户此时沙盒 agent 会看不到
    > diff 之外的代码、结论置信度下降。**首次在一个新仓库启用副本模式时，向用户说明这一点。**
 4. 并行发出（B/C）：
-   - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**：prompt 里含文件系统边界 +
-     "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点" + **未跟踪新文件清单**（`git diff` 不含 untracked，
-     codex 在真仓库里跑却不知道哪些文件是新增的：把第 1 步枚举出的路径逐个列进 prompt，写明"这些是新增
-     未跟踪文件，整个文件都是改动，请打开评审"；一个都没有就写"无未跟踪新文件"）（**写 `git diff <BASE>`，不是 `<BASE>...HEAD`**：
-     后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"或随手评审别的
-     代码，而其它 agent 拿的是 `git diff "$BASE"` 的工作树内容，一致性矩阵在比两份不同的东西），从而**不带 `--base`/`--commit`**（避开
-     `[PROMPT]` 与它们的 argv 互斥）、也**不带 `-s`/`-C`**（review 不认这俩），须从仓库根跑。这样保住了
-     自定义关注点（详见 agents.md）；
+   - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**，prompt 里三要素：
+     ① 文件系统边界；② "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点"——**是 `git diff <BASE>`，不是
+     `<BASE>...HEAD`**：后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"
+     或随手评审别的代码，而其它 agent 拿的是 `git diff "$BASE"` 的工作树内容，一致性矩阵会在比两份不同的东西；
+     ③ **未跟踪新文件清单**——`git diff` 不含 untracked，codex 在真仓库里跑却不知道哪些文件是新增的，把第 1 步
+     枚举出的路径逐个列进 prompt，写明"这些是新增未跟踪文件，整个文件都是改动，请打开评审"，一个都没有就写
+     "无未跟踪新文件"。这样就**不带 `--base`/`--commit`**（避开 `[PROMPT]` 与它们的 argv 互斥）、也**不带
+     `-s`/`-C`**（review 不认这俩），须从仓库根跑，同时保住了自定义关注点（详见 agents.md）；
    - 其它 agent 用 prompts.md 的 **review 模板**（含「工作副本」+「两档结论」段）+ `git diff "$BASE"`
      内容（经上面扫描后），走 `codev_bg_sandboxed`。**只内联 diff**，diff 之外的既有代码不必再手工摘录——
      让它们自己去沙盒里的 `./repo` 读。
@@ -400,9 +413,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    **例外：沙盒没有 `./repo` 时必须内联**——`CODEV_SANDBOX_MODE=text`、仓库超体积闸门、非 git 仓库都会让
    `codev_bg_sandboxed` 自动退回空目录模式（▶ 行标"隔离空目录"），此时路径引用等于什么都没给，agent 只能
    输出"无法验证"。发起前先判（母本是发起时才懒铺的，不能只看目录在不在，要真的铺一次）：
-   `[ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && ( cd "$(git rev-parse --show-toplevel)" && codev_repo_master )`
-   返回非 0（非 git / 超闸门 / 铺失败）、或首个 ▶ 行显示空目录，就对沙盒 agent 改用 DOC_START/DOC_END 内联
-   （codex/gemini 在真仓库，仍路径引用）。铺好的母本随后被各 agent 直接复用，不多花时间。
+   `[ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && ( cd "$(git rev-parse --show-toplevel)" && codev_repo_master && [ "$(find "$CODEV_MASTER" -type f | head -1)" ] )`
+   返回非 0（非 git / 超闸门 / 铺失败 / 母本 0 个文件——空仓库或全被密钥过滤挡下），就对沙盒 agent 改用
+   DOC_START/DOC_END 内联（codex/gemini 在真仓库，仍路径引用）。这个判定必须在**发出之前**做：▶ 行显示
+   空目录时提示词已经发出去了，到那时只能撤回重发。铺好的母本随后被各 agent 直接复用，不多花时间。
 2. 选 agent（A）。`--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就
    让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
    （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），
@@ -450,4 +464,6 @@ brainstorm（2A）→ 用户拍板 → Claude 按方案与 CLAUDE.md 规范编�
 
 简短小结：跑了哪些模式、调用了哪些 agent（含被判无效的类别）、跨模型综合的关键结论、门禁结果、
 本轮已核实 P1 数（多轮时给趋势）、遗留项。不要复述外部 agent 的原文（上面已逐字呈现过）。
+然后收尾：`chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"`（母本 a-w，先恢复写权限；每个签名的母本最大
+1GB，不清就堆到 24 小时 GC）。用户要留输出就告知路径、不删。
 本 skill 的库有回归测试：改 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`。

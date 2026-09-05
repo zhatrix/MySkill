@@ -43,7 +43,7 @@
 | `codev_archive <slug> <round>` | 把本会话 prompt/out/err/metrics 复制到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`，并把 `.superpowers/` 写进 **common gitdir**（`git rev-parse --git-common-dir`，worktree 里 `.git` 是文件）的 `info/exclude` 保证不入库；写不进去时提示会如实说"未能写进 git 忽略"，不会谎称已忽略。 |
 | `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间；`codev_ledger_recent` 同时兼容升级前的旧 7 列布局 时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟**（沙盒天生短命，上限 CODEV_TIMEOUT ≤ 3000s，不会误删并发 run 的活沙盒）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着一律不删；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
@@ -75,8 +75,9 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 
 非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置三选一：
 - **(a) 默认 & 首选：隔离沙盒 + 只读仓库副本**——cwd 是 `mktemp -d` 出来的沙盒，里面有 `./repo`
-  （工作区副本，`chmod -R a-w`）。**真实仓库根本不在 cwd 里**，agent 的任何写入都只能落到副本上、
+  （工作区副本，`chmod -R a-w`）。**真实仓库不在 cwd 里**，agent 顺手的写入只会落到副本上、
   随沙盒一起删掉 → 免掉快照/归因/污染问题，同时 agent **能读到全部代码**。这是 (a') 的严格升级版。
+  （防的是误写：有 shell 的 agent 用绝对路径仍能碰到沙盒外，见下方「边界说明」。）
 - **(a') 隔离空目录只喂文本**（`CODEV_SANDBOX_MODE=text`）——旧默认。仅在不想让 agent 看到仓库
   其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。
 - **(b) 确需在真实仓库 cwd 跑**：则**必须逐 agent 前后快照核对 + 串行**（并行无法归因、会互相污染）。
@@ -186,7 +187,8 @@ rc=0 发布），"判陈旧 → 动手"之间的窗口也会让路径上已换�
 也记 pid，陈旧判定同样先 `kill -0`。④ 发布：`mv .partial.<pid> → 母本` 后若发现自己被嵌进了别人先发布的母本里
 （双 builder 极窄窗口的 mv 语义），删掉嵌套的那份；母本随后 `chmod -R a-w`。每个进入临界区的 builder 在
 `<母本>.builders` 记一行，测试据此直接断言"单一赢家"（tests 26），不再只看最终态。
-实测 15 个并发等待者 + 陈旧锁 × 12 轮（bash/zsh 各 6），全部 rc=0、只生成一个母本、无锁/半成品残留。
+手测（非自动化）15 个并发等待者 + 陈旧锁 × 12 轮（bash/zsh 各 6），全部 rc=0、只生成一个母本、无锁/半成品残留；
+自动化的是 tests 26 的 8 等待者 + builders 计数 = 1。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
 待评审的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。下面片段用于 (b)：
@@ -405,7 +407,7 @@ fi
 | qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
 | codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
 | opencode | **弱**（`edit` 禁了但 `bash` 没禁，可绕过；且权限表随用户配置漂移） | `--agent plan` | 沙盒 `codev_bg_sandboxed` |
-| reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错） | 沙盒 `codev_bg_sandboxed` |
+| reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错；`--help` 里另有 `--allowed-tools "<规则>"`，**未实测**能否做成只读白名单，验过再升级此行） | 沙盒 `codev_bg_sandboxed` |
 
 三层纵深防御，下面四个 agent **三层都要上**，不能只靠其中一层：
 1. **沙盒**（`codev_bg_sandboxed`）——真实仓库不在 cwd，只有 `./repo` 只读副本。**这是主防线**：

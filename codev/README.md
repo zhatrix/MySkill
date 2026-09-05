@@ -92,7 +92,9 @@ bash/zsh 都能正常跑。
 - 其余 agent 在**隔离沙盒**里跑：cwd 不是真仓库，但沙盒里有一份 `./repo` —— 工作区（含未提交
   改动）的**只读副本**。它们能读全部代码来核实跨文件问题，写入默认只落在副本上、用完即删。
   这是 cwd 隔离 + 副本与母本 `chmod -R a-w`，**不是 OS 级沙盒**：防误写，防不了同用户进程刻意枚举 `$TMPDIR`
-  再改回权限的恶意 agent。仓库敏感就设 `CODEV_SANDBOX_MODE=text` 只喂提示词文本。
+  再改回权限的恶意 agent。仓库敏感要做两件事：设 `CODEV_SANDBOX_MODE=text` 让四个沙盒 agent 只拿提示词文本，
+  **并用 `--agents` 排除 codex/gemini**——它们在真实仓库里跑，只读旗标只挡写不挡读，`.gitignore` 掉的文件照样读得到，
+  text 模式对它们不起作用。
 
 ### challenge — 对抗式挑战
 ```
@@ -198,7 +200,8 @@ codev/
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|
 | **沙盒级只读** | codex、gemini | CLI 自带进程级限制（`-s read-only` / `--approval-mode plan`） | 真实仓库根 |
-| **隔离沙盒** | qoderclicn、codebuddy、opencode | 沙盒 + 只读工具白名单/受限 agent + 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+| **隔离沙盒** | qoderclicn、codebuddy | 沙盒 + 只读工具白名单（harness 级）+ 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+| **隔离沙盒（旗标弱）** | opencode | 沙盒 + `--agent plan`（`edit` 禁了但 `bash` 没禁，可绕过）+ 提示词边界 | 同上 |
 | **隔离沙盒（仅沙盒兜底）** | reasonix | 只有沙盒 + 提示词边界——它**没有**可用的只读旗标（`--permission-mode plan` 非交互下报错退出） | 同上 |
 
 第二档的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
@@ -222,10 +225,11 @@ codev/
 
 **注意隐私边界变了**：沙盒 agent 现在能读整个工作区并发给它自己的模型，不再只有 diff。
 密钥文件已排除、secret 扫描照做，但**挡不住硬编码在源码里的密钥**。仓库整体敏感时，
-让 Claude 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"（代价：那四个 agent 重新变瞎）。
+让 Claude 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"（代价：那四个 agent 重新变瞎；对 codex/gemini 无效，
+它们要靠 `--agents` 排除）。
 
 副本超过 100MB（`CODEV_MAX_COPY_KB`）或当前不是 git 仓库时，会自动退回空目录模式，
-启动行 `▶` 会标出实际用的是哪种。
+启动行 `▶` 会标出实际用的是哪种。副本体积闸门默认 100MB（`CODEV_MAX_COPY_KB`，上限 1GB），超过退回只喂文本。
 
 **每个 agent 拿到的是独立副本**：每个（仓库 + 工作区内容）签名只铺一份"母本"（改了代码再评自动换新母本），各 agent 从母本 `cp -c`
 （APFS 写时复制）clone 一份自己的。所以它们互不干扰——某个 agent 就算绕过只读权限改了文件，

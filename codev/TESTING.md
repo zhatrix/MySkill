@@ -18,7 +18,8 @@ codebuddy 429 重置时间、Max turns、context canceled、空输出、部分�
 含 worktree 场景）、probe 空台账返回 0、cost/tokens 遇 null 不串号、账本兼容旧 7 列、`codev_commit_round` 多文件
 （zsh 不拆词）、短结论含 401/rate limit 不误判、rc=137 判 timeout、母本签名随脏文件内容变、母本过滤只挡文件不挡目录
 + credentials 源码保留 + 大小写变体、陈旧锁并发回收单一赢家（直接计数进入临界区的 builder）+ 母本 a-w、
-`CODEV_MAX_COPY_KB` 校验/上限与体积闸门、沙盒 GC 按 owner pid 判活、回流 commit 拒收部分暂存、rc=137 翻牌如实。
+`CODEV_MAX_COPY_KB` 校验/上限与体积闸门、`CODEV_TIMEOUT` 位数守卫、沙盒 GC 按 owner pid 判活 + 会话目录按活动时间判活、
+回流 commit 拒收部分暂存 + 失败时只撤回本次 add 的文件、rc=137 翻牌如实、母本签名与 cwd 无关。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。
