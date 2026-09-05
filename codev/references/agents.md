@@ -158,7 +158,7 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 （secret 扫描仍会兜底），也绝不删用户的源码"——所以**只对确定是密钥载体的模式用通配**。
 若某仓库确实因此丢了关键文件、导致 agent 评审失真，用 `CODEV_SANDBOX_MODE=text` 或临时调整清单。
 
-### 母本 + clone：每会话只 tar 一次
+### 母本 + clone：每个工作区签名只 tar 一次
 
 N 个 agent 各自全量 tar 一遍很浪费。现在改成**母本 + 写时复制 clone**：
 - `codev_repo_master` 把工作区铺成母本 `$CODEV_DIR/codev-master-repo.<签名>`，**每个（仓库 + 工作区内容）签名只做一次**（改了代码再评会自动换新母本），建成后 `chmod -R a-w`；
