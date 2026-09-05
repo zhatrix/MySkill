@@ -119,7 +119,7 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 - `--round N`：多轮评审的轮次（默认 1）。N ≥ 2 时按 synthesis.md §6「多轮回流协议」走：提示词标题带轮次、
   附上一轮发现清单（含已驳回项）要求回归核对、内联两版文档的 `git diff`、外审前先做 fresh-subagent 自审。
 - `--auto [--max-rounds K]`（默认 K=3，上限 5）：自动连跑多轮直到收敛，**只在开始时问一次**（agent 组合 +
-  轮次上限 + 预算），之后每轮自审 → 外审 → 综合 → 回流 → `codev_commit_round` 提交，不再逐轮询问。
+  轮次上限 + 预算），之后每轮 G1 自查 → 外审 + G2 自评（并行）→ 综合 → 回流 → `codev_commit_round` 提交，不再逐轮询问。
   停止条件与流程见 synthesis.md §6.3。没有 `--auto` 时每轮结束仍停下问用户是否开下一轮。
 - `review` 的首个非开关参数若是**存在的文件路径**（`.md`/`.txt`/`.rst`），就是文档评审（Step 2F），不是关注点。
 
@@ -270,10 +270,11 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 ### D. 运行时显示
 两部分：**你在发起/收到通知时打印状态板** + 后台任务 stdout 的 `▶/✔/⏭/⛔/⚠️` 行（库函数打印）。
-1. 启动即报，每 agent 一行：`▶ codex（模型 gpt-5.6-sol）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式"范围"写关注面）。
+1. 启动即报，每 agent 一行：`▶ codex（模型 gpt-5.6-sol）｜ 范围：全量 ｜ 强度 medium ｜ 运行中…`（分工模式"范围"写关注面）；
+   `self`（G2 自评 subagent）也占一行：`▶ self（模型 <Claude 模型 id>）｜ 范围：全量 ｜ fresh-subagent，真实仓库只读 ｜ 运行中…`。
 2. 想盯某个慢 agent：`Monitor` 跟踪 `$CODEV_DIR/codev-out-<agent>.txt`；**不要**后台 `tail -f`（悬挂进程）；不为监控给 codex 加 `--json`。
 3. 完成即翻牌：照抄 `codev_report` 的翻牌行（类别 + 用时/tokens/成本，取不到就不写）。
-4. 全部结束后打印 `codev_session_summary`，再进 E。
+4. 全部结束后打印 `codev_session_summary`（`self` 也在里面，G2 收尾已 `codev_report self`），再进 E。
 
 ### E. 忠实呈现
 每个 agent 的原始输出用分隔框逐字呈现：
@@ -289,7 +290,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 取不到就**省略该字段**，不要编造。）
 
 ### F. 跨模型综合
-所有 agent 返回后，按 `references/synthesis.md`：
+所有 agent（含 G2 的 `self`）返回后，按 `references/synthesis.md`：
 - **先做事实核查回填**（synthesis.md 0.5，**不可跳过**）：把各 agent「需进一步核实的假设」栏合并成
   一张清单，逐条由 Claude 自己读代码核实、或交给 codex（有真实仓库权限）核实，回填
   成立/不成立/待定后再进矩阵。**agent 因看不到代码给的整体 FAIL 不直接采纳**；
@@ -301,7 +302,38 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 - **P1 采纳前必须 Claude 亲验前提**（synthesis.md 0.6，**不分 A/B 栏**）：agent 标"已查证"的也翻过车
   （枚举存在≠路径可达、"同构"未看触发时序、grep 失败被说成"不存在"）；agent 之间矛盾**以代码为准**；
 - review 模式额外给 **PASS / FAIL 门禁**（出现**已亲验成立**的 P1/critical 即 FAIL）；
-- 多轮评审（`--round N`）按 synthesis.md §6：回归核对上一轮 + 轮间自审 + 收敛判据。
+- **「Claude vs 外部 agent」一致率必做**（synthesis.md §4）：`self` 的发现 vs 外部三家的并集，标出"仅外部发现"（Claude 的盲区）
+  与"仅 self 发现"；
+- 多轮评审（`--round N`）按 synthesis.md §6：回归核对上一轮 + G1 自查 + 收敛判据。
+
+### G. 本 agent 参与：自查 + 自评（review / 文档评审 / challenge 每轮必做，不耗外部额度）
+外部 agent 不是唯一的评审方，**Claude 自己也是**——但不能是写提示词、做综合的这个上下文（它对自己写的东西是盲的）。
+两个动作，都用 Agent 工具起**不带本对话上下文**的 general-purpose subagent 执行，Claude 本体只做亲验与综合：
+
+**G1. 自查（fan-out 之前）**：用 prompts.md「自审模板」。第 1 轮：对象是评审对象本身（2B 的 `git diff "$BASE"` +
+未跟踪文件 / 2F 的文档），没有回归清单；第 N ≥ 2 轮：对象是上一轮回流 diff + 上一轮发现编号清单（即 synthesis.md §6.1）。
+产出「必须修 / 建议」，Claude **逐条亲验**后直接修（最小改动），修完再组提示词发外审——别让外部额度花在编排器自己
+就能看出来的问题上，也让外审对着已自查过的版本。发现编号 `r<N>-check-<两位序号>`，台账 agent 写 `self`。
+
+**G2. 自评（与外审并行）**：把发给外部 agent 的**同一份提示词**（路径引用版，含边界段、核实清单、两档结论；**去掉**
+「工作副本」段——subagent 在真仓库里有读权限）交给另一个 fresh subagent，标签 `self`，和外部 agent **同时**发出、
+同时收。它看到的版本与外审完全相同，结果才可比。只读靠两层：提示词写明"禁止修改任何文件"，发出前后各做一次
+`git status --porcelain` 快照，不一致即停下逐字上报（同铁律第二组的处置，不自动回滚）。收尾三行让它走和外部
+agent 一样的翻牌与账本：
+```bash
+CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+export CODEV_MODEL_self=<当前 Claude 模型 id>          # 进账本与 commit trailer；不设就记 unknown
+# subagent 的最终回复原样写进 $CODEV_DIR/codev-out-self.txt（Write 工具），然后：
+: > "$CODEV_DIR/codev-err-self.txt"; codev_report self 0 "$CODEV_DIR/codev-err-self.txt"
+```
+自评结果**逐字呈现**（E，框标 `SELF（模型：…）`）、进一致性矩阵（独家/共同）、编号 `r<N>-self-<两位序号>`、记台账。
+综合时固定给「Claude vs 外部 agent」一致率（synthesis.md §4，不再是"若此前跑过 /code-review 才加"）。
+**只读旗标**：`self` 没有沙盒级保证，靠提示词 + 快照核对，和 opencode 同档；仓库敏感时它照样能读整个工作区。
+
+- brainstorm / consult 不强制 G：Claude 的 v0 方案 / 收敛结论本身就是本 agent 的产出，再起一个 subagent 重复一遍收益低；
+  想要"不带上下文的第二个 Claude 视角"时可按 G2 加一个 `self`。
+- `--auto` 每轮顺序：G1 自查 → 外审 + G2 自评（并行）→ 综合 → 回流 → `codev_commit_round`。
+- `codev_stats` 会把 `self` 和外部 agent 放在同一张表里比 P1 亲验成立率——这是"外审到底比 Claude 自己多看出多少"的直接数据。
 
 ---
 
@@ -341,7 +373,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    `git diff --no-index` **有差异就退出 1**，即每个非空的未跟踪文件都会让它返回 1——这是正常输出，
    不是上一段说的"base 无效"。`|| true` 吞掉它，否则把这段和 base 检查放进同一次 Bash 调用时，
    最后的 rc=1 会被误读成 base 无效而停下问用户；用 `&&` 串到后面的命令上则后面的全不执行。
-2. 选 agent（A）。
+2. 选 agent（A）。**G1 自查**：fresh-subagent 按 prompts.md「自审模板（第 1 轮变体）」看这份 diff + 未跟踪文件，
+   "必须修"由 Claude 亲验后先修掉（改动后重新确认 `git diff "$BASE"` 非空），再进第 3 步。
 3. **组提示词 + 发送前 secret 扫描**：先按第 4 步的要求把每个 agent 的提示词写成 `$CODEV_DIR/codev-prompt-<agent>.txt`
    （**只写文件，不发出**），再扫。扫两个范围：通用机制 B 的提示词文件扫描（所有 agent），以及下面这段——
    扫的是**实际将发送的完整 payload**。⚠️ **`./repo` 副本模式下 payload 是
@@ -392,7 +425,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"**并用 `--agents` 排除 codex/gemini**（它们在真仓库跑，
    > text 对它们无效），并告知用户此时沙盒 agent 会看不到 diff 之外的代码、结论置信度下降。
    > **首次在一个新仓库启用副本模式时，向用户说明这一点。**
-4. 并行发出（B/C，扫描通过后；提示词内容要求如下）：
+4. 并行发出（B/C，扫描通过后；提示词内容要求如下）。**G2 自评同时发出**：codex 那份提示词去掉 `codex review` 专属指令、
+   换成"请运行 `git diff <BASE>` 并打开未跟踪清单里的文件"，交给 `self` subagent：
    - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**，prompt 里三要素：
      ① 文件系统边界；② "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点"——**是 `git diff <BASE>`，不是
      `<BASE>...HEAD`**：后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"
@@ -405,8 +439,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
      内容（经上面扫描后），走 `codev_bg_sandboxed`。**只内联 diff**，diff 之外的既有代码不必再手工摘录——
      让它们自己去沙盒里的 `./repo` 读。
 5. 运行时显示（D）→ 忠实呈现（E）→ **事实核查回填 + P1 亲验** → 综合（F）+ **PASS/FAIL 门禁**。
-6. 若此前对话里已跑过 Claude 自己的 `/code-review`，加一段"Claude vs 外部 agent"对比与
-   一致率。
+6. 「Claude vs 外部 agent」对比与一致率（必做，数据来自 G2 的 `self`；本对话此前若还跑过 `/code-review`，把它的发现也并进 self 一侧）。
 7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
    修复后的 commit 同样走 `codev_commit_round <文件列表> …`：首参是【空格分隔的具体文件路径】，多文件就都列出来。
    **不要给目录**——工作树里常有用户自己未提交的改动，给目录会把它们一起提交，函数为此直接拒收目录并返回 1。
@@ -427,9 +460,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    返回非 0（非 git / 超闸门 / 铺失败 / 母本 0 个文件——空仓库或全被密钥过滤挡下），就对沙盒 agent 改用
    DOC_START/DOC_END 内联（codex/gemini 在真仓库，仍路径引用）。这个判定必须在**发出之前**做：▶ 行显示
    空目录时提示词已经发出去了，到那时只能撤回重发。铺好的母本随后被各 agent 直接复用，不多花时间。
-2. 选 agent（A）。`--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就
-   让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
-   （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），
+2. 选 agent（A）。**G1 自查（每轮）**：第 1 轮给 fresh-subagent 文档路径 + prompts.md「自审模板（第 1 轮变体）」；
+   `--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就让用户给），
+   `git diff "$PREV" -- "$DOC"` 就是"本轮改动"，按 synthesis.md §6.1 给它文档路径 + 该 diff + 上一轮编号清单。
    自审发现由 Claude 亲验后直接改进文档，再进外审。
 3. 组提示词（prompts.md「文档评审模板」，先写文件不发出）：路径引用 + 章节目录 + 关注点 + **点名 3-8 条核实项**
    （文档里最关键、最可能与代码脱节的 `文件:行号` / 表名 / 函数 / 迁移号断言）+ 两档结论；
@@ -441,7 +474,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 4. secret 扫描：提示词文件（通用机制 B）+ **文档正文**（内联/路径引用都要，agent 会读它）：
    `grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$DOC"; case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac`
    + 副本模式下按 2B 第 3 步扫母本。
-5. 并行发出（C，扫描通过后）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
+5. 并行发出（C，扫描通过后；**G2 自评同时发出**——同一份文档评审提示词去掉「工作副本」段交给 `self`）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
    记录本轮 **已核实 P1 数**，写进综合结尾（供 §6 收敛判据用）。
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
@@ -455,7 +488,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 1. 确定对象（当前 diff / 指定文件 / 某个方案）。
 2. 选 agent（A）。
 3. 用 prompts.md 的 **challenge 模板**写提示词文件（先不发）：指令 agent "扮演对手，尽力找出会
-   让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。secret 扫描（B：提示词文件 + 副本模式整仓），通过后并行发出（C）。
+   让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。G1 自查（先让 fresh-subagent 按自审模板第 1 轮变体过一遍对象，
+   明显问题先修）。secret 扫描（B：提示词文件 + 副本模式整仓），通过后并行发出（C），**G2 自评同时发出**。
 4. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：汇成"攻击面清单"，标注哪些是真问题、哪些已被现有代码处理。
 5. 询问是否让 Claude 针对确认的漏洞补测试/加固。
 

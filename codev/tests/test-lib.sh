@@ -368,6 +368,14 @@ rm -rf "$REPO" "$T/codev-fifo.txt"
 GCD="$CODEV_DIR/gc3"; mkdir -p "$GCD/codev-sbox.ancient"; echo $$ > "$GCD/codev-sbox.ancient/.codev-owner"; touch -t 202001010000 "$GCD/codev-sbox.ancient"
 ( TMPDIR="$GCD"; codev_sbox_gc >/dev/null ); [ -d "$GCD/codev-sbox.ancient" ] && bad "7 天以上的沙盒因 pid 活着未删" || ok "超 7 天沙盒不看 pid 直接删"; rm -rf "$GCD"
 
+echo "35. self（本 agent 的 fresh-subagent）走同一套翻牌与账本：codev_report self 记 ✔、模型取 CODEV_MODEL_self、probe 列出 self"
+mk self "## A. 已查证的结论
+P2 r1-self-01 …" ""; export CODEV_MODEL_self=claude-test-model
+r=$(report self 0); case "$r" in *"✔ self 完成"*) ok "self 翻牌 ✔";; *) bad "self 翻牌不对" "$r";; esac
+grep -q "	self	claude-test-model	ok	" "$CODEV_LEDGER" && ok "账本 agent=self 模型=CODEV_MODEL_self" || bad "self 未进账本" "$(tail -1 "$CODEV_LEDGER")"
+unset CODEV_MODEL_self
+codev_probe 2>/dev/null | grep -q '^OK   self' && ok "probe 列出 self" || bad "probe 未列 self"
+
 echo "32. 母本 chmod -R a-w 未生效（用替身 chmod 模拟 ACL/只读挂载失败）→ 不铺母本、退回 text；签名哈希皆空 → 不铺母本"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
   && chmod() { case "$*" in *a-w*) return 0;; *) command chmod "$@";; esac; } && codev_repo_master >/dev/null 2>&1; echo "rc=$?" > "$T/codev-chm.txt"
