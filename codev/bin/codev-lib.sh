@@ -46,6 +46,12 @@ case "${CODEV_MAX_COPY_KB:-}" in
     echo "⚠️ CODEV_MAX_COPY_KB='$CODEV_MAX_COPY_KB' 不是纯数字，已退回默认 102400 KB" >&2
     CODEV_MAX_COPY_KB=102400 ;;
 esac
+# 上限 1 GB：闸门无上限就能让母本构建拖过 codev_sbox_gc 的 60 分钟死亡判定（构建阶段没有 timeout 管），
+# 另一会话的 GC 会把正在构建的活沙盒当残留删掉。GC 现在还会按 owner pid 判活，这条是双保险。
+if [ "$CODEV_MAX_COPY_KB" -gt 1048576 ] 2>/dev/null; then
+  echo "⚠️ CODEV_MAX_COPY_KB=$CODEV_MAX_COPY_KB 超过上限 1048576 KB（1 GB），已截到上限" >&2
+  CODEV_MAX_COPY_KB=1048576
+fi
 
 # 单次 agent 调用的超时秒数。默认 600 只是"兜底真正卡死的进程"的安全网，不是能力上限——后台执行
 # 本来就不受前台 300s 工具超时约束。核实型评审（要求 agent 进 ./repo 逐条核实、60+ 次工具调用）和
@@ -299,11 +305,22 @@ CODEV_EOF
       rm -f "$msg"; return 1
     fi
   done
+  # 提交的是【整个文件的工作树内容】（文件粒度，不是 hunk 粒度）。若用户对该文件做了部分暂存
+  # （index ≠ HEAD 且 index ≠ 工作树），git add 会把边界抹平、把用户没打算提交的那部分一起带走——拒收，让用户先处理。
+  for t in "$@"; do
+    if ! git diff --cached --quiet -- "$t" 2>/dev/null && ! git diff --quiet -- "$t" 2>/dev/null; then
+      echo "⚠️ $t 同时有已暂存与未暂存的改动（部分暂存）：codev_commit_round 按整文件提交，会抹掉这个边界。先 git commit 或 git reset 该文件再回流" >&2
+      rm -f "$msg"; return 1
+    fi
+  done
+  local was_unstaged=; git diff --cached --quiet -- "$@" 2>/dev/null && was_unstaged=1   # add 之前 index 干净 → 失败时能安全恢复
   git add -- "$@" || { rm -f "$msg"; return 1; }
   if git diff --cached --quiet -- "$@"; then echo "⚠️ $files 没有待提交的改动，跳过 commit" >&2; rm -f "$msg"; return 1; fi
   git diff --cached --stat -- "$@" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件
   git commit -q -F "$msg" -- "$@"; rc=$?
   rm -f "$msg"
+  # commit 失败时把刚 add 进去的撤回，别给用户留一个它没做过的暂存状态（只在 add 之前 index 本来干净时才撤）。
+  [ "$rc" != 0 ] && [ -n "$was_unstaged" ] && git reset -q -- "$@" 2>/dev/null
   [ "$rc" = 0 ] && echo "✔ 已提交第 $round 轮回流：$(git log -1 --format=%h) $summary"
   return $rc
 }
@@ -366,7 +383,8 @@ codev_report() {
   case "$cls" in
     ok)      printf '✔ %s 完成 exit=0%s\n' "$agent" "$extra"
              [ -n "$lines" ] && { printf '  ⚠️ 但 stderr 含错误行（输出可能被截断，核对正文是否完整）:\n'; printf '%s\n' "$lines" | sed 's/^/  /'; } ;;
-    timeout) printf '⏭ %s 跳过（超时 124，撞 CODEV_TIMEOUT=%ss 安全网%s）→ 缩小核实范围/改路径引用少内联/或 export CODEV_TIMEOUT=1200 后重试\n' "$agent" "$CODEV_TIMEOUT" "${secs:+，用时 ${secs}s}" ;;
+    timeout) printf '⏭ %s 跳过（超时 rc=%s%s，撞 CODEV_TIMEOUT=%ss 安全网%s）→ 缩小核实范围/改路径引用少内联/或 export CODEV_TIMEOUT=1200 后重试\n' \
+               "$agent" "$rc" "$([ "$rc" = 137 ] && printf '，进程 trap 了 TERM 由 -k 补 KILL')" "$CODEV_TIMEOUT" "${secs:+，用时 ${secs}s}" ;;
     quota)   printf '⛔ %s 额度/限流（exit=%s，本轮无效，勿当评审呈现）:\n' "$agent" "$rc"
              { [ -n "$lines" ] && printf '%s\n' "$lines"; [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out"; } | sed 's/^/  /'
              echo "  → 跳过该 agent；错误串里若有重置时间，之后再试；换其它 agent 补位" ;;
@@ -397,7 +415,8 @@ $( [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out" )"
 # 凡进副本的内容都要当作"已经发出去了"。--exclude 只挡常见密钥文件名，挡不住硬编码在源码里的密钥——
 # Step 2B 的 secret 扫描仍然必须做。仓库确实敏感就用 CODEV_SANDBOX_MODE=text 退回只喂文本。
 # 返回 0=已铺好，1=跳过（非 git 仓库 / 超体积闸门 / 拷贝失败），由调用方退回 text 模式。
-# 【每会话只 tar 一次】：母本铺在会话目录里，各 agent 的沙盒从母本 clone（见 codev_repo_copy）。
+# 【每个（仓库 + 工作区内容）签名只 tar 一次】：母本铺在会话目录里、路径带签名哈希（codev_master_path），
+# 各 agent 的沙盒从母本 clone（见 codev_repo_copy）；同会话内改了代码再评会自动换新母本。
 # 否则 N 个 agent = N 次全量 tar，大仓库上很浪费。实测 55MB / 2000 文件 / 6 agent：
 # 「6 次全量 tar」5.06s → 「1 次 tar + 6 次 clone」2.72s；且 APFS clone 共享数据块——
 # 额外 5 份副本的真实磁盘增量仅 6MB（df 实测；du 会虚报 ~280MB，它数不出共享块）。
@@ -464,12 +483,15 @@ codev_repo_master() {
         # 然后 rm 掉旧锁、放掉子锁、照常去抢 $lock——抢不到（有人比我快）也无妨，谁 mkdir 成功谁是唯一 builder。
         # 旧持锁者的 .partial 这里不碰：每个 builder 用带自己 pid 的 .partial.<pid>，死掉的由赢家按 pid 判活清掉。
         if mkdir "$lock.reclaim" 2>/dev/null; then
+          sh -c 'echo $PPID' > "$lock.reclaim/pid" 2>/dev/null   # 子锁也记 owner，让下面的陈旧判定能 kill -0
           holder=$(cat "$lock/pid" 2>/dev/null)
           if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] \
              && { [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; }; then rm -rf "$lock"; fi
-          rmdir "$lock.reclaim" 2>/dev/null
+          rm -rf "$lock.reclaim" 2>/dev/null
         elif [ -n "$(find "$lock.reclaim" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
-          rm -rf "$lock.reclaim"     # 回收者自己死在半路（极窄窗口）：子锁也会陈旧，同样按 3 分钟清
+          # 回收者自己死在半路（极窄窗口）：子锁也会陈旧。同样先 kill -0 判活，活着的不碰。
+          holder=$(cat "$lock.reclaim/pid" 2>/dev/null)
+          if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then rm -rf "$lock.reclaim"; fi
         fi
         # 【不能 continue】：回收失败时（如会话目录不可写）锁还在，continue 会跳过下面的
         # sleep 与 waited++ → 变成无 sleep 的忙等，把一个核吃满且永不退出（实测 timeout 124、
@@ -485,8 +507,18 @@ codev_repo_master() {
   # agent 若是同一个 shell 里 `( … ) &` 出来的子 shell，$$ 在 bash/zsh 下都是父 shell 的 pid——
   # 父 shell 一退出所有锁就"死"了，或者反过来 N 个 builder 共用同一个 .partial.<pid>。
   # `sh -c 'echo $PPID'` 作为直接子进程跑，PPID 就是当前这个（子）shell 自己的 pid，bash/zsh 一致。
+  # 拿到锁后先看母本是不是已经有了：等待者在 until 里的 mkdir 恰在赢家放锁的瞬间成功，就会带着"已铺好"的
+  # 母本再进一次临界区（自己 tar 一份再在 -e 处丢掉——不出错但白干一遍，builders 计数也会多一行）。
+  if [ -d "$CODEV_MASTER" ]; then rm -rf "$lock" 2>/dev/null; return 0; fi
   sh -c 'echo $PPID' > "$lock/pid" 2>/dev/null
-  me=$(cat "$lock/pid" 2>/dev/null); [ -n "$me" ] || me=$$
+  me=$(cat "$lock/pid" 2>/dev/null)
+  if [ -z "$me" ]; then
+    # 写不进 pid 就【放弃】：带着空 pid 的锁 3 分钟后会被等待者按"持锁者已死"回收，两个 builder 并存。
+    # 原来退回 me=$$ 继续构建正是这个窗口。放掉锁、退回 text 模式，比赌会话目录马上恢复可写更稳。
+    rm -rf "$lock" 2>/dev/null
+    echo "⚠️ 母本锁 pid 写入失败（$lock 不可写？），放弃铺母本，退回 text 模式" >&2
+    return 1
+  fi
   # 拿到锁了。下面用子 shell 包住全部工作，出口统一放锁——
   # 【不能】在中途直接 return：那样锁不会被删，同会话后续 agent 全卡死在上面的 until。
   # .partial 带持锁者 pid：builder 之间绝不共用同一个半成品目录，回收陈旧锁的人也不需要碰别人的。
@@ -500,7 +532,8 @@ codev_repo_master() {
       case "$p" in *[!0-9]*|'') ;; *) kill -0 "$p" 2>/dev/null || rm -rf "$d";; esac
     done < <(find "$CODEV_DIR" -maxdepth 1 -type d -name "$(basename "$CODEV_MASTER").partial.*" -print0 2>/dev/null)
     # 体积闸门：只统计将被拷的文件（已被 .gitignore 排除的 node_modules/build 产物天然不计入）。
-    # BSD xargs 无 -r，用 `|| true` 吞空输入；du 可能被 xargs 分批多次调用，awk 累加即可。
+    # 空输入用 `|| true` 吞退出码（macOS 的 BSD xargs 其实接受 -r 且空输入本就不执行，见 codev_master_path 注释；
+    # 这里不依赖 -r 只是为了少一个假设）；du 可能被 xargs 分批多次调用，awk 累加即可。
     # ⚠️ cd 必须在【整条管道之外】（即命令替换的子 shell 里）：若写成 `{ cd "$root" && git ls-files; } | xargs du`，
     # cd 只作用于管道左段的子 shell，右段的 du 仍在原 cwd 解析相对路径 → 全部 No such file → 恒得 0，闸门形同虚设。
     sz=$( cd "$root" 2>/dev/null && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
@@ -509,6 +542,7 @@ codev_repo_master() {
     # 但【别指望 `|| true` 挡这个】——它只吞退出码，不阻止命令被空跑。若移植到会空跑的
     # xargs 版本上，需改成先判文件列表是否为空。
     [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && exit 1
+    echo "$me" >> "$CODEV_MASTER.builders" 2>/dev/null   # 进入临界区的 builder 记一行：测试据此断言"单一赢家"
     # 先解到 .partial 再原子改名：万一进程在解压中途被杀，留下的是 .partial，
     # 下次不会被 `[ -d "$CODEV_MASTER" ]` 误判成"已铺好"而让 agent 读到半个仓库。
     rm -rf "$part"
@@ -534,12 +568,15 @@ codev_repo_master() {
       cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
         | { while IFS= read -r -d '' f; do
               { [ -e "$f" ] || [ -L "$f" ]; } || continue
+              case "$f" in .git|.git/*|*/.git|*/.git/*) continue;; esac
+              # 目录项（只可能是 submodule 挂载点，ls-files 对普通目录不输出）直通：过滤只挡【文件】，
+              # 名叫 vendor.env 的 submodule 不该因为名字被整棵挡掉；--no-recursion 只建空目录、不下钻。
+              [ -d "$f" ] && [ ! -L "$f" ] && { printf '%s\0' "$f"; continue; }
               # 这份清单必须与下面 find -iname 那轮【一一对应】（那轮补大小写变体）。改一边就同步另一边。
               case "${f##*/}" in
                 .env|*.env|.env.*|.envrc|*.pem|*.key|*.p12|*.pfx|id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|\
                 *.keystore|*.jks|.netrc|.npmrc|*.tfvars|*.tfstate|*.tfstate.*) continue;;
               esac
-              case "$f" in .git|.git/*|*/.git|*/.git/*) continue;; esac
               printf '%s\0' "$f"
             done; } \
         | tar -cf - --null -T - --no-recursion \
@@ -581,14 +618,25 @@ codev_repo_master() {
     # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
     [ -e "$CODEV_MASTER" ] && { rm -rf "$part"; exit 0; }   # 别人已铺好，复用
     mv "$part" "$CODEV_MASTER" || { rm -rf "$part"; exit 1; }
+    # 双 builder 极窄窗口（上一行 -e 与 mv 之间别人先发布）：mv 会把我的 .partial 移【进】它里面。
+    # 母本已是 a-w，先给顶层 u+w 才能删掉嵌进去的那份。
+    if [ -d "$CODEV_MASTER/${part##*/}" ]; then
+      chmod u+w "$CODEV_MASTER" 2>/dev/null; chmod -R u+w "$CODEV_MASTER/${part##*/}" 2>/dev/null
+      rm -rf "$CODEV_MASTER/${part##*/}"
+    fi
+    # 母本自己也 a-w：沙盒 agent 是同用户进程，枚举 $TMPDIR 就能找到母本；不锁的话一个带 Bash 的 agent
+    # 能改写母本，后启动的 agent 从被改母本 clone 出副本、评审建立在被篡改的代码上。
+    # 会话收尾 rm -rf 前要先 chmod -R u+w（agents.md 收尾清理段与 codev_sbox_gc 都已这么做）。
+    chmod -R a-w "$CODEV_MASTER" 2>/dev/null
   ); rc=$?
   # 放锁：无论上面成败都执行。用 rm -rf 而不是 rmdir——锁目录里有 pid 文件（非空），
   # rmdir 会静默失败（实测：锁泄漏 → 同会话后续每个 agent 白等 300s 再退回 text 模式，
   # 副本功能静默失效）。空值守卫防 CODEV_MASTER 意外为空时 rm -rf 打到 ".lock" 之外的东西。
   # 【只放自己的锁】：pid 文件写着别人 → 那是别人在陈旧回收后新拿的锁，删了它就又是两个 builder 并存。
-  # pid 文件缺失/为空（会话目录不可写）时仍放——否则锁泄漏、后续 agent 全等 300s。
+  # pid 为空也不放：自己的锁 pid 写失败时上面已经放掉并返回，走到这里 pid 一定写成功过；
+  # 现在为空只可能是别人刚 mkdir 还没来得及写——那是别人的锁。
   holder=$(cat "$lock/pid" 2>/dev/null)
-  if [ -n "$lock" ] && { [ -z "$holder" ] || [ "$holder" = "$me" ]; }; then rm -rf "$lock" 2>/dev/null; fi
+  if [ -n "$lock" ] && [ "$holder" = "$me" ]; then rm -rf "$lock" 2>/dev/null; fi
   return $rc
 }
 
@@ -631,6 +679,9 @@ codev_bg_sandboxed() {
   fi
   local sbox rc mode
   sbox=$(mktemp -d -t codev-sbox.XXXXXX) || { echo "⚠️ $agent mktemp 失败"; return 1; }
+  # owner 标记：codev_sbox_gc 删 60 分钟以上的沙盒前先 kill -0 这个 pid，活着的沙盒不删。
+  # 光靠 mtime 不够——母本等待/构建阶段没有 timeout 管，加上 CODEV_TIMEOUT 最大 3000s，是能拖过 60 分钟的。
+  sh -c 'echo $PPID' > "$sbox/.codev-owner" 2>/dev/null
   if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
     # 副本可能【建成了但里面没东西】：空仓库、或全部文件都命中密钥过滤（实测两种都 rc=0、0 文件）。
     # 此时提示词还在承诺"可以读 ./repo 核实"，agent 找不到任何代码 → 又回到"瞎子"状态，
@@ -681,7 +732,7 @@ codev_bg_native() {
 # 空目录时代漏了无所谓，现在沙盒里有整份仓库副本 → 会堆磁盘、也留代码残迹，所以要定期扫。
 # 只删【60 分钟前】的：codev_run 上限 CODEV_TIMEOUT ≤ 3000s（50 分钟），超过 60 分钟的必然是死掉的，不会误删并发 run 的活沙盒。
 codev_sbox_gc() {
-  local t="${TMPDIR:-/tmp}" d n=0
+  local t="${TMPDIR:-/tmp}" d n=0 o
   # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
   # 只扫【沙盒】：沙盒天生短命（单次 agent 调用，最长 CODEV_TIMEOUT≤3000s），超 60 分钟必是死掉的。
   # ⚠️ 【不要】把会话目录 codev.* 也按 60 分钟扫：会话目录是长命的（用户看完输出、讨论、再跑一轮
@@ -693,6 +744,9 @@ codev_sbox_gc() {
   # （注：命令替换在 bash 和 zsh 下【都会】词拆分，这不是 zsh 特有问题——别被"zsh 不拆分"
   #   的说法误导，那条只适用于未加引号的【变量】展开。）
   while IFS= read -r -d '' d; do
+    # owner 还活着就不删：60 分钟只是"多半已死"的启发，不是证明（见 codev_bg_sandboxed 写标记处的注释）。
+    o=$(cat "$d/.codev-owner" 2>/dev/null)
+    case "$o" in *[!0-9]*|'') ;; *) kill -0 "$o" 2>/dev/null && continue;; esac
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
   done < <(find "$t" -maxdepth 1 -type d -name 'codev-sbox.*' -mmin +60 -print0 2>/dev/null)
   # 会话目录（含母本，可能几十 MB）用 24 小时这档兜底：够长，不会撞上"用户慢慢看输出"或并发 run；

@@ -32,8 +32,10 @@ allowed-tools:
     在**真实仓库根**跑，自己读文件、跑 `git diff`。
   - **其余四个**（reasonix / qoderclicn / opencode / codebuddy）→ `codev_bg_sandboxed`，在
     **隔离沙盒**里跑：cwd 是 `mktemp -d` 出来的沙盒，真实仓库**不在**里面，但沙盒内铺了一份
-    `./repo` —— 工作区（含未提交改动）的**只读副本**。它们既能读全部代码，写入又只能落到副本上、
+    `./repo` —— 工作区（含未提交改动）的**只读副本**。它们既能读全部代码，写入默认只落到副本上、
     随沙盒删掉。再叠加各自的只读/禁工具旗标（见 `agents.md` 表格）+ 提示词边界，共三层。
+    **这是 cwd 隔离 + 副本/母本 `a-w`，不是 OS 级沙盒**：防的是误写；同用户进程刻意枚举 `$TMPDIR`
+    仍能找到并改回权限，防不了恶意 agent。仓库敏感就用 `CODEV_SANDBOX_MODE=text`。
   - **别把第二组挪进真实仓库**，除非确认其旗标是**沙盒级**而非"框架答应不调用写工具"
     （opencode `--agent plan` 就是反例：`edit` 禁了但 `bash` 没禁）。确需如此则必须逐 agent
     前后 `git status --porcelain` 快照核对 + 串行，发现改动即停下、逐字上报用户由其处置
@@ -181,6 +183,11 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 **评审/挑战/文档评审模板还要带「两档结论」**：强制 agent 把结论分成【已查证】和【需进一步核实的假设】
 两栏，别因为看不到某处代码就给整体 FAIL。第二栏由 F 之前的事实核查环节收口（见 synthesis.md 0.5）。
 
+**发送前 secret 扫描——所有 fan-out 模式都做，不只 review。** `codev_bg_sandboxed` 铺 `./repo` 副本
+**不分模式**：brainstorm / challenge / consult 同样把整个工作区发给沙盒 agent。副本模式（默认）下先跑
+Step 2B 第 3 步的整仓扫描；`CODEV_SANDBOX_MODE=text` 下扫将发送的提示词文件。命中就停下问用户。
+README 对用户的承诺是"发给外部模型前会做 secret 扫描"，这一条让它在每个模式都成立。
+
 ### C. 并行调用（后台执行，避免超时）
 > 经验：慢模型（reasonix/codebuddy 等）在**前台被 `timeout 240` 卡死**——用户直接手调这些 CLI 从不
 > 超时，是本 skill 自己的短超时 + 高推理强度 + 超大提示词共同造成的。因此**默认后台执行**。
@@ -284,7 +291,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 ## Step 2A — brainstorm（头脑风暴 / 方案设计）
 
 1. Claude 先基于需求与代码库快速产出 **v0 方案**（要解决什么、初步思路、关键取舍）。
-2. 选 agent（通用机制 A）。
+2. 选 agent（通用机制 A）。secret 扫描（通用机制 B：副本模式扫整仓，text 模式扫提示词）。
 3. 并行发出（通用机制 B/C），用 prompts.md 的 **brainstorm 模板**：把需求 + Claude 的 v0
    方案发给每个 agent，要求它**独立给出自己的方案，并指出 v0 的风险/更好的替代**。
 4. 运行时显示（D）→ 忠实呈现（E）→ 跨模型综合（F）：合并成一份带**取舍表 + 风险清单 + 推荐方案**的方案文档。
@@ -326,13 +333,18 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    # 返回 1，"拒绝扫描"就和"扫过了没命中"分不清。
    [ "${CODEV_SANDBOX_MODE:-repo}" = repo ] || [ -n "$BASE" ] \
      || { echo "text 模式需要 BASE（否则 git diff 会误把范围当成 working-vs-index），先回第 1 步"; exit 1; }
-   # BSD/macOS xargs 无 GNU 的 -r/--no-run-if-empty（`xargs -0 -r` 会 illegal option 直接失败、
-   # 让整段内容不参与扫描）；用 `|| true` 吞空输入，`cat --` 防 `-` 开头文件名被当选项。
+   # 先确认枚举本身成功：管道里 git ls-files 失败被 2>/dev/null 吞掉后 grep 收到空输入会返回 1，
+   # 那会被下面当成"干净"。非 git 目录 / 仓库损坏必须在这里就停。
+   n=$(git ls-files 2>/dev/null | wc -l | tr -d ' '); [ "${n:-0}" -gt 0 ] || { echo "SCAN: 枚举失败（非 git 仓库或空仓库），按命中处理"; exit 1; }
+   # 空输入用 `|| true` 吞退出码（macOS 的 BSD xargs 其实接受 -r 且空输入本就不执行，这里不依赖它只是少一个假设）；
+   # `cat --` 防 `-` 开头文件名被当选项。
    if [ "${CODEV_SANDBOX_MODE:-repo}" = repo ]; then
      # 副本模式：扫【将进副本的全部文件】（= tracked + 未忽略 untracked，与 codev_repo_master 同源）。
      # 密钥【文件】已被副本过滤挡掉，所以这一轮真正要抓的是【硬编码在源码里】的密钥。
-     { git ls-files -z; git ls-files --others --exclude-standard -z; } \
-       | { xargs -0 cat -- 2>/dev/null || true; }
+     # 【路径名也进扫描流】：过滤按扩展名放行的 credentials.sql / credentials.tf 这类，内容里未必有关键词，
+     # 靠文件名才抓得到——扫描集合必须与实际发送的集合（路径 + 内容）一致。
+     { git ls-files; git ls-files --others --exclude-standard
+       { git ls-files -z; git ls-files --others --exclude-standard -z; } | { xargs -0 cat -- 2>/dev/null || true; }; }
    else
      # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件。
      { git diff "$BASE"
@@ -349,14 +361,16 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    > 拿不准就当真密钥处理。
 
    > ⚠️ **`./repo` 只读副本让"发送范围"变大了**：沙盒 agent 能读整个工作区并把内容发给它自己的模型，
-   > 不再只有 diff。`codev_repo_copy` 已 `--exclude` 掉常见密钥文件（`.env*`、`*.pem`、`*.key`、
+   > 不再只有 diff。母本构建（`codev_repo_master`）时已按**文件名**过滤掉常见密钥文件（`.env*`、`*.pem`、`*.key`、
    > `id_rsa*`、`.netrc`、`.npmrc` 等）且不含 `.git`，但**挡不住硬编码在源码里的密钥**。
    > 所以上面这轮 secret 扫描照做不误。若仓库整体敏感（含客户数据、私有密钥、合规限制），
    > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"，并告知用户此时沙盒 agent 会看不到
    > diff 之外的代码、结论置信度下降。**首次在一个新仓库启用副本模式时，向用户说明这一点。**
 4. 并行发出（B/C）：
    - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**：prompt 里含文件系统边界 +
-     "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点"（**写 `git diff <BASE>`，不是 `<BASE>...HEAD`**：
+     "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点" + **未跟踪新文件清单**（`git diff` 不含 untracked，
+     codex 在真仓库里跑却不知道哪些文件是新增的：把第 1 步枚举出的路径逐个列进 prompt，写明"这些是新增
+     未跟踪文件，整个文件都是改动，请打开评审"；一个都没有就写"无未跟踪新文件"）（**写 `git diff <BASE>`，不是 `<BASE>...HEAD`**：
      后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"或随手评审别的
      代码，而其它 agent 拿的是 `git diff "$BASE"` 的工作树内容，一致性矩阵在比两份不同的东西），从而**不带 `--base`/`--commit`**（避开
      `[PROMPT]` 与它们的 argv 互斥）、也**不带 `-s`/`-C`**（review 不认这俩），须从仓库根跑。这样保住了
@@ -370,6 +384,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
    修复后的 commit 同样走 `codev_commit_round <文件列表> …`：首参是【空格分隔的具体文件路径】，多文件就都列出来。
    **不要给目录**——工作树里常有用户自己未提交的改动，给目录会把它们一起提交，函数为此直接拒收目录并返回 1。
+   两个限制：① 按**整文件**提交（不是 hunk），目标文件里用户自己的未提交改动会一起进去，文件有部分暂存时函数拒收；
+   ② 路径**不能含空格/制表符**（首参按空白拆分），这种文件先重命名或手动 `git add`/`git commit`。
 
 ## Step 2F — 文档评审（spec / 实施计划 / 方案文档，无 diff）
 
@@ -378,6 +394,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 1. 定位文档：`DOC=<路径>`，`git ls-files --error-unmatch "$DOC"` 或未被忽略的 untracked → **在工作区内**，
    走路径引用；否则（仓库外 / 被 ignore）才内联全文。`wc -c "$DOC"` 与 `grep -n '^#' "$DOC"` 拿体积与章节目录。
+   **例外：沙盒没有 `./repo` 时必须内联**——`CODEV_SANDBOX_MODE=text`、仓库超体积闸门、非 git 仓库都会让
+   `codev_bg_sandboxed` 自动退回空目录模式（▶ 行标"隔离空目录"），此时路径引用等于什么都没给，agent 只能
+   输出"无法验证"。发起前先判：`[ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && codev_master_path && [ -d "$CODEV_MASTER" ]`
+   不成立、或首个 ▶ 行显示空目录，就对沙盒 agent 改用 DOC_START/DOC_END 内联（codex/gemini 在真仓库，仍路径引用）。
 2. 选 agent（A）。`--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就
    让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
    （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），
@@ -396,13 +416,13 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
    全文 grep 同步**，版本号 +0.1；然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的
    `.superpowers/codev/`，不进 git）+ `codev_commit_round "$DOC" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
-   "Co-Authored-By: …"`（**只提交显式列出的文件**，工作树里用户的其它改动不碰；trailer 由库写）。
+   "Co-Authored-By: …"`（**只提交显式列出的文件**、按整文件提交，工作树里用户的其它改动不碰；路径不能含空格；trailer 由库写）。
    非 `--auto` → 问用户是否开下一轮；`--auto` → 按 synthesis.md §6.3 判停/续。
 
 ## Step 2C — challenge（对抗式挑战）
 
 1. 确定对象（当前 diff / 指定文件 / 某个方案）。
-2. 选 agent（A）。
+2. 选 agent（A）。secret 扫描（B：副本模式扫整仓，text 模式扫提示词）。
 3. 并行发出（B/C），用 prompts.md 的 **challenge 模板**：指令 agent "扮演对手，尽力找出会
    让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。
 4. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：汇成"攻击面清单"，标注哪些是真问题、哪些已被现有代码处理。
@@ -410,7 +430,7 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 
 ## Step 2D — consult（咨询汇总）
 
-1. 若用户点名了 agent 就用它；否则选 agent（A，默认 2 个）。
+1. 若用户点名了 agent 就用它；否则选 agent（A，默认 2 个）。secret 扫描（B）。
 2. 并行发出（B/C），用 prompts.md 的 **consult 模板**：转述用户问题。
 3. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：给出各 agent 观点 + Claude 的收敛结论。
 

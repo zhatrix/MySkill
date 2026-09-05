@@ -29,7 +29,7 @@
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
 | `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离沙盒（含 `umask 077`，收进子 shell 不外泄）+ **默认铺一份只读仓库副本 `./repo`**（见下）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过并清空旧输出 + `codev_report`。首参 agent 标签，其后是完整命令 argv。 |
-| `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo`，**每会话只做一次**。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
+| `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo.<签名>`（签名 = 仓库根 + HEAD + 脏文件内容，见 `codev_master_path`），**每个签名只做一次**，同会话改了代码再评自动换新母本；建成后 `chmod -R a-w`。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
 | `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
@@ -59,7 +59,7 @@ diff 里的 `$(...)`、反引号会被 shell 展开（注入）。
 ```bash
 PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$PROMPT" <<'EOF' 写入（单引号 EOF 防展开）
 ```
-> 提示词文件放 `$CODEV_DIR`（会话目录）内、按 agent 命名，与库写的 out/err 同处，收尾 `rm -rf "$CODEV_DIR"` 一并清。
+> 提示词文件放 `$CODEV_DIR`（会话目录）内、按 agent 命名，与库写的 out/err 同处，收尾 `chmod -R u+w "$CODEV_DIR"; rm -rf "$CODEV_DIR"` 一并清（母本是 a-w 的，先恢复写权限）。
 > 若临时另建文件，注意 macOS/BSD `mktemp` 只替换**结尾**的 X（`mktemp /tmp/foo-XXXXXX.txt` 原样生成、并行相撞），
 > 一律用 `mktemp -t codev-<role>` 形式。
 > **注意**：`"$(cat "$PROMPT")"` 只解决注入，**不能**避免 `ARG_MAX`（内容仍作 argv）。防 ARG_MAX 要靠
@@ -69,7 +69,7 @@ PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$P
 `$CODEV_DIR/codev-out-<agent>.txt` / `$CODEV_DIR/codev-err-<agent>.txt`（后台独立 shell 靠字面路径读，
 不用随机 `mktemp` 变量——否则收到完成通知时不知去哪读；`CODEV_DIR` 每次调用用字面值重设）。提示词文件
 `PROMPT` 放同一会话目录（`$CODEV_DIR/codev-prompt-<agent>.txt`）。
-收尾清理：完成呈现后直接 `rm -rf "$CODEV_DIR"`（整个会话目录一并删，不用通配 glob，故不会误删并发 run 的文件；或告知用户保留）。
+收尾清理：完成呈现后 `chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"`（母本已 `chmod -R a-w`，不先恢复写权限 rm 会失败；整个会话目录一并删，不用通配 glob，故不会误删并发 run 的文件；或告知用户保留）。
 失败/空输出判定综合 **exit code + stdout + stderr** 三者（`codev_report` 已据此翻牌）；若 stdout 为空但
 stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 stderr"。
 
@@ -161,7 +161,7 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 ### 母本 + clone：每会话只 tar 一次
 
 N 个 agent 各自全量 tar 一遍很浪费。现在改成**母本 + 写时复制 clone**：
-- `codev_repo_master` 把工作区铺成母本 `$CODEV_DIR/codev-master-repo`，**每会话只做一次**；
+- `codev_repo_master` 把工作区铺成母本 `$CODEV_DIR/codev-master-repo.<签名>`，**每个（仓库 + 工作区内容）签名只做一次**（改了代码再评会自动换新母本），建成后 `chmod -R a-w`；
 - `codev_repo_copy` 用 `cp -c`（APFS **clonefile**）从母本给每个 agent clone 一份。
 
 实测（55MB / 2000 文件，6 个 agent）：旧的"每 agent 全量 tar" 5.06s → 新的"1 次 tar + 6 次 clone" 2.72s。
@@ -181,7 +181,11 @@ agent 白等满 300s）。回收的三条规则：① 先用 `kill -0` 判持锁
 各自 `rm -rf` 再 `mkdir` 会删掉别人刚建的新锁（实测 15 个等待者里 5-8 个同时进 tar、母本只剩 5/100 个文件却
 rc=0 发布），"判陈旧 → 动手"之间的窗口也会让路径上已换成新锁；所以先抢 `.lock.reclaim` 子锁，只有拿到的那个能
 动 `.lock`，且拿到后再核实一遍陈旧。③ 放锁只放自己的（pid 文件对得上），pid 用 `sh -c 'echo $PPID'` 取当前
-（子）shell 自己的 pid——`$$` 在 `( … ) &` 子 shell 里是父 shell 的，bash/zsh 皆然。
+（子）shell 自己的 pid——`$$` 在 `( … ) &` 子 shell 里是父 shell 的，bash/zsh 皆然。pid **写不进去就放弃锁退回 text
+模式**（带空 pid 的锁 3 分钟后会被当死锁回收、出现双 builder），放锁**严格**只放 pid 等于自己的；`.lock.reclaim` 子锁
+也记 pid，陈旧判定同样先 `kill -0`。④ 发布：`mv .partial.<pid> → 母本` 后若发现自己被嵌进了别人先发布的母本里
+（双 builder 极窄窗口的 mv 语义），删掉嵌套的那份；母本随后 `chmod -R a-w`。每个进入临界区的 builder 在
+`<母本>.builders` 记一行，测试据此直接断言"单一赢家"（tests 26），不再只看最终态。
 实测 15 个并发等待者 + 陈旧锁 × 12 轮（bash/zsh 各 6），全部 rc=0、只生成一个母本、无锁/半成品残留。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
@@ -235,7 +239,8 @@ fi
   **解法（借 gstack）：丢 `--base`，把 diff 范围写进 prompt** 让 codex 自己跑 `git diff`——这样既避开
   argv 互斥、又**保住自定义关注点**（比"无 prompt"版强）。prompt 里含文件系统边界 + 一句
   "请运行 `git diff <base>` 只评审这些改动 + <关注点>"（是 `git diff <base>`——base 到【工作树】，和其它 agent
-  内联的 `git diff "$BASE"` 同源；不要写 `<base>...HEAD`，那只含已提交范围，未提交改动在 main 上跑时为空）：
+  内联的 `git diff "$BASE"` 同源；不要写 `<base>...HEAD`，那只含已提交范围，未提交改动在 main 上跑时为空）
+  + **未跟踪新文件的路径清单**（`git diff` 不含 untracked；把 SKILL 2B 第 1 步枚举出的路径列进去，写明"整个文件都是改动"）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel)"
   # PROMPT 内含边界 + “跑 git diff <BASE> 只评审这些改动”（<BASE> 写字面值，如 HEAD~1；不带 ...HEAD）
@@ -379,7 +384,7 @@ fi
 
 | 类别 | 翻牌 | 处置 |
 |---|---|---|
-| `timeout` | `⏭ 超时 124，撞 CODEV_TIMEOUT` | 先确认已后台执行；改路径引用少内联、核实清单收窄到 3-8 条、`export CODEV_TIMEOUT=1200` 后重试一次 |
+| `timeout` | `⏭ 超时 rc=124/137，撞 CODEV_TIMEOUT`（137 = 进程 trap 了 TERM、由 `-k` 补 KILL） | 先确认已后台执行；改路径引用少内联、核实清单收窄到 3-8 条、`export CODEV_TIMEOUT=1200` 后重试一次 |
 | `quota` | `⛔ 额度/限流` + 错误行原句 | 本轮无效，**不呈现其输出**；有重置时间就记下到点再试；换别家补位；账本会标记，下次默认不推荐 |
 | `auth` | `⛔ 鉴权失败` | 给对应登录命令，跳过 |
 | `turns` | `⚠️ turn 预算耗尽` | codebuddy 调 `--max-turns 64` + 收窄核实范围后重试一次 |

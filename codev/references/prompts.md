@@ -160,7 +160,8 @@ DIFF_END
 ## review 模板（代码评审，用于 codex 以外的 agent）
 
 > codex 用原生 `codex review`，不用这个模板——但**仍需给它一段 prompt**（gstack 式）：文件系统边界 +
-> 一句"请运行 `git diff <base>` 只评审这些改动 + <关注点>"（不是 `<base>...HEAD`，那只含已提交范围），让 codex
+> 一句"请运行 `git diff <base>` 只评审这些改动 + <关注点>"（不是 `<base>...HEAD`，那只含已提交范围）+ **未跟踪新文件
+> 路径清单**（`git diff` 不含 untracked，codex 不知道哪些是新增的；没有就写"无"），让 codex
 > 自己生成 diff（从而不带 `--base`、避开 argv 互斥、保住关注点，见 agents.md）。故 codex 的 prompt 里
 > **不内联 diff 文本**，只给指令；下面这个内联 diff 的模板是给 reasonix/qoderclicn/opencode/codebuddy 用的。
 > 下方模板外层用四个反引号，内层的三反引号 diff 围栏才不会提前闭合。
@@ -254,6 +255,8 @@ DIFF_END
 1. **路径引用优先**：文档已在工作区（tracked 或未被忽略的 untracked）→ 提示词只给路径 + 体积 + 章节目录，
    codex/gemini 在真仓库读、沙盒 agent 读 `./repo/<路径>`。仅文档在仓库外或被 .gitignore 挡在副本外时才内联
    （内联时外层四反引号、`DOC_START/DOC_END` 标记为数据）。实测：52KB 内联版 600s 零输出，4KB 路径版顺利出稿。
+   **例外**：沙盒没有 `./repo`（`CODEV_SANDBOX_MODE=text`、超体积闸门、非 git 仓库 → 自动退回空目录模式）时，
+   对沙盒 agent **必须内联**，否则路径引用等于什么都没给（SKILL 2F 第 1 步有判定方法）。
 2. **核实清单代替开放式逐条核对**（上文），并要求两档结论。
 
 > 沙盒 agent 的 `./repo/` 是工作区副本，文档里的 `文件:行号` 引用可直接去核对——Claude 不再需要手工摘录代码。

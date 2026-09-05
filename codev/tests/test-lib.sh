@@ -258,7 +258,7 @@ done
 for drop in credentials.json credentials gcp-credentials.yml credentials.yml.enc server.key UPPER.KEY .ENV; do
   grep -qx "$drop" "$T/codev-mst.txt" && bad "漏挡 $drop" "$(cat "$T/codev-mst.txt")" || ok "挡住 $drop"
 done
-rm -rf "$REPO" "$T/codev-mst.txt" "$CODEV_DIR"/codev-master-repo.*
+chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-mst.txt" "$CODEV_DIR"/codev-master-repo.*
 
 echo "26. 母本锁：陈旧锁（持锁 pid 已死）被多个等待者同时发现时只能有一个赢家；放锁只放自己的"
 REPO=$(mktemp -d -t codevrepo.XXXXXX)
@@ -273,8 +273,44 @@ REPO=$(mktemp -d -t codevrepo.XXXXXX)
 grep -q '^files=60$' "$T/codev-lock.txt" && ok "母本完整（60 个文件）" || bad "母本不完整" "$(cat "$T/codev-lock.txt")"
 grep -q '^partials=0$' "$T/codev-lock.txt" && ok "没有残留 .partial" || bad "残留 .partial" "$(cat "$T/codev-lock.txt")"
 grep -q 'lock-leaked' "$T/codev-lock.txt" && bad "锁泄漏" || ok "锁已释放"
-rm -rf "$REPO" "$T/codev-lock.txt" "$CODEV_DIR"/codev-master-repo.*
+nb=$(cat "$CODEV_DIR"/codev-master-repo.*.builders 2>/dev/null | wc -l | tr -d ' '); [ "$nb" = 1 ] && ok "只有 1 个 builder 进过临界区（直接计数）" || bad "进入临界区的 builder 数=$nb" "$(cat "$T/codev-lock.txt")"
+[ -w "$(ls -d "$CODEV_DIR"/codev-master-repo.[0-9]* | head -1)/f1.txt" ] && bad "母本仍可写" || ok "母本已 chmod a-w"
+chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-lock.txt" "$CODEV_DIR"/codev-master-repo.*
 
-rm -rf "$CODEV_DIR"
+echo "27. 体积闸门：CODEV_MAX_COPY_KB 非法值退回默认、超 1GB 截到上限；超闸门时 codev_repo_master 返回 1 且不铺母本"
+r=$(CODEV_MAX_COPY_KB=abc; source "$LIB" 2>/dev/null; echo "$CODEV_MAX_COPY_KB"); [ "$r" = 102400 ] && ok "非法值 → 102400" || bad "非法值未退回" "$r"
+r=$(CODEV_MAX_COPY_KB=9999999999; source "$LIB" 2>/dev/null; echo "$CODEV_MAX_COPY_KB"); [ "$r" = 1048576 ] && ok "超上限 → 1048576" || bad "未截到上限" "$r"
+REPO=$(mktemp -d -t codevrepo.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && head -c 300000 /dev/zero | tr '\0' 'x' > big.txt && git add -A && git commit -qm i >/dev/null \
+  && CODEV_MAX_COPY_KB=100 codev_repo_master; echo "rc=$?" > "$T/codev-gate.txt"
+  # 不用 ls 通配：zsh 无匹配时报 "no matches found" 而非 "No such file"，用 find 计数两边一致
+  echo "masters=$(find "$CODEV_DIR" -maxdepth 1 -type d -name 'codev-master-repo.*' ! -name '*.lock' | wc -l | tr -d ' ')" >> "$T/codev-gate.txt" )
+grep -q '^rc=1$' "$T/codev-gate.txt" && ok "超闸门 rc=1" || bad "超闸门未拒绝" "$(cat "$T/codev-gate.txt")"
+grep -q '^masters=0$' "$T/codev-gate.txt" && ok "未铺母本" || bad "超闸门仍铺了母本" "$(cat "$T/codev-gate.txt")"
+chmod -R u+w "$CODEV_DIR"/codev-master-repo.* 2>/dev/null; rm -rf "$REPO" "$T/codev-gate.txt" "$CODEV_DIR"/codev-master-repo.* 2>/dev/null
+
+echo "28. 沙盒 GC：超 60 分钟但 owner 进程还活着的沙盒不删；owner 已死的删"
+GCD="$CODEV_DIR/gc"; mkdir -p "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
+echo $$ > "$GCD/codev-sbox.alive/.codev-owner"; echo 999999 > "$GCD/codev-sbox.dead/.codev-owner"
+touch -t 202001010000 "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
+( TMPDIR="$GCD"; codev_sbox_gc >/dev/null )
+[ -d "$GCD/codev-sbox.alive" ] && ok "owner 活着 → 保留" || bad "活沙盒被 GC 删了"
+[ -d "$GCD/codev-sbox.dead" ] && bad "owner 已死仍未删" || ok "owner 已死 → 删"
+[ -d "$GCD/codev-sbox.nomark" ] && bad "无标记的旧沙盒未删" || ok "无标记旧沙盒 → 删（兼容旧版）"
+rm -rf "$GCD"
+
+echo "29. 回流 commit 拒收部分暂存：目标文件同时有已暂存与未暂存改动时 rc=1 且 index 不动"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && echo v1 > a.md && git add -A && git commit -qm i && echo v2 > a.md && git add a.md && echo v3 > a.md \
+  && codev_commit_round a.md 1 codex 0 - msg >/dev/null 2>&1; echo "rc=$?" > "$T/codev-ps.txt"; git diff --cached -- a.md | grep -c '^+v2' >> "$T/codev-ps.txt"; git log --oneline | wc -l | tr -d ' ' >> "$T/codev-ps.txt" )
+[ "$(sed -n 1p "$T/codev-ps.txt")" = "rc=1" ] && ok "部分暂存被拒" || bad "部分暂存未被拒" "$(cat "$T/codev-ps.txt")"
+[ "$(sed -n 2p "$T/codev-ps.txt")" = 1 ] && ok "index 仍是用户暂存的 v2" || bad "index 被动了" "$(cat "$T/codev-ps.txt")"
+[ "$(sed -n 3p "$T/codev-ps.txt")" = 1 ] && ok "没有产生 commit" || bad "产生了 commit" "$(cat "$T/codev-ps.txt")"
+rm -rf "$REPO" "$T/codev-ps.txt"
+
+echo "30. 翻牌行：rc=137 的超时写明 rc=137 而不是写死 124"
+mk x "" ""; r=$(report x 137); case "$r" in *"rc=137"*) ok "137 如实显示";; *) bad "仍写死 124" "$r";; esac
+
+chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]
