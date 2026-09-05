@@ -90,7 +90,7 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
   让慢模型跑完。**切勿**用 `$TP <cmd>` 变量前缀：zsh 不做词拆分会把整串当一个命令名（本机 shell 就是
   zsh，实测每个调用都 exit 127）；库里的 `codev_run` 用 `"$@"` 传参，bash/zsh 都对。
 - 若 `timeout -> MISSING`（stock macOS 常见）：提示用户 `brew install coreutils`；未装时库函数会
-  **自动跳过该 agent**（后台无兜底 = 永久挂起）并提示改前台串行。**注意**：`$TO` 缺失时优先只让非原生
+  **自动跳过该 agent**（后台无兜底 = 永久挂起）并提示改前台串行。**注意**：`CODEV_TO` 缺失时优先只让非原生
   只读 agent 处理提示词文本、不接触工作区。
 - 若一个都没有：停下，告诉用户"未检测到任何外部 agent CLI"，并给出安装指引
   （见 `references/agents.md` 顶部），然后退出。
@@ -188,16 +188,20 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 **发送前 secret 扫描——所有 fan-out 模式都做，不只 review；顺序固定：写完全部提示词 → 扫 → 才 fan-out。**
 两个范围都要扫：
 1. **提示词文件本身**（所有模式、所有 agent）：用户的问题/关注点、Claude 的 v0 方案、内联的 diff 都在里面，
-   从别处粘来的 token 会随它直接外发。用 `find -exec` 而不是 `"$CODEV_DIR"/codev-prompt-*.txt` glob：zsh 无匹配时
-   glob 报错、grep 根本不跑、`$?` 为 1，会被下面判成"干净"。
+   从别处粘来的 token 会随它直接外发。先用 `find` 计数守卫，再直接 glob 交给 grep：zsh 无匹配时 glob 报错、grep 根本
+   不跑、`$?` 为 1，会被判成"干净"，所以要先确认有文件；但**不要**用 `find -exec grep`，find 会把 grep 的 2（出错）折成 1。
    ```bash
    n=$(find "$CODEV_DIR" -maxdepth 1 -name 'codev-prompt-*.txt' | wc -l | tr -d ' ')
    [ "${n:-0}" -gt 0 ] || { echo "SCAN: 还没有提示词文件——先写提示词再扫"; exit 1; }
-   find "$CODEV_DIR" -maxdepth 1 -name 'codev-prompt-*.txt' -exec grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' {} +
+   # 上一行已保证至少有一个文件，glob 此时必有匹配（zsh 不会 NOMATCH）。不要用 find -exec grep：
+   # find 会把 grep 的 2（出错，如文件不可读）折成 1，"出错"分支永远走不到、出错被判成"干净"（实测）。
+   grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$CODEV_DIR"/codev-prompt-*.txt
    case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac
    ```
-2. **将进副本的整个工作区**（副本模式，即默认）：`codev_bg_sandboxed` 铺 `./repo` **不分模式**，brainstorm /
-   challenge / consult 同样把整个工作区发给沙盒 agent。跑 Step 2B 第 3 步的整仓扫描（它不依赖 BASE）。
+2. **将进副本的整个工作区**（**仅副本模式**，即默认）：`codev_bg_sandboxed` 铺 `./repo` **不分模式**，brainstorm /
+   challenge / consult 同样把整个工作区发给沙盒 agent。跑 Step 2B 第 3 步片段的 repo 分支：先铺母本、扫母本里的
+   文件集合（它不依赖 BASE，也不受 cwd 影响）。`CODEV_SANDBOX_MODE=text` 下工作区不外发，这一项不做——2A/2C/2D 在
+   text 模式只扫提示词文件，别照抄 2B 片段（它的 text 分支要 BASE）。
 命中就停下问用户。
 README 对用户的承诺是"发给外部模型前会做 secret 扫描"，这一条让它在每个模式都成立。
 
@@ -304,9 +308,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 ## Step 2A — brainstorm（头脑风暴 / 方案设计）
 
 1. Claude 先基于需求与代码库快速产出 **v0 方案**（要解决什么、初步思路、关键取舍）。
-2. 选 agent（通用机制 A）。secret 扫描（通用机制 B：副本模式扫整仓，text 模式扫提示词）。
-3. 并行发出（通用机制 B/C），用 prompts.md 的 **brainstorm 模板**：把需求 + Claude 的 v0
+2. 选 agent（通用机制 A）。
+3. 用 prompts.md 的 **brainstorm 模板**把每个 agent 的提示词写成文件（先不发）：把需求 + Claude 的 v0
    方案发给每个 agent，要求它**独立给出自己的方案，并指出 v0 的风险/更好的替代**。
+   然后 secret 扫描（通用机制 B：提示词文件 + 副本模式整仓），通过后并行发出（C）。
 4. 运行时显示（D）→ 忠实呈现（E）→ 跨模型综合（F）：合并成一份带**取舍表 + 风险清单 + 推荐方案**的方案文档。
 5. 问用户是否把方案写入文件（如 `docs/方案-<主题>.md`）。写文件由 Claude 执行：先 `mkdir -p docs`，
    并对 `<主题>` 做 sanitize（空格→`-`，去掉 `/ : *` 等非法字符）再拼文件名。
@@ -337,31 +342,34 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    不是上一段说的"base 无效"。`|| true` 吞掉它，否则把这段和 base 检查放进同一次 Bash 调用时，
    最后的 rc=1 会被误读成 base 无效而停下问用户；用 `&&` 串到后面的命令上则后面的全不执行。
 2. 选 agent（A）。
-3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**。⚠️ **`./repo` 副本模式下 payload 是
+3. **组提示词 + 发送前 secret 扫描**：先按第 4 步的要求把每个 agent 的提示词写成 `$CODEV_DIR/codev-prompt-<agent>.txt`
+   （**只写文件，不发出**），再扫。扫两个范围：通用机制 B 的提示词文件扫描（所有 agent），以及下面这段——
+   扫的是**实际将发送的完整 payload**。⚠️ **`./repo` 副本模式下 payload 是
    整个工作区，不是 diff**：沙盒 agent 能读副本里任何文件并发给它自己的模型，所以只扫 diff 等于漏掉
    绝大部分实际外发内容。按模式选范围：
    ```bash
-   # 只有 text 模式的范围依赖 BASE（副本模式扫整仓、2F 文档评审根本没有 BASE），守卫只在那条分支前做，
+   # 先 cd 到仓库根：这段在编排器自己的 Bash 调用里跑，cwd 不保证在根；git ls-files / git diff 从子目录只列子目录，
+   # 而副本是整个工作区——子目录之外的密钥会漏扫（实测子目录 3 个文件 vs 根 13 个）。
+   cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || { echo "SCAN: 不在 git 仓库内，按命中处理"; exit 1; }
+   # 只有 text 模式的范围依赖 BASE（副本模式扫母本、2F 文档评审根本没有 BASE），守卫只在那条分支前做，
    # 而且必须放在管道【外面】：写进管道左段的子 shell 里，exit 1 只退出那个子 shell，grep 照样收到空输入
    # 返回 1，"拒绝扫描"就和"扫过了没命中"分不清。
    [ "${CODEV_SANDBOX_MODE:-repo}" = repo ] || [ -n "$BASE" ] \
      || { echo "text 模式需要 BASE（否则 git diff 会误把范围当成 working-vs-index），先回第 1 步"; exit 1; }
-   # 先确认枚举本身成功：管道里 git ls-files 失败被 2>/dev/null 吞掉后 grep 收到空输入会返回 1，
-   # 那会被下面当成"干净"。非 git 目录 / 仓库损坏必须在这里就停。
-   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "SCAN: 不在 git 仓库内，按命中处理"; exit 1; }
-   n=$({ git ls-files; git ls-files --others --exclude-standard; } 2>/dev/null | wc -l | tr -d ' ')
-   [ "${n:-0}" -gt 0 ] || { echo "SCAN: 枚举为空（tracked 与未忽略 untracked 都没有），按命中处理"; exit 1; }
-   # 空输入用 `|| true` 吞退出码（macOS 的 BSD xargs 其实接受 -r 且空输入本就不执行，这里不依赖它只是少一个假设）；
-   # `cat --` 防 `-` 开头文件名被当选项。
    if [ "${CODEV_SANDBOX_MODE:-repo}" = repo ]; then
-     # 副本模式：扫【将进副本的全部文件】（= tracked + 未忽略 untracked，与 codev_repo_master 同源）。
-     # 密钥【文件】已被副本过滤挡掉，所以这一轮真正要抓的是【硬编码在源码里】的密钥。
-     # 【路径名也进扫描流】：过滤按扩展名放行的 credentials.sql / credentials.tf 这类，内容里未必有关键词，
-     # 靠文件名才抓得到——扫描集合必须与实际发送的集合（路径 + 内容）一致。
-     { git ls-files; git ls-files --others --exclude-standard
-       { git ls-files -z; git ls-files --others --exclude-standard -z; } | { xargs -0 cat -- 2>/dev/null || true; }; }
+     # 副本模式：【先铺母本，扫母本里的文件集合】。沙盒 agent 拿到的就是这份 clone，扫描集合与发送集合严格一致；
+     # 母本按签名固定，没有"扫完工作区又被改了"的窗口（扫活的工作树就有）；密钥【文件】已被过滤挡掉，这一轮真正
+     # 要抓的是【硬编码在源码里】的密钥和按扩展名放行的 credentials.sql 这类【路径名】。codev_repo_master 在当前
+     # shell 回填 CODEV_MASTER。（codex/gemini 读的是活的工作树，这层保证不覆盖它们：扫描后到调用完成期间别改仓库。）
+     codev_repo_master || { echo "SCAN: 母本铺不出来（非 git / 超闸门 / 铺失败），改 CODEV_SANDBOX_MODE=text 再扫"; exit 1; }
+     [ "$(find "$CODEV_MASTER" -type f | head -1)" ] || { echo "SCAN: 母本 0 个文件（空仓库或全被密钥过滤挡下），按命中处理"; exit 1; }
+     { find "$CODEV_MASTER" -type f | sed "s|^$CODEV_MASTER/||"       # 路径名也进扫描流
+       find "$CODEV_MASTER" -type f -exec cat -- {} + 2>/dev/null; }
    else
      # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件（路径清单也会进 codex 提示词，所以文件名同样要扫）。
+     # 空输入用 `|| true` 吞退出码；`cat --` 防 `-` 开头文件名被当选项。
+     n=$({ git diff "$BASE" --name-only; git ls-files --others --exclude-standard; } 2>/dev/null | wc -l | tr -d ' ')
+     [ "${n:-0}" -gt 0 ] || { echo "SCAN: 没有改动也没有未跟踪文件（或 BASE 无效），按命中处理"; exit 1; }
      { git diff "$BASE"
        git ls-files --others --exclude-standard
        git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; } }
@@ -370,7 +378,8 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    # grep 的退出码：0 命中 / 1 干净 / 2 出错——别把"干净"的 1 当失败，也别把 2 当干净。
    ```
-   命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围 / 改用 `CODEV_SANDBOX_MODE=text`；
+   命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围 / 改用 `CODEV_SANDBOX_MODE=text`
+   并 `--agents` 排除 codex/gemini（text 只影响沙盒 agent，见铁律）；
    未命中再继续。
    > 副本模式下整仓扫描**命中率天然高得多**（测试固件、示例配置、变量名里带 `token`/`secret` 的正常代码
    > 都会命中）。**别因为噪音多就跳过或删条件**——按文件聚合命中、区分"真密钥"与"仅命名相似"后再问用户，
@@ -380,9 +389,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    > 不再只有 diff。母本构建（`codev_repo_master`）时已按**文件名**过滤掉常见密钥文件（`.env*`、`*.pem`、`*.key`、
    > `id_rsa*`、`.netrc`、`.npmrc` 等）且不含 `.git`，但**挡不住硬编码在源码里的密钥**。
    > 所以上面这轮 secret 扫描照做不误。若仓库整体敏感（含客户数据、私有密钥、合规限制），
-   > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"，并告知用户此时沙盒 agent 会看不到
-   > diff 之外的代码、结论置信度下降。**首次在一个新仓库启用副本模式时，向用户说明这一点。**
-4. 并行发出（B/C）：
+   > 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"**并用 `--agents` 排除 codex/gemini**（它们在真仓库跑，
+   > text 对它们无效），并告知用户此时沙盒 agent 会看不到 diff 之外的代码、结论置信度下降。
+   > **首次在一个新仓库启用副本模式时，向用户说明这一点。**
+4. 并行发出（B/C，扫描通过后；提示词内容要求如下）：
    - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**，prompt 里三要素：
      ① 文件系统边界；② "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点"——**是 `git diff <BASE>`，不是
      `<BASE>...HEAD`**：后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"
@@ -421,15 +431,17 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    让用户给），`git diff "$PREV" -- "$DOC"` 就是"本轮改动"；先做 synthesis.md §6.1 的 **fresh-subagent 自审**
    （Agent 工具起一个不带本对话上下文的 subagent，只给它文档路径 + 该 diff + prompts.md「自审模板」），
    自审发现由 Claude 亲验后直接改进文档，再进外审。
-3. secret 扫描：扫**文档正文**（内联/路径引用都要，agent 会读它）；副本模式下按 2B 第 3 步扫整仓。
-4. 组提示词（prompts.md「文档评审模板」）：路径引用 + 章节目录 + 关注点 + **点名 3-8 条核实项**
+3. 组提示词（prompts.md「文档评审模板」，先写文件不发出）：路径引用 + 章节目录 + 关注点 + **点名 3-8 条核实项**
    （文档里最关键、最可能与代码脱节的 `文件:行号` / 表名 / 函数 / 迁移号断言）+ 两档结论；
    `--round ≥ 2` 附「回归核对」段（上一轮发现编号清单：已采纳的逐条判 已修 / 未修 / 修出新问题；**已驳回的列出驳回依据，
    要求除非有新证据否则不要重提**）+ **必带**内联 `git diff "$PREV" -- "$DOC"`（≤15KB 直接放；超了放 `--stat` + 改动章节；
    diff 不是文档全文，路径引用规则不适用——副本无 `.git`，agent 自己跑不出两版差异）。
    codex 用 `codex exec`（不是 `review`——没有 diff 可评），`-c 'model_reasoning_effort="medium"'`；
    复杂文档 `export CODEV_TIMEOUT=1200`。
-5. 并行发出（C）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
+4. secret 扫描：提示词文件（通用机制 B）+ **文档正文**（内联/路径引用都要，agent 会读它）：
+   `grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$DOC"; case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac`
+   + 副本模式下按 2B 第 3 步扫母本。
+5. 并行发出（C，扫描通过后）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
    记录本轮 **已核实 P1 数**，写进综合结尾（供 §6 收敛判据用）。
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
@@ -441,16 +453,16 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 ## Step 2C — challenge（对抗式挑战）
 
 1. 确定对象（当前 diff / 指定文件 / 某个方案）。
-2. 选 agent（A）。secret 扫描（B：副本模式扫整仓，text 模式扫提示词）。
-3. 并行发出（B/C），用 prompts.md 的 **challenge 模板**：指令 agent "扮演对手，尽力找出会
-   让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。
+2. 选 agent（A）。
+3. 用 prompts.md 的 **challenge 模板**写提示词文件（先不发）：指令 agent "扮演对手，尽力找出会
+   让它崩的输入、边界条件、并发/竞态、错误处理缺失、隐含假设"。secret 扫描（B：提示词文件 + 副本模式整仓），通过后并行发出（C）。
 4. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：汇成"攻击面清单"，标注哪些是真问题、哪些已被现有代码处理。
 5. 询问是否让 Claude 针对确认的漏洞补测试/加固。
 
 ## Step 2D — consult（咨询汇总）
 
-1. 若用户点名了 agent 就用它；否则选 agent（A，默认 2 个）。secret 扫描（B）。
-2. 并行发出（B/C），用 prompts.md 的 **consult 模板**：转述用户问题。
+1. 若用户点名了 agent 就用它；否则选 agent（A，默认 2 个）。
+2. 用 prompts.md 的 **consult 模板**写提示词文件（转述用户问题）→ secret 扫描（B：提示词文件 + 副本模式整仓）→ 并行发出（C）。
 3. 运行时显示（D）→ 忠实呈现（E）→ 综合（F）：给出各 agent 观点 + Claude 的收敛结论。
 
 ## Step 2E — 全流程（默认）
@@ -464,6 +476,8 @@ brainstorm（2A）→ 用户拍板 → Claude 按方案与 CLAUDE.md 规范编�
 
 简短小结：跑了哪些模式、调用了哪些 agent（含被判无效的类别）、跨模型综合的关键结论、门禁结果、
 本轮已核实 P1 数（多轮时给趋势）、遗留项。不要复述外部 agent 的原文（上面已逐字呈现过）。
-然后收尾：`chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"`（母本 a-w，先恢复写权限；每个签名的母本最大
-1GB，不清就堆到 24 小时 GC）。用户要留输出就告知路径、不删。
-本 skill 的库有回归测试：改 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`。
+然后收尾——和后台调用一样，这是一次新的 Bash 调用，`CODEV_DIR` 不会自动带过来，必须写 Step 0 打印的字面路径：
+`CODEV_DIR=<会话目录>; chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"`（母本 a-w，先恢复写权限；每个签名的
+母本最大 1GB，不清就堆到 24 小时 GC；变量为空时 `rm -rf ""` 静默什么都不删）。用户要留输出就告知路径、不删——
+并提醒：会话目录 24 小时内没有任何文件写入就会被下一次 `/codev` 的 GC 清掉，要长期保留得挪出 `$TMPDIR`。
+本 skill 的库有回归测试：改 `bin/codev-lib.sh` 后 `bash tests/test-lib.sh` 与 `zsh tests/test-lib.sh` 两边都要绿。

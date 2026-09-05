@@ -43,7 +43,7 @@
 | `codev_archive <slug> <round>` | 把本会话 prompt/out/err/metrics 复制到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`，并把 `.superpowers/` 写进 **common gitdir**（`git rev-parse --git-common-dir`，worktree 里 `.git` 是文件）的 `info/exclude` 保证不入库；写不进去时提示会如实说"未能写进 git 忽略"，不会谎称已忽略。 |
 | `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间；`codev_ledger_recent` 同时兼容升级前的旧 7 列布局 时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
-| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着一律不删；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时**（里面有母本，几十 MB；24h 这档够长，不会撞上"用户慢慢看输出"或并发 run，且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
+| `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着一律不删；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时且目录内 24 小时内无任何文件写入**（会话目录没有单一持有者 pid，按活动时间判活；且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
 | `codev_probe` | Step 0 探测：先 `codev_sbox_gc` 回收残留沙盒，再列 OK/MISS agent（codex 附鉴权）+ timeout 状态。 |
 
 要传环境变量给库函数：`codev_bg_native gemini env VAR=val gemini …`（`env` 作为命令的一部分传入）。
@@ -75,11 +75,12 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 
 非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置三选一：
 - **(a) 默认 & 首选：隔离沙盒 + 只读仓库副本**——cwd 是 `mktemp -d` 出来的沙盒，里面有 `./repo`
-  （工作区副本，`chmod -R a-w`）。**真实仓库不在 cwd 里**，agent 顺手的写入只会落到副本上、
-  随沙盒一起删掉 → 免掉快照/归因/污染问题，同时 agent **能读到全部代码**。这是 (a') 的严格升级版。
-  （防的是误写：有 shell 的 agent 用绝对路径仍能碰到沙盒外，见下方「边界说明」。）
+  （工作区副本，`chmod -R a-w`）。真实仓库不在 cwd 里，所以它**防误写不防故意**：顺手的相对路径写入
+  只会落到副本上、随沙盒一起删掉（免掉快照/归因/污染问题），有 shell 的 agent 用绝对路径仍能碰到沙盒外
+  （见下方「边界说明」）。同时 agent **能读到全部代码**。这是 (a') 的严格升级版。
 - **(a') 隔离空目录只喂文本**（`CODEV_SANDBOX_MODE=text`）——旧默认。仅在不想让 agent 看到仓库
-  其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。
+  其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。**只影响这四个沙盒 agent**：codex/gemini
+  在真仓库跑，只读旗标只挡写不挡读，仓库敏感时要另用 `--agents` 把它们排除。
 - **(b) 确需在真实仓库 cwd 跑**：则**必须逐 agent 前后快照核对 + 串行**（并行无法归因、会互相污染）。
   有了 (a) 之后基本没有理由再走 (b)。
 
@@ -157,7 +158,7 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
 **已知的假阳性（security-first 的有意取舍，非 bug）**：`*.key` 和 `*.env` 会连带挡掉
 `src/keymap.key`、`config/test.env` 这类合法文件。判断标准是"宁可漏挡一个少见的密钥文件名
 （secret 扫描仍会兜底），也绝不删用户的源码"——所以**只对确定是密钥载体的模式用通配**。
-若某仓库确实因此丢了关键文件、导致 agent 评审失真，用 `CODEV_SANDBOX_MODE=text` 或临时调整清单。
+若某仓库确实因此丢了关键文件、导致 agent 评审失真，用 `CODEV_SANDBOX_MODE=text`（沙盒 agent 退回只喂文本）或临时调整清单。
 
 ### 母本 + clone：每个工作区签名只 tar 一次
 
@@ -410,8 +411,9 @@ fi
 | reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错；`--help` 里另有 `--allowed-tools "<规则>"`，**未实测**能否做成只读白名单，验过再升级此行） | 沙盒 `codev_bg_sandboxed` |
 
 三层纵深防御，下面四个 agent **三层都要上**，不能只靠其中一层：
-1. **沙盒**（`codev_bg_sandboxed`）——真实仓库不在 cwd，只有 `./repo` 只读副本。**这是主防线**：
-   即使前两层全被绕过，写入也只落在副本上，随沙盒删掉。
+1. **沙盒**（`codev_bg_sandboxed`）——真实仓库不在 cwd，只有 `./repo` 只读副本。**这是主防线，但防的是
+   误写不是故意**：前两层被绕过时，顺手的相对路径写入只落在副本上、随沙盒删掉；带 shell 的 agent 用绝对路径
+   仍能碰到沙盒外（见「边界说明」），这一层拦不住它。
 2. **旗标**（上表"实测旗标"列）——能拿到 harness 级的就拿（qoderclicn / codebuddy）；
    拿不到的（reasonix / opencode）如实承认只有第 1、3 层。
 3. **提示词边界**（prompts.md 的「文件系统边界」段落）——最弱的一层，只防"顺手"不防"故意"。

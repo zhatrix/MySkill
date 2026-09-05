@@ -307,7 +307,9 @@ r=$(CODEV_MAX_COPY_KB=99999999999999999999; source "$LIB" 2>/dev/null; echo "$CO
 echo "28. 沙盒 GC：超 60 分钟但 owner 进程还活着的沙盒不删；owner 已死的删"
 GCD="$CODEV_DIR/gc"; mkdir -p "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
 echo $$ > "$GCD/codev-sbox.alive/.codev-owner"; echo "$DEAD" > "$GCD/codev-sbox.dead/.codev-owner"
-touch -t 202001010000 "$GCD/codev-sbox.alive" "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
+# alive 用"2 小时前"（超 60 分钟但远不到 7 天上限——7 天以上不看 pid 一律删，见测试 34）；dead/nomark 用 2020 即可
+touch -t "$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%H%M)" "$GCD/codev-sbox.alive"
+touch -t 202001010000 "$GCD/codev-sbox.dead" "$GCD/codev-sbox.nomark"
 ( TMPDIR="$GCD"; codev_sbox_gc >/dev/null )
 [ -d "$GCD/codev-sbox.alive" ] && ok "owner 活着 → 保留" || bad "活沙盒被 GC 删了"
 [ -d "$GCD/codev-sbox.dead" ] && bad "owner 已死仍未删" || ok "owner 已死 → 删"
@@ -333,6 +335,9 @@ grep -qx 'a.md' "$T/codev-rb.txt" && ok "用户暂存的 a.md 仍在 index" || b
 grep -qx 'b.md' "$T/codev-rb.txt" && bad "本次 add 的 b.md 未撤回" "$(cat "$T/codev-rb.txt")" || ok "本次 add 的 b.md 已撤回"
 rm -rf "$REPO" "$T/codev-rb.txt"
 
+echo "30. 翻牌行：rc=137 的超时写明 rc=137 而不是写死 124"
+mk x "" ""; r=$(report x 137); case "$r" in *"rc=137"*) ok "137 如实显示";; *) bad "仍写死 124" "$r";; esac
+
 echo "31. 第 2 轮回流：CODEV_TIMEOUT 位数守卫；会话目录 GC 按活动时间判活；母本签名与调用 cwd 无关"
 r=$(CODEV_TIMEOUT=99999999999999999999; source "$LIB" 2>/dev/null; echo "$CODEV_TIMEOUT"); [ "$r" = 600 ] && ok "20 位 CODEV_TIMEOUT → 600" || bad "超长 CODEV_TIMEOUT 穿透" "$r"
 GCD="$CODEV_DIR/gc2"; mkdir -p "$GCD/codev.active/sub" "$GCD/codev.stale"
@@ -348,8 +353,30 @@ REPO=$(mktemp -d -t codevrepo.XXXXXX)
 [ "$(sort -u "$T/codev-cwd.txt" | wc -l | tr -d ' ')" = 1 ] && ok "根目录与子目录算出同一母本路径" || bad "签名随 cwd 变" "$(cat "$T/codev-cwd.txt")"
 rm -rf "$REPO" "$T/codev-cwd.txt"
 
-echo "30. 翻牌行：rc=137 的超时写明 rc=137 而不是写死 124"
-mk x "" ""; r=$(report x 137); case "$r" in *"rc=137"*) ok "137 如实显示";; *) bad "仍写死 124" "$r";; esac
+echo "33. 长 stdout（≥600 字节）的额度页 → quota；同样长但带标题/P 级的真评审即使提到 429 也 → ok；shasum 坏了退 cksum"
+mk x "$(printf 'You have reached your credit usage limit for today. %s' "$(head -c 700 /dev/zero | tr '\0' 'x')")" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = quota ] && ok "长额度页 → quota" || bad "长额度页判成 $r"
+mk x "$(printf '## Review\nThe 429 rate limit retry path is fine. P2: minor. %s' "$(head -c 700 /dev/zero | tr '\0' 'y')")" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "长评审含 429 仍 → ok" || bad "长评审判成 $r"
+h=$(printf 'abc' | { shasum() { return 1; }; codev_hash; }); case "$h" in [0-9]*) ok "shasum 坏 → cksum 兜底（${h}）";; *) bad "cksum 兜底失效" "[$h]";; esac
+
+echo "34. 未跟踪的 FIFO 不会让签名计算挂死；沙盒超 7 天即使 owner pid 活着也删"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo a > a.txt && git add -A && git commit -qm i && mkfifo pipe.fifo \
+  && timeout 20 bash -c '. "'"$LIB"'"; codev_master_path' >/dev/null 2>&1; echo "rc=$?" > "$T/codev-fifo.txt" )
+grep -q '^rc=0$' "$T/codev-fifo.txt" && ok "有 FIFO 时 codev_master_path 秒回 rc=0" || bad "FIFO 让签名挂死/失败" "$(cat "$T/codev-fifo.txt")"
+rm -rf "$REPO" "$T/codev-fifo.txt"
+GCD="$CODEV_DIR/gc3"; mkdir -p "$GCD/codev-sbox.ancient"; echo $$ > "$GCD/codev-sbox.ancient/.codev-owner"; touch -t 202001010000 "$GCD/codev-sbox.ancient"
+( TMPDIR="$GCD"; codev_sbox_gc >/dev/null ); [ -d "$GCD/codev-sbox.ancient" ] && bad "7 天以上的沙盒因 pid 活着未删" || ok "超 7 天沙盒不看 pid 直接删"; rm -rf "$GCD"
+
+echo "32. 母本 chmod -R a-w 未生效（用替身 chmod 模拟 ACL/只读挂载失败）→ 不铺母本、退回 text；签名哈希皆空 → 不铺母本"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
+  && chmod() { case "$*" in *a-w*) return 0;; *) command chmod "$@";; esac; } && codev_repo_master >/dev/null 2>&1; echo "rc=$?" > "$T/codev-chm.txt"
+  echo "masters=$(find "$CODEV_DIR" -maxdepth 1 -type d -name 'codev-master-repo.*' ! -name '*.lock' | wc -l | tr -d ' ')" >> "$T/codev-chm.txt" )
+grep -q '^rc=1$' "$T/codev-chm.txt" && ok "chmod 无效时 rc=1" || bad "chmod 无效仍成功" "$(cat "$T/codev-chm.txt")"
+grep -q '^masters=0$' "$T/codev-chm.txt" && ok "未留下可写母本" || bad "留下了可写母本" "$(cat "$T/codev-chm.txt")"
+( cd "$REPO" && shasum() { return 1; } && cksum() { return 1; } && codev_master_path 2>/dev/null; echo "rc=$?" > "$T/codev-hash.txt" )
+grep -q '^rc=1$' "$T/codev-hash.txt" && ok "哈希皆空 → codev_master_path rc=1" || bad "哈希皆空仍 rc=0" "$(cat "$T/codev-hash.txt")"
+rm -rf "$REPO" "$T/codev-chm.txt" "$T/codev-hash.txt"; rm_masters
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
