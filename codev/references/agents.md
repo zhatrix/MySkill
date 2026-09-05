@@ -137,17 +137,19 @@ stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 s
    untracked、以及被它 `.gitignore` 忽略的文件都一起打包（实测 `sub/untracked_secret.txt` 进了包）。
    加 `--no-recursion` 后目录项只建空目录、不下钻；普通文件因 `ls-files` 已逐个列出，不受影响。
 
-密钥过滤是**两道**：tar 的 `--exclude`（大小写敏感）+ 解包后一轮 `find -type f -iname` 大小写
-不敏感清扫（挡 `.ENV`、`UPPER.PEM` 这类变体，实测 `--exclude` 确实漏它们）。两道都只认**文件名**，
+密钥过滤是**两道**：喂给 tar 的文件清单先按 **basename** 用 `case` 过滤（大小写敏感）+ 解包后一轮
+`find -type f -iname` 大小写不敏感清扫（挡 `.ENV`、`UPPER.PEM` 这类变体）。两道都只认**文件名**，
 挡不住硬编码在源码里的密钥 —— Step 2B 的 secret 扫描仍然必须做。
 
 **过滤模式的两条硬约束**（都是踩过的坑，改清单前务必先看）：
 
-1. **tar 的 `--exclude` 按【路径分量】匹配，会连目录一起挡掉。** 所以宽通配是禁区：
-   `*credentials*`（甚至光秃秃的 `credentials`）会整体吃掉 `src/credentials/` 整棵子树，
-   连里面不含密钥的文件一起消失，`--exclude=./credentials` 锚定也无效。无扩展名的凭证文件
-   （`credentials`、`credentials.json`）只在**后置 `find -type f -iname`** 里挡——
-   `-type f` 天然匹配不到目录，正好只删真的凭证文件。
+1. **不用 tar 的 `--exclude`——它按【路径分量】匹配，会连目录一起挡掉。** `*.env` 会把名叫
+   `dark.env/` 的目录整棵子树静默吃掉（实测 `src/themes/dark.env/colors.txt` 一个不剩，后置 find
+   救不回 tar 根本没写出来的东西）；`*credentials*` 会整体吃掉 `src/credentials/`。所以第一道过滤
+   放在文件清单阶段按 basename 匹配：只挡文件、不挡目录。`credentials` 一类不进这份清单，只在**后置
+   `find -type f -iname`** 里挡，且只删数据格式（json/yml/ini/toml/enc/pem/txt…）与无扩展名的——
+   任何其它扩展名（`.proto`/`.scala`/`.sql`/`.tf`…）都当源码留下，白名单式的"摘掉常见源码扩展名"
+   永远列不全。
 2. **后置 `find` 必须带 `-type f`。** 不加会匹配到目录，`-delete` 虽拒删非空目录，
    但空目录/单文件目录仍会连带整棵子树消失。
 
@@ -172,9 +174,15 @@ APFS clone 共享数据块：额外 5 份副本的**真实**磁盘增量仅 6MB�
 不支持 `cp -c` 的平台（非 APFS）自动退回 `cp -R`，语义一样、只是不共享块。
 
 **并发正确性**：fan-out 时 N 个 agent 是 N 个独立 shell、会同时进 `codev_repo_master`。
-用 `mkdir` 原子锁（抢到的铺、其余等着复用）+ `.partial` 目录原子改名（中途被杀不会留下半个仓库
-被下次误当"已铺好"）+ 陈旧锁回收（持锁进程被杀时不至于让后续 agent 白等满 300s）：先用 `kill -0` 判持锁者是否存活，**活锁不回收**（否则会偷走仍在写母本的进程的锁，两个 builder 同时解 tar → 母本交错/截断，波及全部 agent）；mtime 只作 PID 丢失时的兜底，`-mmin +2` 实际语义是 **≥3 分钟**（find 按整分钟截断）。
-实测 6 个真并发 agent 全部读到正确内容、只生成一个母本、无锁/半成品残留。
+用 `mkdir` 原子锁（抢到的铺、其余等着复用）+ 每个 builder 自己的 `.partial.<pid>` 目录原子改名（中途被杀不会
+留下半个仓库被下次误当"已铺好"；builder 之间绝不共用半成品目录）+ 陈旧锁回收（持锁进程被杀时不至于让后续
+agent 白等满 300s）。回收的三条规则：① 先用 `kill -0` 判持锁者是否存活，**活锁不回收**；mtime 只作 PID 丢失时的
+兜底，`-mmin +2` 实际语义是 **≥3 分钟**（find 按整分钟截断）。② 回收本身必须排他：N 个等待者会**同时**判定陈旧，
+各自 `rm -rf` 再 `mkdir` 会删掉别人刚建的新锁（实测 15 个等待者里 5-8 个同时进 tar、母本只剩 5/100 个文件却
+rc=0 发布），"判陈旧 → 动手"之间的窗口也会让路径上已换成新锁；所以先抢 `.lock.reclaim` 子锁，只有拿到的那个能
+动 `.lock`，且拿到后再核实一遍陈旧。③ 放锁只放自己的（pid 文件对得上），pid 用 `sh -c 'echo $PPID'` 取当前
+（子）shell 自己的 pid——`$$` 在 `( … ) &` 子 shell 里是父 shell 的，bash/zsh 皆然。
+实测 15 个并发等待者 + 陈旧锁 × 12 轮（bash/zsh 各 6），全部 rc=0、只生成一个母本、无锁/半成品残留。
 
 无论哪种，核对只**检测并如实上报**，**绝不自动 `git checkout`/`reset`**——review 模式下工作区正是用户
 待评审的未提交改动，自动回滚会连用户自己的工作一起抹掉（未跟踪文件 checkout 也删不掉）。下面片段用于 (b)：
@@ -226,10 +234,11 @@ fi
      with '--commit'`，exit 2）。
   **解法（借 gstack）：丢 `--base`，把 diff 范围写进 prompt** 让 codex 自己跑 `git diff`——这样既避开
   argv 互斥、又**保住自定义关注点**（比"无 prompt"版强）。prompt 里含文件系统边界 + 一句
-  "请运行 `git diff <base>...HEAD`（拿不到就 `git diff <base>`）只评审这些改动 + <关注点>"：
+  "请运行 `git diff <base>` 只评审这些改动 + <关注点>"（是 `git diff <base>`——base 到【工作树】，和其它 agent
+  内联的 `git diff "$BASE"` 同源；不要写 `<base>...HEAD`，那只含已提交范围，未提交改动在 main 上跑时为空）：
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel)"
-  # PROMPT 内含边界 + “跑 git diff <BASE>...HEAD 只评审这些改动”（<BASE> 写字面值，如 HEAD~1）
+  # PROMPT 内含边界 + “跑 git diff <BASE> 只评审这些改动”（<BASE> 写字面值，如 HEAD~1；不带 ...HEAD）
   codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort="medium"'
   ```
   实测已验证：`codex review [PROMPT]` 确会读取仓库/执行 `git diff` 并产出**带真实文件:行号**的 diff-grounded

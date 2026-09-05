@@ -310,15 +310,22 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    两者皆空则告知"无改动可评审"并退出。**未跟踪新文件**也要纳入，用 NUL 分隔安全枚举（防文件名含空格/换行/前导 `-`）：
    ```bash
    git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
-     git diff --no-index -- /dev/null "$f"      # 或直接附文件内容，提示词里标注"新增未跟踪文件"
+     git diff --no-index -- /dev/null "$f" || true   # 或直接附文件内容，提示词里标注"新增未跟踪文件"
    done
    ```
+   `git diff --no-index` **有差异就退出 1**，即每个非空的未跟踪文件都会让它返回 1——这是正常输出，
+   不是上一段说的"base 无效"。`|| true` 吞掉它，否则把这段和 base 检查放进同一次 Bash 调用时，
+   最后的 rc=1 会被误读成 base 无效而停下问用户；用 `&&` 串到后面的命令上则后面的全不执行。
 2. 选 agent（A）。
 3. **发送前 secret 扫描**——扫的是**实际将发送的完整 payload**。⚠️ **`./repo` 副本模式下 payload 是
    整个工作区，不是 diff**：沙盒 agent 能读副本里任何文件并发给它自己的模型，所以只扫 diff 等于漏掉
    绝大部分实际外发内容。按模式选范围：
    ```bash
-   [ -z "$BASE" ] && { echo "BASE 未定义，拒绝扫描（会误把范围当成 working-vs-index）"; exit 1; }
+   # 只有 text 模式的范围依赖 BASE（副本模式扫整仓、2F 文档评审根本没有 BASE），守卫只在那条分支前做，
+   # 而且必须放在管道【外面】：写进管道左段的子 shell 里，exit 1 只退出那个子 shell，grep 照样收到空输入
+   # 返回 1，"拒绝扫描"就和"扫过了没命中"分不清。
+   [ "${CODEV_SANDBOX_MODE:-repo}" = repo ] || [ -n "$BASE" ] \
+     || { echo "text 模式需要 BASE（否则 git diff 会误把范围当成 working-vs-index），先回第 1 步"; exit 1; }
    # BSD/macOS xargs 无 GNU 的 -r/--no-run-if-empty（`xargs -0 -r` 会 illegal option 直接失败、
    # 让整段内容不参与扫描）；用 `|| true` 吞空输入，`cat --` 防 `-` 开头文件名被当选项。
    if [ "${CODEV_SANDBOX_MODE:-repo}" = repo ]; then
@@ -331,7 +338,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
      { git diff "$BASE"
        git ls-files --others --exclude-standard -z | { xargs -0 cat -- 2>/dev/null || true; } }
    fi | grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'
+   case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 扫描本身出错，按命中处理";; esac
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
+   # grep 的退出码：0 命中 / 1 干净 / 2 出错——别把"干净"的 1 当失败，也别把 2 当干净。
    ```
    命中 → 停下，AskUserQuestion 让用户确认是否继续发送 / 先脱敏 / 缩小范围 / 改用 `CODEV_SANDBOX_MODE=text`；
    未命中再继续。
@@ -347,7 +356,9 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
    > diff 之外的代码、结论置信度下降。**首次在一个新仓库启用副本模式时，向用户说明这一点。**
 4. 并行发出（B/C）：
    - `codex` 走 `codev_bg_native codex codex review "<prompt>"`——**gstack 式**：prompt 里含文件系统边界 +
-     "请自己跑 `git diff <BASE>...HEAD` 只评审这些改动 + 关注点"，从而**不带 `--base`/`--commit`**（避开
+     "请自己跑 `git diff <BASE>` 只评审这些改动 + 关注点"（**写 `git diff <BASE>`，不是 `<BASE>...HEAD`**：
+     后者只含已提交范围，未提交改动在 main 上跑时 BASE 就是 HEAD、范围为空，codex 会说"没有改动"或随手评审别的
+     代码，而其它 agent 拿的是 `git diff "$BASE"` 的工作树内容，一致性矩阵在比两份不同的东西），从而**不带 `--base`/`--commit`**（避开
      `[PROMPT]` 与它们的 argv 互斥）、也**不带 `-s`/`-C`**（review 不认这俩），须从仓库根跑。这样保住了
      自定义关注点（详见 agents.md）；
    - 其它 agent 用 prompts.md 的 **review 模板**（含「工作副本」+「两档结论」段）+ `git diff "$BASE"`

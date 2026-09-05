@@ -212,6 +212,69 @@ r=$(CODEV_LEDGER="$LEG" codev_ledger_recent codex)
 case "$r" in *"quota ok"*"最近 09-01T10:05"*) ok "旧 7 列账本仍可读";; *) bad "旧账本行被丢弃" "$r";; esac
 codev_finding_add ntms spec-a 1 codex m id P1 A 采纳 成立 独家 未加引号的 描述 2>/dev/null && bad "多余实参未被拒" || ok "finding_add 拒收未加引号的描述"
 
+echo "22. 回流 commit 多文件：首参空格分隔的多个文件在 bash/zsh 下都要拆开（zsh 不对未加引号变量拆词）"
+REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && mkdir -p docs && echo a > docs/a.md && echo b > docs/b.md && echo c > docs/c.md && git add -A && git commit -qm init \
+  && echo a2 > docs/a.md && echo b2 > docs/b.md && echo c2 > docs/c.md \
+  && codev_commit_round "docs/a.md docs/b.md" 1 codex 0 - "两个文件" >/dev/null \
+  && git show --stat --format= HEAD > "$T/codev-mf.txt" && git status --porcelain >> "$T/codev-mf.txt" ) \
+  && ok "多文件 commit 成功" || bad "多文件 commit 失败" "$(cat "$T/codev-mf.txt" 2>&1)"
+grep -q 'docs/a.md' "$T/codev-mf.txt" && grep -q 'docs/b.md' "$T/codev-mf.txt" && ok "a.md b.md 都进了 commit" || bad "文件没都进" "$(cat "$T/codev-mf.txt" 2>&1)"
+grep -q '^ M docs/c.md' "$T/codev-mf.txt" && ok "没列的 c.md 仍未提交" || bad "c.md 被顺手提交" "$(cat "$T/codev-mf.txt" 2>&1)"
+rm -rf "$REPO" "$T/codev-mf.txt"
+
+echo "23. 短 stdout 像评审结论（含 401 / rate limit 字样）→ ok，不得判成 auth/quota；真错误串仍按类别"
+mk x "LGTM. No P1. The 401 handling in auth.py is correct." ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "LGTM+401 → ok" || bad "LGTM+401 判成 $r"
+mk x "PASS — the rate limit retry path is fine" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "PASS+rate limit → ok" || bad "PASS+rate limit 判成 $r"
+mk x "Error: 401 Unauthorized. Please login first." ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = auth ] && ok "真鉴权错误串仍 → auth" || bad "真鉴权串判成 $r"
+r=$(codev_classify x 137 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = timeout ] && ok "rc=137（-k KILL）→ timeout" || bad "137 判成 $r"
+
+echo "24. 母本签名：同一个已脏文件再改内容 → 签名必须变；未跟踪文件改内容也要变"
+REPO=$(mktemp -d -t codevrepo.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v1 > a.py && git add -A && git commit -qm init \
+  && echo v2 > a.py && codev_master_path && printf '%s\n' "$CODEV_MASTER" \
+  && echo v3 > a.py && codev_master_path && printf '%s\n' "$CODEV_MASTER" \
+  && echo u1 > new.txt && codev_master_path && printf '%s\n' "$CODEV_MASTER" \
+  && echo u2 > new.txt && codev_master_path && printf '%s\n' "$CODEV_MASTER" ) > "$T/codev-sig.txt"
+n=$(sort -u "$T/codev-sig.txt" | wc -l | tr -d ' '); [ "$n" = 4 ] && ok "4 次改动得到 4 个不同母本路径" || bad "签名没随内容变（去重后 $n 个）" "$(cat "$T/codev-sig.txt")"
+rm -rf "$REPO" "$T/codev-sig.txt"
+
+echo "25. 母本过滤：只挡文件不挡目录；credentials 只删数据格式/无扩展名，源码保留；大小写变体也挡"
+REPO=$(mktemp -d -t codevrepo.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+  && mkdir -p src/themes/dark.env certs.pem src/credentials proto \
+  && echo c > src/themes/dark.env/colors.txt && echo r > certs.pem/readme.md && echo g > src/credentials/a.go \
+  && echo p > proto/credentials.proto && echo s > Credentials.scala && echo q > credentials.sql \
+  && echo j > credentials.json && echo b > credentials && echo y > gcp-credentials.yml && echo e > credentials.yml.enc \
+  && echo k > server.key && echo K > UPPER.KEY && echo E > .ENV && echo ok > main.go \
+  && git add -A && git commit -qm init >/dev/null \
+  && codev_repo_master && ( cd "$CODEV_MASTER" && find . -type f | sed 's|^\./||' | sort ) ) > "$T/codev-mst.txt" 2>&1
+for keep in src/themes/dark.env/colors.txt certs.pem/readme.md src/credentials/a.go proto/credentials.proto Credentials.scala credentials.sql main.go; do
+  grep -qx "$keep" "$T/codev-mst.txt" && ok "保留 $keep" || bad "误删 $keep" "$(cat "$T/codev-mst.txt")"
+done
+for drop in credentials.json credentials gcp-credentials.yml credentials.yml.enc server.key UPPER.KEY .ENV; do
+  grep -qx "$drop" "$T/codev-mst.txt" && bad "漏挡 $drop" "$(cat "$T/codev-mst.txt")" || ok "挡住 $drop"
+done
+rm -rf "$REPO" "$T/codev-mst.txt" "$CODEV_DIR"/codev-master-repo.*
+
+echo "26. 母本锁：陈旧锁（持锁 pid 已死）被多个等待者同时发现时只能有一个赢家；放锁只放自己的"
+REPO=$(mktemp -d -t codevrepo.XXXXXX)
+( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && for i in $(seq 1 60); do echo "f$i" > "f$i.txt"; done && git add -A && git commit -qm init >/dev/null )
+( cd "$REPO" && codev_master_path && mkdir -p "$CODEV_MASTER.lock" && echo 999999 > "$CODEV_MASTER.lock/pid" \
+  && touch -t 202001010000 "$CODEV_MASTER.lock" \
+  && for i in 1 2 3 4 5 6 7 8; do ( codev_repo_master; echo "rc=$?" >> "$T/codev-lock.txt" ) & done; wait
+  n=$(cd "$CODEV_MASTER" && find . -type f | wc -l | tr -d ' '); echo "files=$n" >> "$T/codev-lock.txt"
+  ls -d "$CODEV_MASTER".partial.* 2>/dev/null | wc -l | tr -d ' ' | sed 's/^/partials=/' >> "$T/codev-lock.txt"
+  [ -d "$CODEV_MASTER.lock" ] && echo lock-leaked >> "$T/codev-lock.txt" )
+[ "$(grep -c '^rc=0$' "$T/codev-lock.txt")" = 8 ] && ok "8 个等待者全部 rc=0" || bad "有等待者失败" "$(cat "$T/codev-lock.txt")"
+grep -q '^files=60$' "$T/codev-lock.txt" && ok "母本完整（60 个文件）" || bad "母本不完整" "$(cat "$T/codev-lock.txt")"
+grep -q '^partials=0$' "$T/codev-lock.txt" && ok "没有残留 .partial" || bad "残留 .partial" "$(cat "$T/codev-lock.txt")"
+grep -q 'lock-leaked' "$T/codev-lock.txt" && bad "锁泄漏" || ok "锁已释放"
+rm -rf "$REPO" "$T/codev-lock.txt" "$CODEV_DIR"/codev-master-repo.*
+
 rm -rf "$CODEV_DIR"
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

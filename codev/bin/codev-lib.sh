@@ -76,8 +76,10 @@ CODEV_FINDINGS="${CODEV_FINDINGS:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/fi
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
 # 「timeout 600」的单个文件执行而失败；用函数 + "$@" 传参，bash/zsh 都对。
 # CODEV_TIMEOUT（默认 600s）只兜底真正卡死的进程——慢模型靠【后台执行】跑完，不受前台 300s 约束；核实型评审可调到 1200。
+# -k 15：先发 TERM、15 秒后补 KILL。不加的话 trap 了 SIGTERM 的 CLI（Node/Python 的优雅退出处理器）
+# 会活过 CODEV_TIMEOUT，沙盒跟着活过 codev_sbox_gc 的 60 分钟死亡判定，被另一个会话的 GC 连 ./repo 一起 rm 掉。
 codev_run() {
-  if [ -n "$CODEV_TO" ]; then "$CODEV_TO" "$CODEV_TIMEOUT" "$@"; else "$@"; fi
+  if [ -n "$CODEV_TO" ]; then "$CODEV_TO" -k 15 "$CODEV_TIMEOUT" "$@"; else "$@"; fi
 }
 
 # codev_classify <agent> <rc> <outfile> <errfile> — 把一次调用归成一个类别（只输出类别名）：
@@ -93,12 +95,18 @@ codev_run() {
 # 不扫 codex 回显的提示词和文件清单。
 codev_classify() {
   local agent="$1" rc="$2" out="$3" err="$4" osz=0 short="" errlines="" c=""
-  [ "$rc" = "124" ] && { echo timeout; return 0; }
+  # 124 = timeout 发 TERM 后退出；137 = 子进程 trap 了 TERM、-k 补 KILL 后退出（timeout 自身也回 137）。
+  [ "$rc" = "124" ] || [ "$rc" = "137" ] && { echo timeout; return 0; }
   [ -s "$out" ] && osz=$(wc -c < "$out" | tr -d ' ')
   [ "$osz" -gt 0 ] && [ "$osz" -lt 600 ] && short=$(cat "$out" 2>/dev/null)
   errlines=$(codev_err_lines "$err")
   # ① 很短的 stdout 本身就是错误串（qoderclicn 额度、某些 CLI 把登录提示打到 stdout）→ 按其类别。
-  c=$(codev_match_class "$short"); [ -n "$c" ] && { echo "$c"; return 0; }
+  #    但【像评审结论的短回复】不走这条：consult/quick 模式下 "LGTM. No P1. The 401 handling is correct."
+  #    也不到 600 字节，光靠额度/鉴权关键词会把有效评审判成 auth/quota 丢掉，还进账本记它一次失败。
+  #    结论标记（PASS/FAIL/LGTM/P1-P3/✔/结论/发现/Markdown 标题）是错误串里绝不会出现的东西。
+  if [ -n "$short" ] && ! printf '%s' "$short" | grep -qE '(^|[^A-Za-z])(PASS|FAIL|LGTM|P[123])([^A-Za-z]|$)|✔|结论|发现|^#'; then
+    c=$(codev_match_class "$short"); [ -n "$c" ] && { echo "$c"; return 0; }
+  fi
   # ② stdout 为空：stderr 错误行决定类别；没有错误行且 rc=0 → empty。
   if [ "$osz" -eq 0 ]; then
     c=$(codev_match_class "$errlines"); [ -n "$c" ] && { echo "$c"; return 0; }
@@ -267,7 +275,7 @@ codev_commit_round() {
   [ $# -ge 6 ] || { echo "用法: codev_commit_round files round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
   # 变量名【绝不能叫 path】：zsh 里 path 是绑定 $PATH 的特殊数组，local path=… 会把 PATH 换成该路径，
   # 函数体内 git/mktemp/sed 全部 command not found。同理见 codev_prev_round_commit。
-  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc noglob=
+  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc
   shift 6                                   # 剩下的位置参数是要透传的 trailer，先写进 msg 再复用位置参数装文件列表
   msg=$(mktemp -t codev-msg.XXXXXX) || return 1
   {
@@ -277,8 +285,13 @@ codev_commit_round() {
     printf 'Codev-Verified-P1: %s (prev %s)\n' "$p1" "$prev"
     for t in "$@"; do printf '%s\n' "$t"; done
   } > "$msg"
-  case "$-" in *f*) noglob=1;; esac         # 拆词时关通配，路径按字面走；原来开着就别关回去
-  set -f; set -- $files; [ -n "$noglob" ] || set +f
+  # 把 <files> 拆成逐个位置参数。【不能】写 `set -- $files`：zsh 默认不对未加引号的变量做词拆分
+  # （SH_WORD_SPLIT 关着，$# 恒为 1），而 `set -f` 在 zsh 里开的是 NO_RCS 而不是 NO_GLOB。
+  # 用 read 逐行收：不依赖拆词、不经过通配，bash/zsh 行为一致。
+  set --
+  while IFS= read -r t; do [ -n "$t" ] && set -- "$@" "$t"; done <<CODEV_EOF
+$(printf '%s\n' "$files" | tr ' \t' '\n\n')
+CODEV_EOF
   if [ $# -lt 1 ]; then echo "⚠️ 没有给任何文件路径" >&2; rm -f "$msg"; return 1; fi
   for t in "$@"; do
     if [ -d "$t" ]; then
@@ -402,8 +415,13 @@ codev_master_path() {
   local root sig h
   root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
   [ -n "$root" ] || return 1
-  # 工作区签名：HEAD + `git status --porcelain` 摘要（含未跟踪/已暂存），足以捕捉"改了代码再评一轮"。
-  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$(git status --porcelain --untracked-files=all 2>/dev/null | cksum)"
+  # 工作区签名：HEAD + `git status --porcelain`（哪些文件脏了）+ 【脏文件的实际内容】（git diff HEAD 覆盖
+  # tracked 的已暂存/未暂存改动，未跟踪文件直接 cat）。只哈希 porcelain 是不够的：它只有状态字母 + 路径，
+  # 同一个已脏文件再改几行，porcelain 一个字节都不变 → 命中旧母本 → agent 读到上一轮快照（实测三次连改同路径）。
+  # 成本只与脏文件规模相关，干净仓库几乎为零。xargs -r：GNU 空输入不执行，BSD 本就不执行且接受 -r 为空操作。
+  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$( { git status --porcelain --untracked-files=all
+        git diff HEAD --binary --no-color --no-ext-diff
+        git ls-files --others --exclude-standard -z | xargs -0 -r cat -- ; } 2>/dev/null | cksum)"
   # cksum 是 POSIX、bash/zsh/macOS/Linux 都有（不用 md5/sha1sum：前者 macOS 无 -r 之外差异、后者 macOS 没有）。
   h=$(printf '%s' "$sig" | cksum | tr -cd '0-9')
   CODEV_MASTER="$CODEV_DIR/codev-master-repo.${h:-0}"
@@ -418,7 +436,7 @@ codev_repo_master() {
   # holder 必须在这里【一次性】声明：写成循环体内的 `local holder` 会在 zsh 下每轮打印
   # 「holder=<pid>」污染输出——zsh 未设 TYPESET_SILENT 时，对【已存在】的变量再执行不带赋值的
   # local/typeset 会显示它的当前值（实测等待循环每秒吐一行）。bash 无此行为。
-  local root sz holder lock="$CODEV_MASTER.lock" waited=0
+  local root sz holder lock="$CODEV_MASTER.lock" waited=0 me
   # 【并发护栏】fan-out 时 N 个 agent 是 N 个独立 shell、会同时进到这里。没有锁的话它们会
   # 同时往同一个母本目录 tar，解出交错/截断的文件（agent 读到半个文件比读不到更糟）。
   # mkdir 是原子的：抢到的铺母本，没抢到的等它铺完再复用。
@@ -436,9 +454,23 @@ codev_repo_master() {
       if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
         :
       else
-        # 确认已死：把 .partial 改名再删，避免旧持锁者的 mv 恰好发布半成品。
-        mv "$CODEV_MASTER.partial" "$CODEV_MASTER.partial.dead.$$" 2>/dev/null
-        rm -rf "$CODEV_MASTER.partial.dead.$$" "$lock"
+        # 【单一赢家】：N 个等待者会同时判定这把锁陈旧。原来各自 `rm -rf $lock; mkdir $lock`，
+        # 结果 A 刚 mkdir 出来的新锁被 B 的 rm -rf 删掉、B 再 mkdir 成功，两个 builder 并存往同一个
+        # .partial 里 tar（实测 15 个等待者里 5-8 个同时进 tar，母本只剩 5/100 个文件却 rc=0 发布）。
+        # 光把 rm 换成 mv 也不够：判陈旧和动手之间有窗口，路径上可能已经换成别人刚 mkdir 的新锁
+        # （实测 8 个等待者里 2-3 个的新锁被这样偷走，pid 文件写不进去、rc=1）。
+        # 所以回收本身也要排他：先抢 .reclaim 子锁，只有拿到的那一个能动 $lock；拿到后【再核实一遍】
+        # 陈旧（持锁者死了就没人能放它、又只有我能回收，核实通过后到 rm -rf 之间路径不可能被换掉），
+        # 然后 rm 掉旧锁、放掉子锁、照常去抢 $lock——抢不到（有人比我快）也无妨，谁 mkdir 成功谁是唯一 builder。
+        # 旧持锁者的 .partial 这里不碰：每个 builder 用带自己 pid 的 .partial.<pid>，死掉的由赢家按 pid 判活清掉。
+        if mkdir "$lock.reclaim" 2>/dev/null; then
+          holder=$(cat "$lock/pid" 2>/dev/null)
+          if [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] \
+             && { [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; }; then rm -rf "$lock"; fi
+          rmdir "$lock.reclaim" 2>/dev/null
+        elif [ -n "$(find "$lock.reclaim" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+          rm -rf "$lock.reclaim"     # 回收者自己死在半路（极窄窗口）：子锁也会陈旧，同样按 3 分钟清
+        fi
         # 【不能 continue】：回收失败时（如会话目录不可写）锁还在，continue 会跳过下面的
         # sleep 与 waited++ → 变成无 sleep 的忙等，把一个核吃满且永不退出（实测 timeout 124、
         # spins 上万）。故这里【不跳过】计时与休眠，让它照常走满 300s 再退回 text 模式。
@@ -449,13 +481,24 @@ codev_repo_master() {
     [ "$waited" -gt 300 ] && return 1       # 等超过 ~300s 判失败（母本再大也该好了），退回 text 模式
     sleep 1
   done
-  echo $$ > "$lock/pid" 2>/dev/null   # 记下持锁者，供上面的 kill -0 判活
+  # 记下持锁者 pid，供上面的 kill -0 判活，也供放锁时确认是自己的锁。【不能用 $$】：fan-out 的 N 个
+  # agent 若是同一个 shell 里 `( … ) &` 出来的子 shell，$$ 在 bash/zsh 下都是父 shell 的 pid——
+  # 父 shell 一退出所有锁就"死"了，或者反过来 N 个 builder 共用同一个 .partial.<pid>。
+  # `sh -c 'echo $PPID'` 作为直接子进程跑，PPID 就是当前这个（子）shell 自己的 pid，bash/zsh 一致。
+  sh -c 'echo $PPID' > "$lock/pid" 2>/dev/null
+  me=$(cat "$lock/pid" 2>/dev/null); [ -n "$me" ] || me=$$
   # 拿到锁了。下面用子 shell 包住全部工作，出口统一放锁——
   # 【不能】在中途直接 return：那样锁不会被删，同会话后续 agent 全卡死在上面的 until。
-  local rc=0
+  # .partial 带持锁者 pid：builder 之间绝不共用同一个半成品目录，回收陈旧锁的人也不需要碰别人的。
+  local rc=0 part="$CODEV_MASTER.partial.$me"
   (
     root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
     [ -n "$root" ] || exit 1
+    # 清掉【死掉的】builder 留下的 .partial.<pid>（被杀的前台超时/Ctrl-C）；活着的（pid 还在）不碰。
+    while IFS= read -r -d '' d; do
+      p=${d##*.partial.}
+      case "$p" in *[!0-9]*|'') ;; *) kill -0 "$p" 2>/dev/null || rm -rf "$d";; esac
+    done < <(find "$CODEV_DIR" -maxdepth 1 -type d -name "$(basename "$CODEV_MASTER").partial.*" -print0 2>/dev/null)
     # 体积闸门：只统计将被拷的文件（已被 .gitignore 排除的 node_modules/build 产物天然不计入）。
     # BSD xargs 无 -r，用 `|| true` 吞空输入；du 可能被 xargs 分批多次调用，awk 累加即可。
     # ⚠️ cd 必须在【整条管道之外】（即命令替换的子 shell 里）：若写成 `{ cd "$root" && git ls-files; } | xargs du`，
@@ -468,12 +511,14 @@ codev_repo_master() {
     [ "${sz:-0}" -gt "$CODEV_MAX_COPY_KB" ] 2>/dev/null && exit 1
     # 先解到 .partial 再原子改名：万一进程在解压中途被杀，留下的是 .partial，
     # 下次不会被 `[ -d "$CODEV_MASTER" ]` 误判成"已铺好"而让 agent 读到半个仓库。
-    rm -rf "$CODEV_MASTER.partial"
-    mkdir -p "$CODEV_MASTER.partial" || exit 1
+    rm -rf "$part"
+    mkdir -p "$part" || exit 1
     # tar 按 cwd 相对路径打包，故必须先 cd 进仓库根；--null -T - 读 NUL 分隔文件名（含空格/换行也安全）。
-    # --exclude 过滤明显的密钥载体：副本会被外部模型读取，凡进副本的内容都视同已发送出去。
-    # （不用 grep 过滤文件名列表：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔，行为不一致；
-    #   tar 的 --exclude 在 GNU tar / bsdtar 上都支持，更稳。）
+    # 密钥载体的过滤【在下面的 while 循环里按文件名（basename）做】，不用 tar 的 --exclude：
+    # 副本会被外部模型读取，凡进副本的内容都视同已发送出去；但 --exclude 是按【路径分量】匹配的，
+    # `*.env` 会把名叫 dark.env/ 的【目录】整棵子树静默吃掉（实测 src/themes/dark.env/colors.txt 一个不剩，
+    # find 兜底也救不回 tar 根本没写出来的东西）。按 basename 用 case 匹配就只挡文件、不挡目录，
+    # 且 bash/zsh 行为一致。（不用 grep：本机 grep 可能是 ugrep，其 -z 是"解压"而非 NUL 分隔。）
     # ⚠️ --no-recursion 是【必须的】：git ls-files 对 submodule 只输出一个 mode 160000 的
     # 目录路径（如 `sub`），tar 收到目录默认会【递归整个已初始化 submodule】——连 submodule
     # 自己的 untracked / 被它 .gitignore 忽略的文件一起打包（实测 sub/untracked_secret.txt
@@ -488,56 +533,62 @@ codev_repo_master() {
     ( set -o pipefail 2>/dev/null   # 让左段 git/tar 的失败也能传出去，不被右段 tar -xf 的 0 掩盖
       cd "$root" && { git ls-files -z; git ls-files --others --exclude-standard -z; } \
         | { while IFS= read -r -d '' f; do
-              { [ -e "$f" ] || [ -L "$f" ]; } && printf '%s\0' "$f"
+              { [ -e "$f" ] || [ -L "$f" ]; } || continue
+              # 这份清单必须与下面 find -iname 那轮【一一对应】（那轮补大小写变体）。改一边就同步另一边。
+              case "${f##*/}" in
+                .env|*.env|.env.*|.envrc|*.pem|*.key|*.p12|*.pfx|id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|\
+                *.keystore|*.jks|.netrc|.npmrc|*.tfvars|*.tfstate|*.tfstate.*) continue;;
+              esac
+              case "$f" in .git|.git/*|*/.git|*/.git/*) continue;; esac
+              printf '%s\0' "$f"
             done; } \
         | tar -cf - --null -T - --no-recursion \
-            --exclude='.env' --exclude='*.env' --exclude='.env.*' --exclude='.envrc' \
-            --exclude='*.pem' --exclude='*.key' --exclude='*.p12' --exclude='*.pfx' \
-            --exclude='id_rsa*' --exclude='id_dsa*' --exclude='id_ecdsa*' --exclude='id_ed25519*' \
-            --exclude='*.keystore' --exclude='*.jks' --exclude='.netrc' --exclude='.npmrc' \
-            --exclude='*.tfvars' --exclude='*.tfstate' --exclude='*.tfstate.*' \
-            --exclude='.git' \
-        | ( cd "$CODEV_MASTER.partial" && tar -xf - ) ) 2>/dev/null \
-      || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
+        | ( cd "$part" && tar -xf - ) ) 2>/dev/null \
+      || { rm -rf "$part"; exit 1; }
     # 【P1 修复：symlink 穿透】tar 原样保留 tracked symlink。若仓库含指向仓库外的绝对路径
     # 链接，agent 经 ./repo/link 就能读到沙盒外的真实文件；更糟的是【能写穿】——实测
     # `chmod -R a-w` 之后 `echo X > repo/link` 仍成功改掉了真实目标（chmod 只改 symlink
     # 自身权限位，不保护目标）。那会击穿"写入只落在副本上"这条主防线，故一律删掉链接。
-    find "$CODEV_MASTER.partial" -type l -delete 2>/dev/null
-    # 大小写盲区：--exclude 的 fnmatch 大小写敏感（实测 UPPER.KEY / .ENV 不被排除），
+    find "$part" -type l -delete 2>/dev/null
+    # 大小写盲区：上面 case 的 glob 大小写敏感（UPPER.KEY / .ENV 不被排除），
     # 故再用 -iname 做一轮大小写不敏感清扫兜底。
     # ⚠️ 必须加 -type f：不加会匹配到目录，`-delete` 虽拒删非空目录，但空目录/单文件目录仍会
     # 连带整棵子树消失。
-    # 【这一轮必须覆盖 tar --exclude 的【全部】文件名模式】，否则该项的大小写变体就成了裸奔——
-    # tar 那边大小写敏感，这里是唯一的兜底。改动任一边都要同步另一边（`*.key`/`*.env`/`*.jks`/
+    # 【这一轮必须覆盖上面 case 清单的【全部】文件名模式】，否则该项的大小写变体就成了裸奔——
+    # case 那边大小写敏感，这里是唯一的兜底。改动任一边都要同步另一边（`*.key`/`*.env`/`*.jks`/
     # `id_*` 曾在一次修 credentials 的提交里被漏掉，导致 SERVER.KEY / PROD.ENV / ID_RSA 直接进副本）。
     # credentials* 不在这一轮里，它有自己的一轮（见下），因为需要额外的源码扩展名白名单。
-    find "$CODEV_MASTER.partial" -type f \( -iname '.env' -o -iname '*.env' -o -iname '.env.*' \
+    find "$part" -type f \( -iname '.env' -o -iname '*.env' -o -iname '.env.*' \
          -o -iname '.envrc' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.p12' \
          -o -iname '*.pfx' -o -iname '*.keystore' -o -iname '*.jks' -o -iname '.netrc' \
          -o -iname '.npmrc' -o -iname 'id_rsa*' -o -iname 'id_dsa*' \
          -o -iname 'id_ecdsa*' -o -iname 'id_ed25519*' \
          -o -iname '*.tfvars' -o -iname '*.tfstate' -o -iname '*.tfstate.*' \) -delete 2>/dev/null
     # credentials 单独一轮：宽通配能挡住 gcp-credentials.json / aws_credentials /
-    # credentials.yml.enc 这类前缀后缀变体（实测 8/8），但会连 credentials.go /
-    # credentials_manager.dart / CredentialsProvider.kt 这类【合法源码】一起删（实测 9/9 全中）。
-    # 故先按名字宽匹配、再用 ! -iname 把常见源码扩展名摘出来（实测 8/8 挡住、0/9 误删）。
-    # 只在这里挡、不进 tar --exclude：tar 按路径分量匹配会整体吃掉 src/credentials/ 目录。
-    find "$CODEV_MASTER.partial" -type f -iname '*credentials*' \
-         ! -iname '*.go' ! -iname '*.dart' ! -iname '*.ts' ! -iname '*.tsx' ! -iname '*.js' \
-         ! -iname '*.jsx' ! -iname '*.py' ! -iname '*.rs' ! -iname '*.java' ! -iname '*.kt' \
-         ! -iname '*.swift' ! -iname '*.rb' ! -iname '*.php' ! -iname '*.cs' ! -iname '*.c' \
-         ! -iname '*.h' ! -iname '*.cpp' ! -iname '*.hpp' ! -iname '*.sh' ! -iname '*.vue' \
-         ! -iname '*.md' ! -iname '*.txt' -delete 2>/dev/null
+    # credentials.yml.enc 这类前缀后缀变体，但会连 credentials.go / CredentialsProvider.kt 这类
+    # 【合法源码】一起删。原来用"源码扩展名白名单"摘出来，可白名单永远列不全——.proto/.scala/.ex/
+    # .sql/.tf/.xaml/.gradle 全被删了（实测 9/9）。改成【只删数据格式与无扩展名的】：凭证真正的
+    # 载体就是 json/yml/ini/toml/properties/enc/pem/txt/csv/xml 这些和光秃秃的 credentials；
+    # 其它任何扩展名一律视为源码留下。`! -name '*.*'` = 无扩展名。
+    # 只在这里挡、不进上面的 case 清单：那边按文件名会连 credentials.proto 一起挡；这里 -type f 也不碰目录。
+    find "$part" -type f -iname '*credentials*' \
+         \( ! -name '*.*' -o -iname '*.json' -o -iname '*.yml' -o -iname '*.yaml' -o -iname '*.ini' \
+            -o -iname '*.cfg' -o -iname '*.conf' -o -iname '*.toml' -o -iname '*.properties' \
+            -o -iname '*.enc' -o -iname '*.gpg' -o -iname '*.asc' -o -iname '*.txt' -o -iname '*.csv' \
+            -o -iname '*.xml' -o -iname '*.plist' -o -iname '*.env' -o -iname '*.pem' -o -iname '*.p12' \) \
+         -delete 2>/dev/null
     # mv 前守卫：目标已存在时 `mv dir existingdir` 会把源【移进】目标里（实测 rc=0，
     # 得到 M/codev-master-repo.partial），`||` 分支根本不触发 → 母本里留个嵌套垃圾目录。
-    [ -e "$CODEV_MASTER" ] && { rm -rf "$CODEV_MASTER.partial"; exit 0; }   # 别人已铺好，复用
-    mv "$CODEV_MASTER.partial" "$CODEV_MASTER" || { rm -rf "$CODEV_MASTER.partial"; exit 1; }
+    [ -e "$CODEV_MASTER" ] && { rm -rf "$part"; exit 0; }   # 别人已铺好，复用
+    mv "$part" "$CODEV_MASTER" || { rm -rf "$part"; exit 1; }
   ); rc=$?
   # 放锁：无论上面成败都执行。用 rm -rf 而不是 rmdir——锁目录里有 pid 文件（非空），
   # rmdir 会静默失败（实测：锁泄漏 → 同会话后续每个 agent 白等 300s 再退回 text 模式，
   # 副本功能静默失效）。空值守卫防 CODEV_MASTER 意外为空时 rm -rf 打到 ".lock" 之外的东西。
-  [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+  # 【只放自己的锁】：pid 文件写着别人 → 那是别人在陈旧回收后新拿的锁，删了它就又是两个 builder 并存。
+  # pid 文件缺失/为空（会话目录不可写）时仍放——否则锁泄漏、后续 agent 全等 300s。
+  holder=$(cat "$lock/pid" 2>/dev/null)
+  if [ -n "$lock" ] && { [ -z "$holder" ] || [ "$holder" = "$me" ]; }; then rm -rf "$lock" 2>/dev/null; fi
   return $rc
 }
 
