@@ -62,7 +62,7 @@ brew install coreutils      # 提供 gtimeout
 - 每轮回流 commit 只提交文档 pathspec，trailer 带 `Codev-Round` / `Codev-Reviewed-By: codex(gpt-5.6-sol), …` /
   `Codev-Verified-P1: k (prev j)`，`git log --grep '^Codev-Round: 2'` 可直接查；评审原文归档到 gitignored 的
   `.superpowers/codev/<文档>/r<N>/`，不进仓库。
-- 改了 `bin/codev-lib.sh` 后跑 `bash tests/test-lib.sh`（bash/zsh 均可）；改文案按 `TESTING.md` 跑微测试与真机清单。
+- 改了 `bin/codev-lib.sh` 后 `bash tests/test-lib.sh` 与 `zsh tests/test-lib.sh` 两边都要绿；改文案按 `TESTING.md` 跑微测试与真机清单。
 
 ### 2.4 shell 说明
 skill 已对 **zsh** 做过兼容（用 `codev_run` 函数封装超时，而非 `$TP` 变量前缀——后者在 zsh 下会失败）。
@@ -164,7 +164,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | codebuddy 无输出/超时 | 先看翻牌类别：`⛔ 额度/限流`（429，错误串带重置时间）到点再试；`⚠️ turn 预算耗尽` 用 `--max-turns 64` + 核实清单收窄到 3-5 条；提示词压到 25KB 内。仍不行则跳过 |
 | opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
-| 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟的 |
+| 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟且 owner 进程已死的（会话目录 `codev.*` 则是超 24 小时且无文件活动） |
 | gemini 报网络错误 | 本机 gemini 偶发 503/fetch failed，属它自身网络问题，重试或换 agent |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
 | 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型 |
@@ -179,10 +179,13 @@ codev/
 ├── SKILL.md               # 给 Claude 执行的主规范（流程 / 铁律 / 通用机制 A–F）
 ├── bin/
 │   └── codev-lib.sh       # 共享 shell 函数库：timeout 封装 / 沙盒 / 输出捕获 / RC 上报 / 探测
-└── references/
-    ├── agents.md          # 每个 agent 的精确调用命令、鉴权、只读策略、失败处理
-    ├── prompts.md         # 发给外部 agent 的提示词模板（含文件系统边界）
-    └── synthesis.md       # 跨模型综合、一致性矩阵、PASS/FAIL 门禁规则
+├── references/
+│   ├── agents.md          # 每个 agent 的精确调用命令、鉴权、只读策略、失败处理
+│   ├── prompts.md         # 发给外部 agent 的提示词模板（含文件系统边界）
+│   └── synthesis.md       # 跨模型综合、一致性矩阵、PASS/FAIL 门禁规则
+├── TESTING.md             # 测试与验收手册（库回归 / 文案微测试 / 真机验收）
+└── tests/
+    └── test-lib.sh        # 库的回归测试，bash 与 zsh 各跑一遍
 ```
 
 > **`bin/codev-lib.sh`**：调用外部 agent 的公共底座。Step 0 会建一个**本次会话专属目录**
@@ -195,7 +198,7 @@ codev/
 
 ## 9. 隔离沙盒与只读仓库副本
 
-六个 agent 分两档跑：
+六个 agent 按只读保障分四档跑（后三档都在隔离沙盒里）：
 
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|
@@ -204,7 +207,7 @@ codev/
 | **隔离沙盒（旗标弱）** | opencode | 沙盒 + `--agent plan`（`edit` 禁了但 `bash` 没禁，可绕过）+ 提示词边界 | 同上 |
 | **隔离沙盒（仅沙盒兜底）** | reasonix | 只有沙盒 + 提示词边界——它**没有**可用的只读旗标（`--permission-mode plan` 非交互下报错退出） | 同上 |
 
-第二档的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
+沙盒里的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
 并已排除常见密钥文件：`.env` / `*.env` / `.env.*` / `.envrc`、`*.pem` / `*.key` / `*.p12` / `*.pfx`、
 `id_rsa*` / `id_dsa*` / `id_ecdsa*` / `id_ed25519*`、`*.keystore` / `*.jks`、`.netrc` / `.npmrc`、
 `*credentials*`（仅数据格式与无扩展名，见下）、`*.tfvars` / `*.tfstate*`。第一轮按**文件名**（basename）
@@ -228,8 +231,8 @@ codev/
 让 Claude 用 `CODEV_SANDBOX_MODE=text` 退回"只喂提示词文本"（代价：那四个 agent 重新变瞎；对 codex/gemini 无效，
 它们要靠 `--agents` 排除）。
 
-副本超过 100MB（`CODEV_MAX_COPY_KB`）或当前不是 git 仓库时，会自动退回空目录模式，
-启动行 `▶` 会标出实际用的是哪种。副本体积闸门默认 100MB（`CODEV_MAX_COPY_KB`，上限 1GB），超过退回只喂文本。
+副本超过体积闸门（`CODEV_MAX_COPY_KB`，默认 100MB、上限 1GB）或当前不是 git 仓库时，会自动退回空目录模式，
+启动行 `▶` 会标出实际用的是哪种。
 
 **每个 agent 拿到的是独立副本**：每个（仓库 + 工作区内容）签名只铺一份"母本"（改了代码再评自动换新母本），各 agent 从母本 `cp -c`
 （APFS 写时复制）clone 一份自己的。所以它们互不干扰——某个 agent 就算绕过只读权限改了文件，
