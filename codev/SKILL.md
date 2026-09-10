@@ -54,6 +54,12 @@ allowed-tools:
 - `references/agents.md` — 每个 agent 的精确调用命令、探测/鉴权、超时、只读策略、失败处理。
 - `references/prompts.md` — 发给外部 agent 的提示词模板（含文件系统边界）。
 - `references/synthesis.md` — 跨模型综合、一致性矩阵、PASS/FAIL 门禁规则。
+- `references/changelog.md` — 发生文件修改时调用 `prowler-changelog`、选择日志路径、逐项记录实际变更；只读评审不新增变更条目。
+
+**变更记录**：修改 codev 自身，或 codev 流程中修改 spec / 计划 / 代码时，由编排器按
+`references/changelog.md` 调用 `prowler-changelog`。每项实际逻辑变更都要有记录（含 G1 修正、外审回流及后续补修），
+提交时显式包含对应日志文件；日志写清已验证 / 待验证，不能把记录完成当成修复验收通过。完整历史保留在 changelog，
+不再追加到 spec 状态行，也不把整份历史默认塞给评审 agent。
 
 ---
 
@@ -487,7 +493,8 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
 5. 运行时显示（D）→ 忠实呈现（E）→ **事实核查回填 + P1 亲验** → 综合（F）+ **PASS/FAIL 门禁**。
 6. 「Claude vs 外部 agent」对比与一致率（必做，数据来自 G2 的 `self`；本对话此前若还跑过 `/code-review`，把它的发现也并进 self 一侧）。
 7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
-   修复后的 commit 同样走 `codev_commit_round <文件列表> …`：首参是【空格分隔的具体文件路径】，多文件就都列出来。
+   修复后先按 `references/changelog.md` 记录每项实际变更，再走 `codev_commit_round <文件列表> …`：首参是
+   【空格分隔的具体文件路径】，包含修复文件和对应日志文件，多文件就都列出来。
    **不要给目录**——工作树里常有用户自己未提交的改动，给目录会把它们一起提交，函数为此直接拒收目录并返回 1。
    两个限制：① 按**整文件**提交（不是 hunk），目标文件里用户自己的未提交改动会一起进去，文件有部分暂存时函数拒收；
    ② 路径**不能含空格/制表符**（首参按空白拆分），这种文件先重命名或手动 `git add`/`git commit`。
@@ -525,8 +532,9 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
    记录本轮 **已核实 P1 数**，写进综合结尾（供 §6 收敛判据用）。
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
-   全文 grep 同步**，版本号 +0.1；然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的
-   `.superpowers/codev/`，不进 git）+ `codev_commit_round "$DOC" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
+   全文 grep 同步**，版本号 +0.1；按 `references/changelog.md` 更新 `CHANGELOG`（实际选定的日志路径），
+   然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的 `.superpowers/codev/`，不进 git）+
+   `codev_commit_round "$DOC $CHANGELOG" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
    "Co-Authored-By: …"`（**只提交显式列出的文件**、按整文件提交，工作树里用户的其它改动不碰；路径不能含空格；trailer 由库写）。
    非 `--auto` → 问用户是否开下一轮；`--auto` → 按 synthesis.md §6.3 判停/续。
 
