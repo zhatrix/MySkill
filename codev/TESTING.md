@@ -14,7 +14,8 @@ zsh  tests/test-lib.sh   # 本机默认 shell 是 zsh，两边都要绿
 末行 `pass=N fail=0` 即通过。覆盖：七类翻牌（含 qoderclicn 额度写 stdout、codex 错误在 1MB stderr 尾部、
 codebuddy 429 重置时间、Max turns、context canceled、空输出、部分输出+截断警告）、`CODEV_TIMEOUT` 生效与非法值、
 账本 12 列与 probe 摘要、tokens/成本解析（含 JSON 同名键重复）、模型识别、发现台账与 `codev_stats`、
-意见与判断记录（`codev_opinion_add` 三个枚举列校验 + `codev_opinions` 的四种一致性结论、缺席不当同意、组内顺序）、
+意见与判断记录（`codev_opinion_add` 三个枚举列校验 + `codev_opinions` 的四种一致性结论、缺席不当同意、组内顺序、
+按追加顺序改判、仓库/对象/轮次/task 隔离与范围筛选、新 13 列及旧 12 列兼容、P1 级别分歧、缺失修法与补齐后重判）、
 `codev_commit_round`（隔离脏文件、拒收目录、trailer、找回上一轮 commit）、`codev_archive`（归档 + git 忽略，
 含 worktree 场景）、probe 空台账返回 0、cost/tokens 遇 null 不串号、账本兼容旧 7 列、`codev_commit_round` 多文件
 （zsh 不拆词）、短结论含 401/rate limit 不误判、rc=137 判 timeout、母本签名随脏文件内容变、母本过滤只挡文件不挡目录

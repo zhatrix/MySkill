@@ -468,6 +468,7 @@ case "$r" in *"✔"*"tokens 10"*) ok "codev_report 内解包→分类→计量�
 
 echo "23. 意见与判断记录：codev_opinion_add 逐条留痕，codev_opinions 按问题回放并判定判断组是否一致"
 export CODEV_OPINIONS="$CODEV_DIR/opinions.tsv"
+unset CODEV_TASK_ID  # 不继承调用者的任务身份
 codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 评审 r2-codex-01 提出 P1 "绑定 CHANGELOG" "SKILL.md:537"
 codev_opinion_add ntms spec-a 2 claude opus-5 判断 r2-codex-01 采纳 P1 "绑定 CHANGELOG" "已复现空变量被丢弃"
 codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-codex-01 采纳 P1 "绑定 CHANGELOG" -
@@ -478,7 +479,7 @@ codev_opinion_add ntms spec-a 2 claude opus-5 判断 r2-drop-01 驳回 - "无需
 codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-drop-01 驳回 - "无需修改" -
 codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-miss-01 未返回 P1 - "超时"
 n=$(wc -l < "$CODEV_OPINIONS" | tr -d ' '); [ "$n" = 9 ] && ok "9 行" || bad "行数 $n" "$(cat "$CODEV_OPINIONS")"
-awk -F'\t' 'NF!=12{bad=1} END{exit bad}' "$CODEV_OPINIONS" && ok "每行 12 列（制表符已转义）" || bad "列数不齐" "$(awk -F'\t' '{print NF}' "$CODEV_OPINIONS")"
+awk -F'\t' 'NF!=13 || $13==""{bad=1} END{exit bad}' "$CODEV_OPINIONS" && ok "每行 13 列（含 task，制表符已转义）" || bad "列数不齐" "$(awk -F'\t' '{print NF}' "$CODEV_OPINIONS")"
 r=$(codev_opinions)
 # 一致/分歧的四种结论必须分得开——只执行一致意见（spec §3.4）全靠这一判断，判错就会执行没达成一致的修法
 case "$r" in *"r2-codex-01"*"一致采纳同一修法"*) ok "同修法同采纳 → 可进执行清单";; *) bad "一致采纳未判出" "$r";; esac
@@ -501,6 +502,75 @@ codev_opinion_add a b 1 c d 判断 i 采纳 P1 未加引号的 修法 n 2>/dev/n
 ( CODEV_OPINIONS="$OCK"; codev_opinion_add a b 1 c d 判断 i 采纳 P1 "合法" - ) 2>/dev/null \
   && [ "$(wc -l < "$OCK" | tr -d ' ')" = 1 ] && ok "合法枚举照常写入" || bad "合法枚举被误拒"
 rm -f "$OCK"
+
+echo "24. 回放回归：追加改判、范围隔离、P1 级别分歧与缺失修法"
+# 固定同一分钟，并让最后改判的时间更早，确保计票既不按字典序也不按时间排序。
+export CODEV_OPINIONS="$CODEV_DIR/opinion-regression.tsv"
+printf '%s\n' \
+  '2026-09-11T12:01|repo-a|spec-a|1|claude|old|判断|changed|未返回|P1|-|首次缺席|task-a' \
+  '2026-09-11T12:01|repo-a|spec-a|1|codex|m|判断|changed|采纳|P2|修法甲|-|task-a' \
+  '2026-09-11T12:00|repo-a|spec-a|1|claude|new|判断|changed|采纳|P2|修法甲|补证后改判|task-a' \
+  '2026-09-11T12:00|repo-a|spec-a|1|claude|new|评审|changed|提出|P1|修法乙|不同角色不覆盖判断|task-a' \
+  | tr '|' '\t' > "$CODEV_OPINIONS"
+r=$(codev_opinions changed)
+case "$r" in *"可进执行清单"*) ok "最后追加立场覆盖旧票，模型变化不增加判断主体";; *) bad "改判仍未一致" "$r";; esac
+case "$r" in *"首次缺席"*"补证后改判"*) ok "同角色完整历史保留追加顺序";; *) bad "历史丢失或排序错误" "$r";; esac
+case "$r" in *"⚠️ 涉及 P1"*) bad "旧判断或其它角色的 P1 污染当前判断" "$r";; *) ok "P1 级别只取有效判断";; esac
+CODEV_TASK_ID=task-a codev_opinion_add repo-a spec-a 1 claude m 判断 changed 驳回 P2 无需修改 再次改判
+r=$(codev_opinions changed)
+case "$r" in *"可进执行清单"*) bad "最后改为驳回仍可执行" "$r";; *"未达成一致"*) ok "采纳改为驳回后恢复分歧";; *) bad "改判丢失" "$r";; esac
+
+# 交错写入相同编号，逐一改变仓库、对象、轮次、任务；每组应独立形成结论。
+CODEV_TASK_ID=task-a codev_opinion_add repo-a spec-a 1 claude m 判断 shared 采纳 P2 修法甲 base
+CODEV_TASK_ID=task-a codev_opinion_add repo-b spec-a 1 claude m 判断 shared 驳回 P2 无需修改 repo
+CODEV_TASK_ID=task-a codev_opinion_add repo-a spec-b 1 claude m 判断 shared 驳回 P2 无需修改 doc
+CODEV_TASK_ID=task-a codev_opinion_add repo-a spec-a 2 claude m 判断 shared 驳回 P2 无需修改 round
+CODEV_TASK_ID=task-b codev_opinion_add repo-a spec-a 1 claude m 判断 shared 驳回 P2 无需修改 task
+CODEV_TASK_ID=task-a codev_opinion_add repo-a spec-a 1 codex m 判断 shared 采纳 P2 修法甲 base-again
+r=$(codev_opinions shared)
+n=$(printf '%s\n' "$r" | awk '/^shared  /{n++} END{print n+0}')
+[ "$n" = 5 ] && ok "同名编号按仓库/对象/轮次/任务分为五组" || bad "范围混组: $n" "$r"
+n=$(printf '%s\n' "$r" | awk '/一致驳回/{n++} END{print n+0}')
+case "$r" in *"未达成一致"*) bad "无关任务污染一致判断" "$r";; *"可进执行清单"*) [ "$n" = 4 ] && ok "交错记录分别采纳一组、驳回四组" || bad "分组结论错误" "$r";; *) bad "采纳组丢失" "$r";; esac
+r=$(codev_opinions shared repo-a spec-a 1 task-a)
+case "$r" in *"一致驳回"*) bad "范围过滤漏入其它组" "$r";; *"可进执行清单"*) ok "五维筛选仅回放指定任务问题";; *) bad "范围筛选错误" "$r";; esac
+case "$(codev_opinions '' repo-b)" in *"repo=repo-a"*) bad "空 issue 的仓库过滤失效";; *"repo=repo-b"*) ok "空参数支持仅按仓库筛选";; *) bad "仓库筛选丢记录";; esac
+
+# 旧 12 列记录保留可读，并与新 task 隔离；缺失身份不能伪装成已知任务。
+printf '%s\n' '2026-09-11T12:00|repo-a|spec-a|1|claude|m|判断|shared|驳回|P2|无需修改|legacy' | tr '|' '\t' >> "$CODEV_OPINIONS"
+r=$(codev_opinions shared repo-a spec-a 1)
+case "$r" in *"旧记录缺少 task ID"*) ok "旧 12 列记录可读并提示身份限制";; *) bad "旧记录消失或无提示" "$r";; esac
+awk -F'\t' 'NF==12' "$CODEV_OPINIONS" > "$CODEV_DIR/legacy-only.tsv"
+r=$(CODEV_OPINIONS="$CODEV_DIR/legacy-only.tsv" codev_opinions shared)
+case "$r" in *"→ 判断组一致驳回：关闭该项"*) bad "旧记录身份不明仍声明关闭" "$r";; *"旧记录仅供回顾"*) ok "旧记录未确认任务归属不声明执行或关闭";; *) bad "旧记录缺少保守结论" "$r";; esac
+case "$(codev_opinions shared repo-a spec-a 1 task-a)" in *legacy*) bad "旧记录污染已知任务";; *"可进执行清单"*) ok "旧记录不混入已知任务";; *) bad "已知任务丢失";; esac
+
+codev_opinion_add repo-a spec-a 1 claude m 判断 level 采纳 P1 修法甲 -
+codev_opinion_add repo-a spec-a 1 codex m 判断 level 采纳 P2 修法甲 -
+r=$(codev_opinions level)
+case "$r" in *"可进执行清单"*) bad "P1/P2 同修法被放行" "$r";; *"严重级别分歧"*"⚠️ 涉及 P1"*) ok "同修法的 P1/P2 分歧仍阻塞";; *) bad "级别分歧无阻塞提示" "$r";; esac
+codev_opinion_add repo-a spec-a 1 codex m 判断 level 采纳 P1 修法甲 澄清
+r=$(codev_opinions level)
+case "$r" in *"严重级别分歧"*) bad "旧级别分歧未解除" "$r";; *"可进执行清单"*) ok "级别澄清后使用最新判断";; *) bad "级别澄清未生效" "$r";; esac
+codev_opinion_add repo-a spec-a 1 codex m 判断 level 采纳 - 修法甲 级别待定
+r=$(codev_opinions level)
+case "$r" in *"可进执行清单"*) bad "未知级别绕过 P1 分歧" "$r";; *"⚠️ 涉及 P1"*) ok "P1 与未知级别也保留阻塞";; *) bad "未知级别无阻塞提示" "$r";; esac
+
+for fix in '-' '' '   ' '同意' '待补充' 'TBD'; do
+  codev_opinion_add repo-a spec-a 1 claude m 判断 missing 采纳 P1 "$fix" -
+  r=$(codev_opinions missing)
+  case "$r" in *"可进执行清单"*) bad "单主体占位修法被放行: [$fix]" "$r";; *"缺少具体修法"*) ok "单主体修法待补充: [$fix]";; *) bad "缺失修法未提示: [$fix]" "$r";; esac
+done
+codev_opinion_add repo-a spec-a 1 claude m 判断 missing 采纳 P1 - -
+codev_opinion_add repo-a spec-a 1 codex m 判断 missing 采纳 P1 - -
+r=$(codev_opinions missing)
+case "$r" in *"可进执行清单"*) bad "双主体占位修法被放行" "$r";; *"缺少具体修法"*) ok "双主体同占位符仍待补充";; *) bad "双主体缺修法未提示" "$r";; esac
+codev_opinion_add repo-a spec-a 1 claude m 判断 missing 采纳 P1 修法甲 -
+codev_opinion_add repo-a spec-a 1 codex m 判断 missing 采纳 P1 修法甲 -
+case "$(codev_opinions missing)" in *"可进执行清单"*) ok "双方补齐同修法后可执行";; *) bad "补齐修法仍不可执行";; esac
+codev_opinion_add repo-a spec-a 1 third m 判断 missing 采纳 P1 修法甲 -
+r=$(codev_opinions missing)
+case "$r" in *"可进执行清单"*) bad "三位判断者被放行" "$r";; *"判断主体超过两个"*) ok "计票仍遵守两位判断主体上限";; *) bad "未提示判断人数冲突" "$r";; esac
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"

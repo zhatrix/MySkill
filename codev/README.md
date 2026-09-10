@@ -62,7 +62,10 @@ brew install coreutils      # 提供 gtimeout
   "声称 P1 里亲验成立的比例"和"独家成立"数（这是选模型的依据，不是采纳条数）。
 - 意见与判断记录 `~/.local/state/codev/opinions.tsv`：每个 agent 对每个问题的**每一条立场**单独一行（谁提出、谁采纳、
   谁存疑、各自给的级别和修法）。`codev_opinions <问题编号>` 事后回放某条当时各方原话立场，并判出判断组是否达成一致；
-  不带参数放全部。跨会话累积，设 `CODEV_OPINIONS` 可改路径。
+  不带参数放全部；可用 `codev_opinions <问题编号> <仓库> <对象> <轮次> <task>` 精确筛选（空参数表示不过滤）。
+  记录按仓库/对象/轮次/task/问题隔离，历史全部展示，计票只取各判断主体最后追加的记录；P1 级别分歧或缺少具体修法不进入执行清单。
+  设 `CODEV_TASK_ID` 标识任务，跨会话恢复须沿用该值；未设置时取 `CODEV_DIR` 会话名。新记录追加 task 为第 13 列，旧 12 列仍可读并提示身份限制，补齐任务归属前仅供回顾，不据此执行或关闭问题。
+  跨会话累积，设 `CODEV_OPINIONS` 可改路径。
 - 每轮回流 commit 只提交文档 pathspec，trailer 带 `Codev-Round` / `Codev-Reviewed-By: codex(gpt-5.6-sol), …` /
   `Codev-Verified-P1: k (prev j)`，`git log --grep '^Codev-Round: 2'` 可直接查；评审原文归档到 gitignored 的
   `.superpowers/codev/<文档>/r<N>/`，不进仓库。
