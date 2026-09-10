@@ -60,6 +60,9 @@ brew install coreutils      # 提供 gtimeout
   `/codev` 探测时会给每个 agent 标"近期 3 次结果"，连续额度耗尽的 agent 不会被推荐。设 `CODEV_LEDGER` 可改路径。
 - 发现台账 `~/.local/state/codev/findings.tsv`：每条外部发现的裁决与亲验结果；`codev_stats` 看每个 agent/模型的
   "声称 P1 里亲验成立的比例"和"独家成立"数（这是选模型的依据，不是采纳条数）。
+- 意见与判断记录 `~/.local/state/codev/opinions.tsv`：每个 agent 对每个问题的**每一条立场**单独一行（谁提出、谁采纳、
+  谁存疑、各自给的级别和修法）。`codev_opinions <问题编号>` 事后回放某条当时各方原话立场，并判出判断组是否达成一致；
+  不带参数放全部。跨会话累积，设 `CODEV_OPINIONS` 可改路径。
 - 每轮回流 commit 只提交文档 pathspec，trailer 带 `Codev-Round` / `Codev-Reviewed-By: codex(gpt-5.6-sol), …` /
   `Codev-Verified-P1: k (prev j)`，`git log --grep '^Codev-Round: 2'` 可直接查；评审原文归档到 gitignored 的
   `.superpowers/codev/<文档>/r<N>/`，不进仓库。

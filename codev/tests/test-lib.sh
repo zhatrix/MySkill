@@ -466,6 +466,42 @@ printf '%s' '[{"type":"result","result":"# 结论\nPASS 无 P1","usage":{"input_
 r=$(codev_report uw2 0 "$CODEV_DIR/codev-err-uw2.txt" 2>&1)
 case "$r" in *"✔"*"tokens 10"*) ok "codev_report 内解包→分类→计量链路通";; *) bad "report 链路未拿到用量" "$r";; esac
 
+echo "23. 意见与判断记录：codev_opinion_add 逐条留痕，codev_opinions 按问题回放并判定判断组是否一致"
+export CODEV_OPINIONS="$CODEV_DIR/opinions.tsv"
+codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 评审 r2-codex-01 提出 P1 "绑定 CHANGELOG" "SKILL.md:537"
+codev_opinion_add ntms spec-a 2 claude opus-5 判断 r2-codex-01 采纳 P1 "绑定 CHANGELOG" "已复现空变量被丢弃"
+codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-codex-01 采纳 P1 "绑定 CHANGELOG" -
+codev_opinion_add ntms spec-a 2 gemini g3 评审 r2-gem-01 提出 P2 "含	制表符	的修法" -
+codev_opinion_add ntms spec-a 2 claude opus-5 判断 r2-gem-01 采纳 P2 "方案甲" -
+codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-gem-01 采纳 P2 "方案乙" -
+codev_opinion_add ntms spec-a 2 claude opus-5 判断 r2-drop-01 驳回 - "无需修改" "证据不成立"
+codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-drop-01 驳回 - "无需修改" -
+codev_opinion_add ntms spec-a 2 codex gpt-5.6-sol 判断 r2-miss-01 未返回 P1 - "超时"
+n=$(wc -l < "$CODEV_OPINIONS" | tr -d ' '); [ "$n" = 9 ] && ok "9 行" || bad "行数 $n" "$(cat "$CODEV_OPINIONS")"
+awk -F'\t' 'NF!=12{bad=1} END{exit bad}' "$CODEV_OPINIONS" && ok "每行 12 列（制表符已转义）" || bad "列数不齐" "$(awk -F'\t' '{print NF}' "$CODEV_OPINIONS")"
+r=$(codev_opinions)
+# 一致/分歧的四种结论必须分得开——只执行一致意见（spec §3.4）全靠这一判断，判错就会执行没达成一致的修法
+case "$r" in *"r2-codex-01"*"一致采纳同一修法"*) ok "同修法同采纳 → 可进执行清单";; *) bad "一致采纳未判出" "$r";; esac
+case "$r" in *"修法不同"*disputed*) ok "均采纳但修法不同 → disputed";; *) bad "修法分歧未判出" "$r";; esac
+case "$r" in *"r2-drop-01"*"一致驳回"*) ok "一致驳回 → 关闭";; *) bad "一致驳回未判出" "$r";; esac
+# 缺席不等于同意：codev_ledger 那边"超时被当成功"的老账已经付过学费，判断票这里更不能重演
+case "$r" in *"未返回"*"未达成一致"*) ok "未返回不算同意";; *) bad "未返回被当成一致" "$r";; esac
+case "$r" in *"⚠️ 涉及 P1"*) ok "P1 分歧带阻塞提醒";; *) bad "P1 分歧无提醒" "$r";; esac
+# 组内顺序：时间戳只到分钟，同轮记录全并列，靠 sort 会把裁决排到提出前面，回放读起来是倒的
+case "$r" in *"评审 codex"*"判断 claude"*) ok "组内按 评审→判断 排";; *) bad "组内顺序倒了" "$r";; esac
+r=$(codev_opinions r2-codex-01)
+case "$r" in *r2-gem-01*) bad "按问题过滤失效" "$r";; *r2-codex-01*) ok "按问题过滤";; *) bad "过滤后没内容" "$r";; esac
+case "$(codev_opinions nosuch)" in *"没有匹配的记录"*) ok "无匹配有明确提示";; *) bad "无匹配未提示";; esac
+case "$(CODEV_OPINIONS="$CODEV_DIR/none.tsv" codev_opinions)" in *"意见记录为空"*) ok "空记录不报错";; *) bad "空记录处理错";; esac
+OCK="$CODEV_DIR/ochk.tsv"
+codev_opinion_add a b 1 c d 巡视 i 提出 P1 f n 2>/dev/null && bad "非法 role 未被拒" || ok "opinion_add 拒收非法 role"
+codev_opinion_add a b 1 c d 判断 i adopted P1 f n 2>/dev/null && bad "英文 stance 未被拒" || ok "opinion_add 拒收英文 stance"
+codev_opinion_add a b 1 c d 判断 i 采纳 P0 f n 2>/dev/null && bad "非法 severity 未被拒" || ok "opinion_add 拒收非法 severity"
+codev_opinion_add a b 1 c d 判断 i 采纳 P1 未加引号的 修法 n 2>/dev/null && bad "多余实参未被拒" || ok "opinion_add 拒收未加引号的修法"
+( CODEV_OPINIONS="$OCK"; codev_opinion_add a b 1 c d 判断 i 采纳 P1 "合法" - ) 2>/dev/null \
+  && [ "$(wc -l < "$OCK" | tr -d ' ')" = 1 ] && ok "合法枚举照常写入" || bad "合法枚举被误拒"
+rm -f "$OCK"
+
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

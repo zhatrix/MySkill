@@ -80,6 +80,11 @@ CODEV_LEDGER="${CODEV_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/ledger
 # 发现台账：每条外部 agent 的发现一行（含 Claude 裁决与亲验结果），codev_stats 据此算每个 agent/模型的
 # "声称 P1 里经亲验成立的比例"与"独家且成立"数——这才是选模型的依据，不是采纳条数（条数奖励产出多而泛的 agent）。
 CODEV_FINDINGS="${CODEV_FINDINGS:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/findings.tsv}"
+# 意见与判断记录：每个 agent 对每个问题的【一条立场】一行（评审提出、判断裁决、自审复核各自成行）。
+# 与发现台账的分工：findings.tsv 一条发现只有一行、只装 Claude 的最终裁决；协议 v2 允许多位判断者，
+# "谁提出、谁采纳、谁存疑、各自给的级别和修法"在那里根本存不下，事后回看只剩一个合成结论。
+# opinions.tsv 保留每位主体的原始立场，codev_opinions 按问题回放，并据此判断组是否真的达成一致。
+CODEV_OPINIONS="${CODEV_OPINIONS:-${XDG_STATE_HOME:-$HOME/.local/state}/codev/opinions.tsv}"
 
 # codev_run <cmd...> — 超时封装。取代 `$TP <cmd>` 变量前缀：
 # zsh 不对无引号变量做词拆分，`$TP cmd`（TP="/path/timeout 600"）会被当成名为
@@ -340,6 +345,73 @@ codev_stats() {
       if ($10=="采纳") a[k]++
     }
     END { for (k in n) { split(k, kk, "\t"); printf "  %-10s %-18s P1 %d/%d  独家成立 %d  总 %d  采纳 %d\n", kk[1], kk[2], ok[k]+0, p1[k]+0, u[k]+0, n[k], a[k]+0 } }' "$CODEV_FINDINGS" | sort
+}
+
+# codev_opinion_add <repo> <doc> <round> <agent> <model> <role> <issue> <stance> <severity> <fix> <note>
+# 意见与判断记录追加一行（12 列：时间 + 11 个入参；入参里的制表符/换行会被替换成空格）。
+#   role:     评审（提出问题）/ 判断（对某问题裁决）/ 自审（self review 阶段的发现）/ 复核（补修后定向复核）
+#   issue:    稳定问题 ID 或发现编号（r<轮次>-<agent>-<序号>）；同一问题的多方立场靠它串起来
+#   stance:   提出 / 采纳 / 驳回 / 存疑 / 未返回（未返回是显式记录缺席，不能当同意——见 spec §3.4）
+#   severity: P1/P2/P3/-（各主体可以给不同级别，差异本身要留痕，不能取低值绕门禁）
+#   fix:      该主体选定的具体修法（判断组是否"同意相同修法"就靠比这一列）；没有写 -
+#   note:     证据、快照 ID 或原话摘要
+# 一个 agent 对一个问题可以有多行（先提出、后裁决），但同一 (agent, issue, role) 只记最终立场；
+# 改主意就追加一行并在 note 里写明改判依据，不覆盖旧行。
+codev_opinion_add() {
+  # 与 codev_finding_add 同理必须是 -eq：-ge 会放过没加引号的多词修法，写出 12 列以外的坏行。
+  [ $# -eq 11 ] || { echo "用法: codev_opinion_add repo doc round agent model role issue stance severity fix note（11 个实参，修法和备注记得加引号）" >&2; return 1; }
+  case "$6"  in 评审|判断|自审|复核) ;; *) echo "codev_opinion_add: 第 6 个实参（role）须为 评审/判断/自审/复核，收到「$6」" >&2; return 1;; esac
+  case "$8"  in 提出|采纳|驳回|存疑|未返回) ;; *) echo "codev_opinion_add: 第 8 个实参（stance）须为 提出/采纳/驳回/存疑/未返回，收到「$8」" >&2; return 1;; esac
+  case "$9"  in P1|P2|P3|-) ;; *) echo "codev_opinion_add: 第 9 个实参（severity）须为 P1/P2/P3/-，收到「$9」" >&2; return 1;; esac
+  local d f
+  d=$(dirname "$CODEV_OPINIONS"); mkdir -p "$d" 2>/dev/null || return 1
+  printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_OPINIONS"
+  for f in "$@"; do printf '\t%s' "$(printf '%s' "$f" | tr '\t\n' '  ')" >> "$CODEV_OPINIONS"; done
+  printf '\n' >> "$CODEV_OPINIONS"
+}
+
+# codev_opinions [issue] — 按问题回放每位 agent 的意见与判断，并给出判断组的一致性结论。
+# 不传 issue 就放全部。这是"事后回顾"的入口：codev_stats 回答"哪个模型准"，它回答"这条当时谁怎么说的"。
+codev_opinions() {
+  local want="${1:-}" tab
+  [ -s "$CODEV_OPINIONS" ] || { echo "（意见记录为空：${CODEV_OPINIONS}）"; return 0; }
+  tab=$(printf '\t')
+  echo "意见与判断记录（${CODEV_OPINIONS}）${want:+，问题=$want}："
+  # 先按 问题 ID + 时间 排序，awk 才能靠"字段变了"分组（不用数组，省掉 delete arr 的可移植性问题）。
+  # LC_ALL=C 必须：macOS 自带 awk 在 UTF-8 locale 下中文相等比较会判错（见 codev_stats 的注释）。
+  LC_ALL=C sort -t "$tab" -k8,8 -k1,1 "$CODEV_OPINIONS" 2>/dev/null | LC_ALL=C awk -F'\t' -v want="$want" '
+    function flush(   v) {
+      # 用 started 而不是 cur != "" 判"有没有攒着一组"：坏行的问题 ID 可能是空串，那时 cur=="" 恒成立，
+      # flush 会提前 return 而【不清空缓冲】，这一组的行就漏进下一组的回放里，读起来像是别人也提了这条。
+      if (!started) return
+      # 组内按【评审 → 自审 → 判断 → 复核】排，而不是靠 sort：时间戳只到分钟，同一轮里几乎全是并列，
+      # 排序会退化成整行字节比较，把裁决排到提出前面，回放时读起来是倒的。
+      printf "%s\n%s%s%s%s", head, b_r, b_s, b_j, b_c
+      if (nj == 0)            v = "→ 判断组尚无记录（目前只有评审/自审意见）"
+      else if (reject == nj)  v = "→ 判断组一致驳回：关闭该项，保留驳回依据"
+      else if (adopt == nj && uniqfix <= 1) v = "→ 判断组一致采纳同一修法：可进执行清单"
+      else if (adopt == nj)   v = "→ 均认为缺陷成立但修法不同：缺陷 open、修法 disputed，不执行任意一方"
+      else                    v = "→ 判断组未达成一致（" stances "）：只执行明确一致且可独立执行的部分"
+      printf "  %s\n", v
+      if (p1seen && v ~ /未达成一致|disputed/) printf "  %s\n", "⚠️ 涉及 P1：澄清前按潜在阻塞项保留，不得取较低级别放行"
+      printf "\n"
+      cur=""; started=0; b_r=""; b_s=""; b_j=""; b_c=""; nj=0; adopt=0; reject=0; uniqfix=0; lastfix=""; stances=""; p1seen=0
+    }
+    (want == "" || $8 == want) {
+      if (!started || $8 != cur) { flush(); cur = $8; started = 1; head = sprintf("%s  [%s r%s]", ($8 == "" ? "(缺问题 ID)" : $8), $3, $4); hit++ }
+      # 不用 %-Ns 对齐中文列：awk 按字节算宽度，"评审"占 6 字节反而把版面撑歪。
+      line = "  " $7 " " $5 "(" $6 ")  " $9 "  " $10 "  修法: " $11 ($12 == "-" || $12 == "" ? "" : "  ｜ " $12) "\n"
+      if ($7 == "评审") b_r = b_r line; else if ($7 == "自审") b_s = b_s line; else if ($7 == "判断") b_j = b_j line; else b_c = b_c line
+      if ($10 == "P1") p1seen = 1
+      if ($7 == "判断") {
+        nj++
+        if ($9 == "采纳") { adopt++; if (uniqfix == 0) { uniqfix = 1; lastfix = $11 } else if ($11 != lastfix) { uniqfix = 2; lastfix = $11 } }
+        if ($9 == "驳回") reject++
+        stances = (stances == "" ? $9 : stances "/" $9)
+      }
+    }
+    END { flush(); if (hit == 0) print "  （没有匹配的记录）" }'
+  return 0
 }
 
 # codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
@@ -942,5 +1014,6 @@ codev_probe() {
   echo "timeout -> ${CODEV_TO:-MISSING}（CODEV_TIMEOUT=${CODEV_TIMEOUT}s）"
   [ -s "$CODEV_LEDGER" ] && echo "账本 -> ${CODEV_LEDGER}（近期类别：ok/quota/auth/turns/timeout/empty/error；连续 quota 的 agent 别放进推荐组合）"
   [ -s "$CODEV_FINDINGS" ] && echo "发现台账 -> ${CODEV_FINDINGS}（codev_stats 看每个 agent/模型的 P1 亲验成立率）"
-  return 0   # 上面两行是可选提示，没有台账文件时它的假值不能变成 probe 的失败状态
+  [ -s "$CODEV_OPINIONS" ] && echo "意见记录 -> ${CODEV_OPINIONS}（codev_opinions [问题ID] 回放某条当时谁怎么说、判断组是否一致）"
+  return 0   # 上面三行是可选提示，没有台账文件时它的假值不能变成 probe 的失败状态
 }

@@ -87,6 +87,13 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
 - **发现台账**（`~/.local/state/codev/findings.tsv`，Claude 在综合后用 `codev_finding_add` 逐条记）：
   `codev_stats` 给每个 agent/模型的"声称 P1 里亲验成立的比例"和"独家且成立"数。样本少于 20 条时只当参考，
   不据此改推荐组合；累积够了在 A1 的选项描述里附一句"近 N 条 P1 成立率 x/y"。
+- **意见与判断记录**（`~/.local/state/codev/opinions.tsv`，综合时用 `codev_opinion_add` 逐条记）：
+  发现台账一条发现只有一行、只装 Claude 的最终裁决，**"谁提出、谁采纳、谁存疑、各自给的级别和修法"存不下**，
+  事后回看只剩一个合成结论。意见记录按 `<repo> <doc> <轮次> <agent> <模型> <role> <问题ID> <立场> <级别> <修法> <备注>`
+  一个主体一条立场一行（role = 评审/判断/自审/复核，立场 = 提出/采纳/驳回/存疑/未返回）。
+  `codev_opinions [问题ID]` 按问题回放全部原话立场，并直接判出判断组是**一致采纳同一修法 / 一致驳回 /
+  均采纳但修法不同（disputed）/ 未达成一致**——这正是"只执行一致意见"的依据。**缺席显式记 `未返回`，
+  不留空**：空行会在回放里消失，变成"没人反对"。
 - **超时**：`CODEV_TIMEOUT` 默认 600s，只是兜底卡死进程的安全网。**核实型任务（要求 agent 进仓库逐条核实、
   或文档 > 20KB）在发起后台调用前 `export CODEV_TIMEOUT=1200`**（每个后台调用自包含，须在各自命令里设）。
 
@@ -310,7 +317,10 @@ codev_bg_native codex codex review "$(cat "$PROMPT")" -c 'model_reasoning_effort
 - **分工模式**：按**关注面拼合**各 agent 结论（不做一致性矩阵，因无重叠），某块只有一个模型看过要
   标注"置信有限、无交叉验证"；
 - **先给每条发现编号** `r<轮次>-<agent>-<两位序号>`（如 `r2-codex-03`），矩阵、裁决、回归核对、已驳回清单全部引用编号
-  （synthesis.md 0.4）；综合完成后逐条 `codev_finding_add` 记入发现台账；
+  （synthesis.md 0.4）；综合完成后逐条 `codev_finding_add` 记入发现台账，**同一编号再用 `codev_opinion_add`
+  把各方立场分别记进意见记录**：每个提出它的 agent 一行（role `评审`，立场 `提出`）、每个判断主体一行
+  （role `判断`，立场 采纳/驳回/存疑；没回答该条的记 `未返回`），修法列写各自选定的具体修法——
+  判断组"是否同意相同修法"事后全靠比这一列，`codev_opinions <编号>` 才能回放出当时的分歧；
 - **P1 采纳前必须 Claude 亲验前提**（synthesis.md 0.6，**不分 A/B 栏**）：agent 标"已查证"的也翻过车
   （枚举存在≠路径可达、"同构"未看触发时序、grep 失败被说成"不存在"）；agent 之间矛盾**以代码为准**；
 - review 模式额外给 **PASS / FAIL 门禁**（出现**已亲验成立**的 P1/critical 即 FAIL）；
@@ -492,7 +502,8 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
      subagent——不是 codex 那份 gstack 指令。
 5. 运行时显示（D）→ 忠实呈现（E）→ **事实核查回填 + P1 亲验** → 综合（F）+ **PASS/FAIL 门禁**。
 6. 「Claude vs 外部 agent」对比与一致率（必做，数据来自 G2 的 `self`；本对话此前若还跑过 `/code-review`，把它的发现也并进 self 一侧）。
-7. 综合后 `codev_finding_add` 逐条记发现台账；询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
+7. 综合后 `codev_finding_add` 逐条记发现台账 + `codev_opinion_add` 逐个主体记意见与判断（通用机制 F）；
+   询问用户是否让 Claude 修复被确认的问题（修复由 Claude 做）。
    修复后先按 `references/changelog.md` 记录每项实际变更，再走 `codev_commit_round <文件列表> …`：首参是
    【空格分隔的具体文件路径】，包含修复文件和对应日志文件，多文件就都列出来。
    **不要给目录**——工作树里常有用户自己未提交的改动，给目录会把它们一起提交，函数为此直接拒收目录并返回 1。
@@ -506,6 +517,10 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
 
 1. 定位文档：`DOC=<路径>`，`git ls-files --error-unmatch "$DOC"` 或未被忽略的 untracked → **在工作区内**，
    走路径引用；否则（仓库外 / 被 ignore）才内联全文。`wc -c "$DOC"` 与 `grep -n '^#' "$DOC"` 拿体积与章节目录。
+   **同时按 `references/changelog.md` 的适配规则定下日志路径并绑上 `CHANGELOG=<日志路径>`**（codev 自身改
+   `codev/CHANGELOG.md`，spec/计划默认 `<原文件主名>.changelog.md`）——第 6 步的 `codev_commit_round "$DOC $CHANGELOG"`
+   要用它，而**没绑定时它展开成空串会被静默吞掉**：函数按空白拆首参、空 token 直接丢弃，于是只提交了文档、
+   照样打印「✔ 已提交第 N 轮回流」，日志改动留在工作区，下一轮被卷进无关提交或撞上部分暂存拒收。
    **例外：沙盒没有 `./repo` 时必须内联**——`CODEV_SANDBOX_MODE=text`、仓库超体积闸门、非 git 仓库都会让
    `codev_bg_sandboxed` 自动退回空目录模式（▶ 行标"隔离空目录"），此时路径引用等于什么都没给，agent 只能
    输出"无法验证"。发起前先判（母本是发起时才懒铺的，不能只看目录在不在，要真的铺一次）：
@@ -532,10 +547,12 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
    记录本轮 **已核实 P1 数**，写进综合结尾（供 §6 收敛判据用）。
 6. 回流：Claude 把采纳项改进文档（受伤段落整段重写，不做补丁式 string-replace 堆叠），**对每个改过的概念
-   全文 grep 同步**，版本号 +0.1；按 `references/changelog.md` 更新 `CHANGELOG`（实际选定的日志路径），
+   全文 grep 同步**，版本号 +0.1；按 `references/changelog.md` 更新第 1 步定下的 `$CHANGELOG`，
    然后 `codev_archive <文档 slug> N`（原文归档到 gitignored 的 `.superpowers/codev/`，不进 git）+
    `codev_commit_round "$DOC $CHANGELOG" N "<agent>(<模型>), …" <本轮已核实 P1> <上轮 P1> "<摘要>"
    "Co-Authored-By: …"`（**只提交显式列出的文件**、按整文件提交，工作树里用户的其它改动不碰；路径不能含空格；trailer 由库写）。
+   **发出前先 `[ -n "$DOC" ] && [ -n "$CHANGELOG" ] || echo 变量没绑`**，提交后照 `暂存:` 那几行核对
+   文档和日志**两个文件都在**——少一个就是变量为空被静默丢了（见第 1 步），当场补提交，别等下一轮。
    非 `--auto` → 问用户是否开下一轮；`--auto` → 按 synthesis.md §6.3 判停/续。
 
 ## Step 2C — challenge（对抗式挑战）
@@ -565,6 +582,9 @@ brainstorm（2A）→ 用户拍板 → Claude 按方案与 CLAUDE.md 规范编�
 
 简短小结：跑了哪些模式、调用了哪些 agent（含被判无效的类别）、跨模型综合的关键结论、门禁结果、
 本轮已核实 P1 数（多轮时给趋势）、遗留项。不要复述外部 agent 的原文（上面已逐字呈现过）。
+小结里告诉用户**事后怎么回看**：`codev_opinions <问题ID>` 放某条当时各方的原始立场与判断组一致性，
+`codev_opinions` 不带参数放全部，`codev_stats` 看各 agent/模型的 P1 亲验成立率——两个文件都在
+`~/.local/state/codev/` 下跨会话累积，**不随会话目录被清掉**（会话目录里只有原文，靠 `codev_archive` 归档）。
 然后收尾——和后台调用一样，这是一次新的 Bash 调用，`CODEV_DIR` 不会自动带过来，必须写 Step 0 打印的字面路径：
 `CODEV_DIR=<会话目录>; chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"`（母本 a-w，先恢复写权限；每个签名的
 母本最大 1GB，不清就堆到 24 小时 GC；变量为空时 `rm -rf ""` 静默什么都不删）。用户要留输出就告知路径、不删——

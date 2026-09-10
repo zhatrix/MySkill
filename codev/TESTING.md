@@ -14,6 +14,7 @@ zsh  tests/test-lib.sh   # 本机默认 shell 是 zsh，两边都要绿
 末行 `pass=N fail=0` 即通过。覆盖：七类翻牌（含 qoderclicn 额度写 stdout、codex 错误在 1MB stderr 尾部、
 codebuddy 429 重置时间、Max turns、context canceled、空输出、部分输出+截断警告）、`CODEV_TIMEOUT` 生效与非法值、
 账本 12 列与 probe 摘要、tokens/成本解析（含 JSON 同名键重复）、模型识别、发现台账与 `codev_stats`、
+意见与判断记录（`codev_opinion_add` 三个枚举列校验 + `codev_opinions` 的四种一致性结论、缺席不当同意、组内顺序）、
 `codev_commit_round`（隔离脏文件、拒收目录、trailer、找回上一轮 commit）、`codev_archive`（归档 + git 忽略，
 含 worktree 场景）、probe 空台账返回 0、cost/tokens 遇 null 不串号、账本兼容旧 7 列、`codev_commit_round` 多文件
 （zsh 不拆词）、短结论含 401/rate limit 不误判、rc=137 判 timeout、母本签名随脏文件内容变、母本过滤只挡文件不挡目录
@@ -62,6 +63,8 @@ tests/microtest/score.sh <out_root>/<label>-*                                   
 - [ ] `--round 2`：提示词里有「回归核对」（编号 + 已驳回依据）与 `DIFF_START` 段；外审前跑了一个 fresh subagent 自审。
 - [ ] `--auto --max-rounds 2`：只弹一次 AskUserQuestion；两轮各有一个 commit；停止时打印记录行并给出停止原因。
 - [ ] `codev_stats` 能列出本次的 agent/模型行，P1 成立/声称 数字与综合里一致。
+- [ ] `codev_opinions` 能按编号回放本次每个 agent 的立场，判断组结论与综合里的裁决一致；没回答的主体记的是 `未返回` 而不是空缺。
+- [ ] 文档评审回流的 commit 里**文档和 changelog 两个文件都在**（`git show --stat`）——少一个说明 `$CHANGELOG` 没绑定被静默丢了。
 
 ## 4. 验收记录
 
