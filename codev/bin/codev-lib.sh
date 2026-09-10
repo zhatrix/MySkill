@@ -164,8 +164,57 @@ codev_err_lines() {
 #   codex   : stderr 末尾的 "tokens used" 下一行；
 #   reasonix: 调用时带 --metrics "$CODEV_DIR/codev-metrics-reasonix.json"（实测 v1.35 可用），
 #             取 prompt_tokens + completion_tokens。
+# Claude-Code 系 CLI（codebuddy 等）用 `--output-format json` 时，stdout 是一个消息数组，
+# 末元素 type=result 同时带 .result（正文）、.usage（token）、.total_cost_usd（成本）。
+# 这里把正文还原回 codev-out-<agent>.txt，并把用量归一化成 metrics JSON——复用 codev_tokens /
+# codev_cost 既有的解析路径，不必为每个 CLI 各写一套提取器。
+# 【fail-safe】任何一步不满足就原样不动：宁可少一条计量，也不能毁掉要逐字呈现的正文。
+# 必须在 codev_classify 之前调用：JSON 包着的正文会让 classify 的结论标记/错误短语判据失准。
+codev_unwrap_result() {
+  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json"
+  [ -s "$out" ] || return 0
+  [ "$(head -c 1 "$out" 2>/dev/null)" = "[" ] || return 0   # 不是 JSON 数组就不碰
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$out" "$m" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
+import json, os, sys
+out, mfile = sys.argv[1], sys.argv[2]
+with open(out, encoding="utf-8") as f:
+    d = json.load(f)
+if not isinstance(d, list) or not d:
+    raise SystemExit(1)
+last = d[-1]
+if not isinstance(last, dict) or last.get("type") != "result":
+    raise SystemExit(1)
+text = last.get("result")
+if not isinstance(text, str) or not text.strip():
+    raise SystemExit(1)          # 正文取不到就别动原文件
+u = last.get("usage") or {}
+tmp = out + ".unwrap"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(text)
+os.replace(tmp, out)             # 原子替换，半截文件不会被 agent 读到
+# 归一化成 codev_tokens/codev_cost 认得的键名；取不到的写 null，两边的正则都要求冒号后紧跟数字，
+# 所以 null 会被安全地当成"没有该项"。
+metrics = {
+    "prompt_tokens": u.get("input_tokens"),
+    "completion_tokens": u.get("output_tokens"),
+    "cost": last.get("total_cost_usd"),
+    "currency": "USD",
+}
+if metrics["prompt_tokens"] is not None or metrics["cost"] is not None:
+    with open(mfile, "w", encoding="utf-8") as f:
+        json.dump(metrics, f)
+CODEV_UNWRAP_PY
+  return 0
+}
+
 codev_tokens() {
-  local agent="$1" err="$CODEV_DIR/codev-err-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" n="" a b
+  local agent="$1" err="$CODEV_DIR/codev-err-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" n="" a b v=""
+  # 编排器直接告知的用量：子 agent（G1 check / G2 self）没有 CLI、拿不到 metrics 文件，
+  # 用量只有编排器手里有。与 codev_model_of 的 CODEV_MODEL_<agent> 同一范式。
+  # agent 名先过白名单再 eval（同 codev_model_of），防注入；值必须全是数字才采信。
+  case "$agent" in *[!A-Za-z0-9_]*|'') ;; *) eval "v=\${CODEV_TOKENS_$agent:-}";; esac
+  case "$v" in ''|*[!0-9]*) ;; *) printf 'tokens %s' "$v"; return 0;; esac
   case "$agent" in
     codex)
       n=$(grep -aiA1 'tokens used' "$err" 2>/dev/null | tail -n 1 | tr -cd '0-9') ;;
@@ -199,7 +248,10 @@ codev_model_of() {
 
 # codev_cost <agent> — 能取到才输出 "0.052 CNY"（reasonix --metrics 的 cost/currency 首次出现）；否则空串。
 codev_cost() {
-  local m="$CODEV_DIR/codev-metrics-$1.json" c u
+  local agent="$1" m="$CODEV_DIR/codev-metrics-$1.json" c u v=""
+  # 同 codev_tokens：编排器可直接告知，形如 "1.29 CNY"。只接受 数字/点/空格/字母。
+  case "$agent" in *[!A-Za-z0-9_]*|'') ;; *) eval "v=\${CODEV_COST_$agent:-}";; esac
+  case "$v" in '') ;; *[!0-9.\ A-Za-z]*) ;; *) printf '%s' "$v"; return 0;; esac
   [ -s "$m" ] || return 0
   # 冒号后必须【紧跟】数字：不锚定的话 "cost": null 会一路吃到同一行下一个数字（实测把 4210 个 token 当成 4210.000 CNY 报出去）。
   c=$(grep -o '"cost"[[:space:]]*:[[:space:]]*[0-9][0-9.]*' "$m" 2>/dev/null | head -n 1 | sed 's/.*[^0-9.]\([0-9][0-9.]*\)$/\1/')
@@ -389,6 +441,7 @@ codev_archive() {
 # 若调用方设了 CODEV_T0（epoch 秒，codev_bg_* 会设），完成行附"用时 Ns"；能取到 token 就附。
 codev_report() {
   local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note=""
+  codev_unwrap_result "$agent"   # JSON 输出的 CLI：先还原正文+归一化用量，再分类（顺序不能反）
   cls=$(codev_classify "$agent" "$rc" "$out" "$err")
   [ -n "${CODEV_T0:-}" ] && secs=$(( $(date +%s) - CODEV_T0 ))
   tk=$(codev_tokens "$agent")

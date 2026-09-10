@@ -34,9 +34,10 @@
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
 | `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；stderr 只看以 ERROR/错误/三位状态码开头的"错误行"，不扫 codex 回显的提示词。 |
-| `codev_tokens <agent>` | 能取到才输出 `tokens N`：codex 取 stderr "tokens used"；reasonix 取 `--metrics` 写的 JSON（prompt+completion）。取不到输出空串。 |
+| `codev_tokens <agent>` | 能取到才输出 `tokens N`，四条来源按优先级：① `CODEV_TOKENS_<agent>` 环境变量（编排器直接告知，**子 agent `self`/`check` 唯一的来源**，只认纯数字）；② codex 取 stderr "tokens used"；③ reasonix 取 `--metrics` 写的 JSON（prompt+completion）；④ codebuddy 等 Claude-Code 系 CLI 由 `codev_unwrap_result` 从 `--output-format json` 的末元素归一化后走 ③ 的同一条路径。取不到输出空串。 |
 | `codev_model_of <agent>` | 模型名：`CODEV_MODEL_<agent>` 环境变量 > codex stderr banner `model:` 行 > `unknown`。调用前 `export CODEV_MODEL_reasonix=deepseek-v4` 之类。 |
-| `codev_cost <agent>` / `codev_session_summary` | reasonix `--metrics` 的 cost/currency；本会话所有调用的 用时/tokens/成本 一览（fan-out 结束后打印）。 |
+| `codev_unwrap_result <agent>` | Claude-Code 系 CLI（codebuddy）用 `--output-format json` 时 stdout 是消息数组，末元素 `type=result` 同时带 `.result`（正文）、`.usage`、`.total_cost_usd`。本函数把正文原子替换回 `codev-out-<agent>.txt`、把用量归一化成 metrics JSON，让 `codev_tokens` / `codev_cost` 走既有解析路径。**由 `codev_report` 在 `codev_classify` 之前自动调用**（顺序不能反：JSON 包着正文会让 classify 的结论标记与错误短语判据失准）。**fail-safe**：非 JSON、末元素不是 result、`.result` 为空或坏 JSON 一律原样不动、不写 metrics——宁可少一条计量，也不能毁掉要逐字呈现的正文。 |
+| `codev_cost <agent>` / `codev_session_summary` | 优先 `CODEV_COST_<agent>` 环境变量（形如 `1.29 CNY`），否则取 metrics JSON 的 cost/currency（reasonix 的 `--metrics`、codebuddy 经 `codev_unwrap_result` 归一化的 `total_cost_usd`）；本会话所有调用的 用时/tokens/成本 一览（fan-out 结束后打印）。 |
 | `codev_finding_add …` / `codev_stats [repo]` | 发现台账（`CODEV_FINDINGS`，默认 `~/.local/state/codev/findings.tsv`，13 列）；统计每个 agent/模型的 P1 亲验成立率、独家成立数。awk 用 `LC_ALL=C`：macOS 自带 awk 在 UTF-8 下 `"不成立"=="成立"` 判真。 |
 | `codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [trailer…]` | 回流 commit：首参是空格分隔的【具体文件】列表，只 `git add` 这些文件（绝不 `-A`，传目录直接拒收——否则会把同目录下用户未提交的改动一起提交）。trailer 块 `Codev-Round` / `Codev-Reviewed-By` / `Codev-Verified-P1` + 透传 trailer。无改动则拒绝提交。 |
 | `codev_prev_round_commit <file> <round>` | 找触及该文件且 `Codev-Round: <round-1>` 的最近 commit，供 `git diff` 内联两版差异。 |
@@ -358,7 +359,7 @@ fi
   codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 12 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
   # 核实型评审（提示词要求"读 ./repo 核实事实"，spec/多轮评审都算）：
   root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
-  codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 64 --tools "Read,Glob,Grep" -p "$(cat "$PROMPT")"
+  codev_bg_sandboxed codebuddy codebuddy --effort minimal --max-turns 64 --tools "Read,Glob,Grep" --output-format json -p "$(cat "$PROMPT")"
   ```
 - **只读保证**：`--tools "Read,Glob,Grep"`（只读工具白名单，同 qoderclicn 的 harness 级强制）
   + `-p` 非交互 + 沙盒 + 提示词强约束。不要用 `-y` / `--dangerously-skip-permissions` /

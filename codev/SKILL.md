@@ -230,7 +230,10 @@ codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metr
 # ⚠️ 各 agent 的必备旗标不同，务必照 agents.md 抄，别省：
 #   reasonix   --effort high --metrics <json> -p （medium 会直接报错退出，它是"默认 medium"的例外；metrics 给 token）
 #   qoderclicn --tools "Read,Glob,Grep" -p "…"   （只读工具白名单；别用 --tools ""，那会连读也禁掉）
-#   codebuddy  --effort minimal --max-turns 64 --tools "Read,Glob,Grep" -p "…"（核实型 64；纯咨询 12）
+#   codebuddy  --effort minimal --max-turns 64 --tools "Read,Glob,Grep" --output-format json -p "…"（核实型 64；纯咨询 12）
+#              ⚠️ --output-format json 是【计量必需】：codebuddy 无 --metrics，只有 json 输出的末元素带
+#              usage/total_cost_usd。库的 codev_unwrap_result 会自动把 .result 还原成正文再归一化用量，
+#              逐字呈现不受影响；去掉它就回到"token 恒记 0"的盲区。
 #   opencode   run --agent plan          （很慢，务必后台）
 # 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 沙盒 + ./repo 只读副本 /
 #            umask 077(子shell内) / 捕 agent 退出码 / 收尾删沙盒 / ✔或⚠️上报。
@@ -337,6 +340,10 @@ CODEV_DIR=<会话目录>; printf '%s' '<当前 Claude 模型 id>' > "$CODEV_DIR/
 # 收到后：subagent 的最终回复原样写进 $CODEV_DIR/codev-out-self.txt（Write 工具），然后在【新的】Bash 调用里：
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
 export CODEV_MODEL_self=$(cat "$CODEV_DIR/self-model"); CODEV_T0=$(cat "$CODEV_DIR/self-t0")
+# 【必填】子 agent 没有 CLI、拿不到 metrics 文件，用量只有编排器手里有：把 Agent 工具完成通知里的
+# <usage><subagent_tokens> 数字原样填进来。不填就记 0——G1/G2 曾是全场最大的一笔支出却在账本上隐形
+# （实测每个子 agent 单次 17 万-24 万 token，每轮两个）。只接受纯数字，脏值会被丢弃。
+export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
 : > "$CODEV_DIR/codev-err-self.txt"; codev_report self 0 "$CODEV_DIR/codev-err-self.txt"
 ```
 自评结果**逐字呈现**（E，框标 `SELF（模型：…）`）、进一致性矩阵（独家/共同）、编号 `r<N>-self-<两位序号>`、记台账。

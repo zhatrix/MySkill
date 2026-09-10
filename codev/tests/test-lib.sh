@@ -420,6 +420,44 @@ grep -q '^masters=0$' "$T/codev-chm.txt" && ok "未留下可写母本" || bad "�
 grep -q '^rc=1$' "$T/codev-hash.txt" && ok "哈希皆空 → codev_master_path rc=1" || bad "哈希皆空仍 rc=0" "$(cat "$T/codev-hash.txt")"
 rm -rf "$REPO" "$T/codev-chm.txt" "$T/codev-hash.txt"; rm_masters
 
+echo "22. 计量盲区：CODEV_TOKENS_/CODEV_COST_ 覆盖 + JSON 输出解包（codebuddy/self 曾恒记 0）"
+# 22a 编排器直接告知用量（子 agent 没有 CLI、拿不到 metrics 文件）
+t=$(CODEV_TOKENS_self=204321 codev_tokens self)
+case "$t" in "tokens 204321") ok "CODEV_TOKENS_<agent> 生效";; *) bad "env 用量未生效" "$t";; esac
+c=$(CODEV_COST_self='1.29 CNY' codev_cost self)
+case "$c" in "1.29 CNY") ok "CODEV_COST_<agent> 生效";; *) bad "env 成本未生效" "$c";; esac
+# 22b 变异证明：脏值必须被丢弃，不能拼进账本、更不能被 eval
+for v in '123; rm -rf /' 'abc' '1e9' '$(id)' ''; do
+  t=$(CODEV_TOKENS_self="$v" codev_tokens self)
+  [ -z "$t" ] || { bad "脏 token 值被采信: [$v] → [$t]"; break; }
+done
+[ -z "${t:-}" ] && ok "非数字/注入型 token 值一律丢弃"
+# 22c JSON 解包：正常路径给出正文 + 用量 + 成本
+printf '%s' '[{"type":"result","result":"正文 OK","usage":{"input_tokens":7,"output_tokens":3},"total_cost_usd":0.5}]' > "$CODEV_DIR/codev-out-uw.txt"
+rm -f "$CODEV_DIR/codev-metrics-uw.json"; codev_unwrap_result uw
+[ "$(cat "$CODEV_DIR/codev-out-uw.txt")" = "正文 OK" ] && ok "解包还原正文" || bad "正文未还原" "$(cat "$CODEV_DIR/codev-out-uw.txt")"
+t=$(codev_tokens uw); case "$t" in "tokens 10") ok "解包后 tokens 可读";; *) bad "解包后 tokens 错" "$t";; esac
+c=$(codev_cost uw); case "$c" in "0.500 USD") ok "解包后 cost 可读";; *) bad "解包后 cost 错" "$c";; esac
+# 22d fail-safe 变异：六种坏输入都必须【原样不动】，否则会毁掉要逐字呈现的正文
+uwbad=0
+for fx in '# 评审结论 无 P1' \
+          '[{"type":"message","text":"hi"}]' \
+          '[{"type":"result","result":"   "}]' \
+          '[{"type":"result","usage":{"input_tokens":5}}]' \
+          '[{"type":"result","result":"x"' \
+          '{"type":"result","result":"x"}'; do
+  printf '%s' "$fx" > "$CODEV_DIR/codev-out-uw.txt"; rm -f "$CODEV_DIR/codev-metrics-uw.json"
+  codev_unwrap_result uw
+  [ "$(cat "$CODEV_DIR/codev-out-uw.txt")" = "$fx" ] || { bad "坏输入被改写: $fx"; uwbad=1; break; }
+  [ -f "$CODEV_DIR/codev-metrics-uw.json" ] && { bad "坏输入仍写了 metrics: $fx"; uwbad=1; break; }
+done
+[ "$uwbad" = 0 ] && ok "六种坏输入均原样不动、不写 metrics"
+# 22e 解包必须排在 classify 之前：JSON 包着正文时 classify 会看错
+printf '%s' '[{"type":"result","result":"# 结论\nPASS 无 P1","usage":{"input_tokens":9,"output_tokens":1}}]' > "$CODEV_DIR/codev-out-uw2.txt"
+: > "$CODEV_DIR/codev-err-uw2.txt"
+r=$(codev_report uw2 0 "$CODEV_DIR/codev-err-uw2.txt" 2>&1)
+case "$r" in *"✔"*"tokens 10"*) ok "codev_report 内解包→分类→计量链路通";; *) bad "report 链路未拿到用量" "$r";; esac
+
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]
