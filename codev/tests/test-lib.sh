@@ -217,6 +217,14 @@ printf '2026-09-01T10:00\tcodex\tquota\t1\t3\t10\t0\n2026-09-01T10:05\tcodex\tok
 r=$(CODEV_LEDGER="$LEG" codev_ledger_recent codex)
 case "$r" in *"quota ok"*"最近 09-01T10:05"*) ok "旧 7 列账本仍可读";; *) bad "旧账本行被丢弃" "$r";; esac
 codev_finding_add ntms spec-a 1 codex m id P1 A 采纳 成立 独家 未加引号的 描述 2>/dev/null && bad "多余实参未被拒" || ok "finding_add 拒收未加引号的描述"
+# 枚举校验：写成英文会被 codev_stats 静默计 0（本机曾累积 48 行 adopted + 129 行 yes 才被发现）
+FCK="$CODEV_DIR/fchk.tsv"
+codev_finding_add ntms spec-a 1 codex m id P1 A adopted 成立 独家 "英文 verdict" 2>/dev/null && bad "英文 verdict 未被拒" || ok "finding_add 拒收英文 verdict"
+codev_finding_add ntms spec-a 1 codex m id P1 A 采纳 yes 独家 "英文 verified" 2>/dev/null && bad "英文 verified 未被拒" || ok "finding_add 拒收英文 verified"
+codev_finding_add ntms spec-a 1 codex m id P1 A 采纳 成立 yes "英文 unique" 2>/dev/null && bad "英文 unique 未被拒" || ok "finding_add 拒收英文 unique"
+( CODEV_FINDINGS="$FCK"; codev_finding_add ntms spec-a 1 codex m id P1 A 驳回 不成立 共同 "合法枚举" ) 2>/dev/null \
+  && [ "$(wc -l < "$FCK" | tr -d ' ')" = 1 ] && ok "合法枚举照常写入" || bad "合法枚举被误拒"
+rm -f "$FCK"
 
 echo "22. 回流 commit 多文件：首参空格分隔的多个文件在 bash/zsh 下都要拆开（zsh 不对未加引号变量拆词）"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \

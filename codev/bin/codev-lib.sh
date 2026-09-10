@@ -312,6 +312,12 @@ codev_session_summary() {
 codev_finding_add() {
   # 必须是 -eq：-ge 会放过没加引号的多词描述（"漏 tenant_id" 拆成 3 个实参），写出 13 列以外的坏行。
   [ $# -eq 12 ] || { echo "用法: codev_finding_add repo doc round agent model id severity column verdict verified unique desc（12 个实参，描述记得加引号）" >&2; return 1; }
+  # 【枚举校验】三个判定列必须是中文枚举：codev_stats 只认中文，写成 adopted/yes 会被静默计 0，
+  # 台账看着有行、统计却全是零（实测本机 48 行 adopted + 129 行 yes 就是这么来的，跨会话累积、
+  # 事后才发现）。宁可当场拒收让调用方改对，也不要留一条永远不会被统计到的行。
+  case "$9"  in 采纳|驳回|存疑) ;; *) echo "codev_finding_add: 第 9 个实参（verdict）须为 采纳/驳回/存疑，收到「$9」" >&2; return 1;; esac
+  case "${10}" in 成立|不成立|待定) ;; *) echo "codev_finding_add: 第 10 个实参（verified）须为 成立/不成立/待定，收到「${10}」" >&2; return 1;; esac
+  case "${11}" in 独家|共同) ;; *) echo "codev_finding_add: 第 11 个实参（unique）须为 独家/共同，收到「${11}」" >&2; return 1;; esac
   local d f
   d=$(dirname "$CODEV_FINDINGS"); mkdir -p "$d" 2>/dev/null || return 1
   printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_FINDINGS"
