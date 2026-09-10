@@ -572,6 +572,118 @@ codev_opinion_add repo-a spec-a 1 third m 判断 missing 采纳 P1 修法甲 -
 r=$(codev_opinions missing)
 case "$r" in *"可进执行清单"*) bad "三位判断者被放行" "$r";; *"判断主体超过两个"*) ok "计票仍遵守两位判断主体上限";; *) bad "未提示判断人数冲突" "$r";; esac
 
+echo "38. 全库自审：内容签名、提交边界、归档失败与重复调用"
+REPO=$(mktemp -d -t codevreview.XXXXXX)
+(
+  cd "$REPO" && git init -q && git config user.email t@t && git config user.name t &&
+  printf init > tracked && git add tracked && git commit -qm init &&
+  printf ab > a && printf c > b && codev_master_path && printf '%s\n' "$CODEV_MASTER" &&
+  printf a > a && printf bc > b && codev_master_path && printf '%s\n' "$CODEV_MASTER"
+) > "$CODEV_DIR/review-boundary.txt"
+n=$(sort -u "$CODEV_DIR/review-boundary.txt" | wc -l | tr -d ' ')
+[ "$n" = 2 ] && ok "未跟踪文件内容边界变化使签名改变" || bad "两个文件内容拼接碰撞" "$(cat "$CODEV_DIR/review-boundary.txt")"
+(
+  cd "$REPO" && printf 'tracked diff=audit\n' > .gitattributes && git add .gitattributes && git commit -qm attributes &&
+  git config diff.audit.textconv true && printf changed > tracked && codev_master_path && printf '%s\n' "$CODEV_MASTER" &&
+  printf again > tracked && codev_master_path && printf '%s\n' "$CODEV_MASTER"
+) > "$CODEV_DIR/review-textconv.txt"
+n=$(sort -u "$CODEV_DIR/review-textconv.txt" | wc -l | tr -d ' ')
+[ "$n" = 2 ] && ok "textconv 不会隐藏真实文件内容变化" || bad "签名受 textconv 归一化影响"
+(
+  cd "$REPO" &&
+  printf one > a.md && printf two > b.md && git add a.md b.md && git commit -qm files &&
+  printf changed > a.md && printf changed > b.md
+  before=$(git rev-parse HEAD)
+  codev_commit_round '*.md' 1 codex 0 0 test > "$CODEV_DIR/review-glob.txt" 2>&1
+  [ $? -ne 0 ] && [ "$(git rev-parse HEAD)" = "$before" ] && [ -z "$(git diff --cached --name-only)" ]
+) && ok "通配 pathspec 不卷入多个未指定文件" || bad "通配符扩大提交范围"
+(
+  cd "$REPO" && printf literal > '*.md' && codev_commit_round '*.md' 1 codex 0 0 literal >/dev/null 2>&1 &&
+  [ "$(git show --pretty= --name-only HEAD)" = '*.md' ] && [ -n "$(git diff -- a.md b.md)" ]
+) && ok "含通配符的真实文件名可单独提交" || bad "字面通配文件提交不正确"
+(
+  cd "$REPO"
+  cp() { return 1; }
+  codev_archive failed-copy 1 > "$CODEV_DIR/review-archive.txt" 2>&1
+  [ $? -ne 0 ] && ! grep -q '已归档到' "$CODEV_DIR/review-archive.txt"
+) && ok "归档复制失败返回非零且不宣称成功" || bad "归档复制失败被隐藏"
+(
+  cd "$REPO"
+  codev_archive .. 1 >/dev/null 2>&1; r1=$?
+  codev_archive scope '1/../../escape' >/dev/null 2>&1; r2=$?
+  [ "$r1" -ne 0 ] && [ "$r2" -ne 0 ]
+) && ok "归档拒绝越界 slug 或轮次" || bad "归档参数可逃出目标目录"
+rm -rf "$REPO"
+REPO=$(mktemp -d -t codevreview.XXXXXX)
+(
+  cd "$REPO" && git init -q && printf one > initial && git add initial &&
+  codev_master_path && printf '%s\n' "$CODEV_MASTER" &&
+  printf two > initial && codev_master_path && printf '%s\n' "$CODEV_MASTER"
+) > "$CODEV_DIR/review-unborn.txt"
+n=$(sort -u "$CODEV_DIR/review-unborn.txt" | wc -l | tr -d ' ')
+[ "$n" = 2 ] && ok "尚无 HEAD 的已暂存文件修改也改变签名" || bad "初始仓库内容变化未被哈希"
+if (
+  cd "$REPO"
+  codev_hash() { printf abc; return 1; }
+  codev_master_path >/dev/null 2>&1
+); then bad "签名管道失败仍复用母本"; else ok "签名管道失败不伪造可用快照"; fi
+rm -rf "$REPO"
+
+CODEV_TIMEOUT=600  # 前面的非法参数测试故意留下 abc；实际调用必须恢复有效值
+for launch in codev_bg_native codev_bg_sandboxed; do
+  (
+    export CODEV_SANDBOX_MODE=text
+    unset CODEV_TOKENS_review CODEV_COST_review
+    printf '{"prompt_tokens":900,"completion_tokens":10,"cost":2,"currency":"USD"}' > "$CODEV_DIR/codev-metrics-review.json"
+    umask 022
+    "$launch" review printf 'PASS' > "$CODEV_DIR/review-launch.txt" 2>&1
+    [ "$(cat "$CODEV_DIR/codev-out-review.txt")" = PASS ] && [ ! -e "$CODEV_DIR/codev-metrics-review.json" ] &&
+    ! grep -q 'tokens 910' "$CODEV_DIR/review-launch.txt" &&
+    [ "$(tail -1 "$CODEV_LEDGER" | cut -f10,11)" = "$(printf '%s\t%s' - -)" ]
+  ) && ok "$launch 不复用上一轮 metrics" || bad "$launch 沿用陈旧计量"
+  [ -z "$(find "$CODEV_DIR" -maxdepth 1 \( -name codev-out-review.txt -o -name codev-err-review.txt \) \( -perm -004 -o -perm -040 \))" ] &&
+    ok "$launch 输出不继承 0644 权限" || bad "$launch 输出其它用户可读"
+done
+(
+  printf old > "$CODEV_DIR/codev-metrics-review.json"
+  CODEV_TO=''
+  codev_bg_native review printf PASS >/dev/null
+  [ ! -e "$CODEV_DIR/codev-metrics-review.json" ]
+) && ok "提前跳过调用也清理旧计量" || bad "跳过调用仍留旧计量"
+
+echo "39. 结构化错误输出不能被 PASS 字样变成成功"
+for subtype in error_max_turns error_during_execution; do
+  printf '[{"type":"result","is_error":true,"subtype":"%s","result":"# Partial\\nPASS","usage":{"input_tokens":1,"output_tokens":2}}]' "$subtype" > "$CODEV_DIR/codev-out-jsonerr.txt"
+  : > "$CODEV_DIR/codev-err-jsonerr.txt"
+  r=$(codev_report jsonerr 0 "$CODEV_DIR/codev-err-jsonerr.txt")
+  case "$r" in *'✔'*) bad "结构化错误被当成功: $subtype" "$r";; *'终稿未产出'*|*'非零退出/报错'*) ok "结构化错误覆盖文本判断: $subtype";; *) bad "错误未分类: $subtype" "$r";; esac
+done
+printf '%s' '[{"type":"result","is_error":true,"subtype":"error_max_turns","result":""}]' > "$CODEV_DIR/codev-out-jsonerr.txt"
+r=$(codev_report jsonerr 0 "$CODEV_DIR/codev-err-jsonerr.txt")
+case "$r" in *'✔'*) bad "空结果的结构化错误被当成功" "$r";; *'终稿未产出'*) ok "空结构化错误也识别 turn 耗尽";; *) bad "空错误未分类" "$r";; esac
+printf '%s' '[{"type":"result","result":"PASS","usage":"invalid"}]' > "$CODEV_DIR/codev-out-jsonbad.txt"
+before=$(cat "$CODEV_DIR/codev-out-jsonbad.txt")
+codev_unwrap_result jsonbad
+[ "$(cat "$CODEV_DIR/codev-out-jsonbad.txt")" = "$before" ] && ok "坏 usage 不会先覆盖原始正文" || bad "解包失败仍破坏原始输出"
+(
+  umask 022
+  codev_bg_native jsonmode printf '%s' '[{"type":"result","result":"PASS"}]' >/dev/null 2>&1
+  [ "$(cat "$CODEV_DIR/codev-out-jsonmode.txt")" = PASS ] &&
+  [ -z "$(find "$CODEV_DIR/codev-out-jsonmode.txt" \( -perm -004 -o -perm -040 \))" ]
+) && ok "JSON 解包后仍保持输出仅本人可读" || bad "JSON 解包扩大输出权限"
+mkdir "$CODEV_DIR/codev-metrics-jsonio.json"
+printf '%s' '[{"type":"result","is_error":true,"subtype":"error_max_turns","result":"PASS","usage":{"input_tokens":1}}]' > "$CODEV_DIR/codev-out-jsonio.txt"
+: > "$CODEV_DIR/codev-err-jsonio.txt"
+r=$(codev_report jsonio 0 "$CODEV_DIR/codev-err-jsonio.txt")
+case "$r" in *'✔'*) bad "metrics 写入失败掩盖结构化错误" "$r";; *'终稿未产出'*) ok "metrics 写入失败仍保留结构化错误";; *) bad "metrics 失败后丢失错误状态" "$r";; esac
+printf '%s' '[{"type":"result","is_error":true,"result":"PASS","usage":"invalid"}]' > "$CODEV_DIR/codev-out-jsonio.txt"
+r=$(codev_report jsonio 0 "$CODEV_DIR/codev-err-jsonio.txt")
+case "$r" in *'✔'*) bad "坏 usage 掩盖明确的 is_error" "$r";; *'非零退出/报错'*) ok "坏 usage 不会把明确错误变为成功";; *) bad "坏 usage 后错误状态丢失" "$r";; esac
+mkdir "$CODEV_DIR/codev-out-jsonio.txt.unwrap"
+printf '%s' '[{"type":"result","is_error":true,"result":"PASS"}]' > "$CODEV_DIR/codev-out-jsonio.txt"
+r=$(codev_report jsonio 0 "$CODEV_DIR/codev-err-jsonio.txt")
+case "$r" in *'✔'*) bad "正文替换失败掩盖 is_error" "$r";; *'非零退出/报错'*) ok "正文替换失败仍保留结构化错误";; *) bad "替换失败后错误状态丢失" "$r";; esac
+
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

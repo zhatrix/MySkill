@@ -176,11 +176,11 @@ codev_err_lines() {
 # 【fail-safe】任何一步不满足就原样不动：宁可少一条计量，也不能毁掉要逐字呈现的正文。
 # 必须在 codev_classify 之前调用：JSON 包着的正文会让 classify 的结论标记/错误短语判据失准。
 codev_unwrap_result() {
-  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json"
+  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" unwrap_rc
   [ -s "$out" ] || return 0
   [ "$(head -c 1 "$out" 2>/dev/null)" = "[" ] || return 0   # 不是 JSON 数组就不碰
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$out" "$m" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
+  if python3 - "$out" "$m" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
 import json, os, sys
 out, mfile = sys.argv[1], sys.argv[2]
 with open(out, encoding="utf-8") as f:
@@ -191,13 +191,27 @@ last = d[-1]
 if not isinstance(last, dict) or last.get("type") != "result":
     raise SystemExit(1)
 text = last.get("result")
+subtype = last.get("subtype", "")
+if not isinstance(subtype, str):
+    raise SystemExit(11 if last.get("is_error") is True else 1)
+failed = last.get("is_error") is True or subtype.startswith("error")
+failure_status = (10 if "max_turns" in subtype else 11) if failed else 0
+if failed and (text is None or text == ""):
+    text = subtype or "structured result reports an error"
 if not isinstance(text, str) or not text.strip():
-    raise SystemExit(1)          # 正文取不到就别动原文件
+    raise SystemExit(failure_status or 1)
 u = last.get("usage") or {}
+if not isinstance(u, dict):
+    raise SystemExit(failure_status or 1)  # 保留原文，但不能丢失已识别的失败状态
 tmp = out + ".unwrap"
-with open(tmp, "w", encoding="utf-8") as f:
-    f.write(text)
-os.replace(tmp, out)             # 原子替换，半截文件不会被 agent 读到
+try:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, out)         # 原子替换，半截文件不会被 agent 读到
+except OSError:
+    raise SystemExit(failure_status or 1)
 # 归一化成 codev_tokens/codev_cost 认得的键名；取不到的写 null，两边的正则都要求冒号后紧跟数字，
 # 所以 null 会被安全地当成"没有该项"。
 metrics = {
@@ -206,11 +220,18 @@ metrics = {
     "cost": last.get("total_cost_usd"),
     "currency": "USD",
 }
-if metrics["prompt_tokens"] is not None or metrics["cost"] is not None:
-    with open(mfile, "w", encoding="utf-8") as f:
-        json.dump(metrics, f)
+try:
+    if metrics["prompt_tokens"] is not None or metrics["cost"] is not None:
+        with open(mfile, "w", encoding="utf-8") as f:
+            json.dump(metrics, f)
+except OSError:
+    raise SystemExit(failure_status or 1)
+raise SystemExit(failure_status)
 CODEV_UNWRAP_PY
-  return 0
+  then return 0
+  else unwrap_rc=$?; fi
+  # 10/11 表示成功解包的结构化失败，不是解析失败。report 必须优先采用这一状态。
+  case "$unwrap_rc" in 10|11) return "$unwrap_rc";; *) return 0;; esac
 }
 
 codev_tokens() {
@@ -468,26 +489,27 @@ CODEV_EOF
   # 提交的是【整个文件的工作树内容】（文件粒度，不是 hunk 粒度）。若用户对该文件做了部分暂存
   # （index ≠ HEAD 且 index ≠ 工作树），git add 会把边界抹平、把用户没打算提交的那部分一起带走——拒收，让用户先处理。
   for t in "$@"; do
-    if ! git diff --cached --quiet -- "$t" 2>/dev/null && ! git diff --quiet -- "$t" 2>/dev/null; then
+    if ! git --literal-pathspecs diff --cached --quiet -- "$t" 2>/dev/null && ! git --literal-pathspecs diff --quiet -- "$t" 2>/dev/null; then
       echo "⚠️ $t 同时有已暂存与未暂存的改动（部分暂存）：codev_commit_round 按整文件提交，会抹掉这个边界。先 git commit 或 git reset 该文件再回流" >&2
       rm -f "$msg"; return 1
     fi
   done
   # 逐文件记下 add 之前 index 就干净的那些：commit 失败时只撤回它们（用户自己整文件暂存好的那份不动）。
   local to_reset=
-  for t in "$@"; do git diff --cached --quiet -- "$t" 2>/dev/null && to_reset="$to_reset
+  for t in "$@"; do git --literal-pathspecs diff --cached --quiet -- "$t" 2>/dev/null && to_reset="$to_reset
 $t"; done
-  if ! git add -- "$@"; then   # add 中途失败（权限等）也把已加进去的撤回；pathspec 不匹配时 git 本就一个都不加
-    printf '%s\n' "$to_reset" | while IFS= read -r t; do [ -n "$t" ] && git reset -q -- "$t" 2>/dev/null; done
+  # -- 只结束选项，不会关闭 * 或 :(glob) 等 pathspec；所有操作必须一致使用字面路径。
+  if ! git --literal-pathspecs add -- "$@"; then
+    printf '%s\n' "$to_reset" | while IFS= read -r t; do [ -n "$t" ] && git --literal-pathspecs reset -q -- "$t" 2>/dev/null; done
     rm -f "$msg"; return 1
   fi
-  if git diff --cached --quiet -- "$@"; then echo "⚠️ $files 没有待提交的改动，跳过 commit" >&2; rm -f "$msg"; return 1; fi
-  git diff --cached --stat -- "$@" | sed 's/^/  暂存: /'   # 让调用方看见到底提交了哪些文件
-  git commit -q -F "$msg" -- "$@"; rc=$?
+  if git --literal-pathspecs diff --cached --quiet -- "$@"; then echo "⚠️ $files 没有待提交的改动，跳过 commit" >&2; rm -f "$msg"; return 1; fi
+  git --literal-pathspecs diff --cached --stat -- "$@" | sed 's/^/  暂存: /'
+  git --literal-pathspecs commit -q -F "$msg" -- "$@"; rc=$?
   rm -f "$msg"
   # commit 失败时把刚 add 进去的撤回，别给用户留一个它没做过的暂存状态（只撤 add 之前 index 本来干净的那些文件）。
   if [ "$rc" != 0 ] && [ -n "$to_reset" ]; then
-    printf '%s\n' "$to_reset" | while IFS= read -r t; do [ -n "$t" ] && git reset -q -- "$t" 2>/dev/null; done
+    printf '%s\n' "$to_reset" | while IFS= read -r t; do [ -n "$t" ] && git --literal-pathspecs reset -q -- "$t" 2>/dev/null; done
   fi
   [ "$rc" = 0 ] && echo "✔ 已提交第 $round 轮回流：$(git log -1 --format=%h) $summary"
   return $rc
@@ -505,7 +527,9 @@ codev_prev_round_commit() {
 # 会话目录 24h 后被 GC，归档让"第 3 轮 codex 当时原话是什么"仍可查；目录用 common gitdir 的 info/exclude
 # 保证不入库（本地生效、不改仓库的 .gitignore）。评审原文不进 git：几十 KB × 多家 × 多轮会堆满仓库。
 codev_archive() {
-  local slug="$1" round="$2" root gitdir dest
+  [ $# -eq 2 ] || { echo "用法: codev_archive slug round" >&2; return 1; }
+  local slug="$1" round="$2" root gitdir dest f files
+  case "$round" in ''|*[!0-9]*) echo "⚠️ 归档轮次必须为数字" >&2; return 1;; esac
   root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "⚠️ 非 git 仓库，跳过归档" >&2; return 1; }
   # 不能硬写 $root/.git：worktree / submodule 里 .git 是【文件】，mkdir 会失败，exclude 就写不进去。
   # 要的是 common dir 而不是 --absolute-git-dir：linked worktree 的 info/exclude 只认共享 gitdir，
@@ -513,6 +537,7 @@ codev_archive() {
   gitdir=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null)
   case "$gitdir" in ''|/*) ;; *) gitdir="$root/$gitdir";; esac
   slug=$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-')
+  case "$slug" in ''|.|..) echo "⚠️ 归档 slug 无效" >&2; return 1;; esac
   dest="$root/.superpowers/codev/$slug/r$round"
   mkdir -p "$dest" || return 1
   if ! git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
@@ -520,8 +545,18 @@ codev_archive() {
   fi
   # 用 find 而不是 for f in "$CODEV_DIR"/xxx-*：zsh 默认 NOMATCH，glob 匹配不到文件时直接报错终止函数
   # （只有 metrics 缺失就整个归档失败）。find 还顺带能扛住路径里的空格。
-  find "$CODEV_DIR" -maxdepth 1 -type f \( -name 'codev-prompt-*.txt' -o -name 'codev-out-*.txt' \
-    -o -name 'codev-err-*.txt' -o -name 'codev-metrics-*.json' \) -exec cp {} "$dest/" \; 2>/dev/null
+  files=$(mktemp "$CODEV_DIR/codev-archive.XXXXXX") || return 1
+  if ! find "$CODEV_DIR" -maxdepth 1 -type f \( -name 'codev-prompt-*.txt' -o -name 'codev-out-*.txt' \
+    -o -name 'codev-err-*.txt' -o -name 'codev-metrics-*.json' \) -print0 > "$files"; then
+    rm -f "$files"; return 1
+  fi
+  while IFS= read -r -d '' f; do
+    if ! cp -- "$f" "$dest/"; then
+      echo "⚠️ 归档复制失败，目标可能不完整：$dest" >&2
+      rm -f "$files"; return 1
+    fi
+  done < "$files"
+  rm -f "$files"
   # 只有真的忽略掉了才这么说——评审原文含仓库 diff，被误 `git add -A` 进仓库比不归档更糟。
   if git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
     echo "已归档到 ${dest}（已被 git 忽略）"
@@ -535,9 +570,13 @@ codev_archive() {
 # 超时(124)/额度/鉴权/turn/报错/空输出都清楚标注，并附 stderr 里的错误行原句（含 429 的重置时间）。
 # 若调用方设了 CODEV_T0（epoch 秒，codev_bg_* 会设），完成行附"用时 Ns"；能取到 token 就附。
 codev_report() {
-  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note=""
-  codev_unwrap_result "$agent"   # JSON 输出的 CLI：先还原正文+归一化用量，再分类（顺序不能反）
+  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note="" unwrap_rc=0
+  codev_unwrap_result "$agent" || unwrap_rc=$?
   cls=$(codev_classify "$agent" "$rc" "$out" "$err")
+  # 进程超时优先；其余情况下结构化 is_error/subtype 优先于正文中的 PASS、标题或退出码 0。
+  if [ "$cls" != timeout ]; then
+    case "$unwrap_rc" in 10) cls=turns;; 11) cls=error;; esac
+  fi
   [ -n "${CODEV_T0:-}" ] && secs=$(( $(date +%s) - CODEV_T0 ))
   tk=$(codev_tokens "$agent")
   [ -n "$secs" ] && extra="用时 ${secs}s"
@@ -560,9 +599,11 @@ codev_report() {
     auth)    printf '⛔ %s 鉴权失败（exit=%s）→ 按 agents.md 的登录命令处理后重试:\n' "$agent" "$rc"
              printf '%s\n' "$lines" | sed 's/^/  /' ;;
     turns)   printf '⚠️ %s turn 预算耗尽（exit=%s，终稿未产出）→ 调高 --max-turns 并收窄核实范围到 3-5 条后重试:\n' "$agent" "$rc"
-             printf '%s\n' "$lines" | sed 's/^/  /' ;;
+             printf '%s\n' "$lines" | sed 's/^/  /'
+             [ "$unwrap_rc" = 10 ] && echo "  结构化结果标记 turn 预算耗尽，部分正文不能当作完成的评审" ;;
     empty)   printf '⚠️ %s 空输出（exit=0，stdout/stderr 均无内容，本轮无效）→ 先看 %s 分诊，勿当成"无问题"\n' "$agent" "$err" ;;
     error)   printf '⚠️ %s 非零退出/报错 exit=%s%s（stderr 错误行）:\n' "$agent" "$rc" "${secs:+，用时 ${secs}s}"
+             [ "$unwrap_rc" = 11 ] && echo "  结构化结果标记失败，进程退出码 0 不代表评审成功"
              if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/  /'; elif [ -s "$err" ]; then tail -n 5 "$err" 2>/dev/null | sed 's/^/  /'; else echo "  (无 stderr)"; fi
              case "$lines" in *"context canceled"*) echo "  → reasonix 上游断流/被掐，多为提示词过大；缩到 ≤45KB 或改路径引用后重试一次";; esac ;;
   esac
@@ -599,9 +640,14 @@ CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 codev_hash() {
   # 临时文件放会话目录：输入含 git diff + 未跟踪文件全文，放 $TMPDIR 的话进程被杀就永久留一份工作区内容，GC 也不收它；
   # 会话目录随收尾 / 24h GC 一起删。CODEV_DIR 不可写时才退到 $TMPDIR。
-  local t h; t=$(mktemp "$CODEV_DIR/codev-hash.XXXXXX" 2>/dev/null || mktemp -t codev-hash.XXXXXX) || return 1; cat > "$t"
-  h=$(shasum < "$t" 2>/dev/null | cut -c1-40); [ -n "$h" ] || h=$(cksum < "$t" 2>/dev/null | tr -cd '0-9')
-  rm -f "$t"; printf '%s' "$h"
+  local t h; t=$(mktemp "$CODEV_DIR/codev-hash.XXXXXX" 2>/dev/null || mktemp -t codev-hash.XXXXXX) || return 1
+  cat > "$t" || { rm -f "$t"; return 1; }
+  if h=$(shasum < "$t" 2>/dev/null); then h=$(printf '%s' "$h" | cut -c1-40)
+  elif h=$(cksum < "$t" 2>/dev/null); then h=$(printf '%s' "$h" | tr -cd '0-9')
+  else rm -f "$t"; return 1; fi
+  rm -f "$t"
+  case "$h" in ''|*[!0-9a-f]*) return 1;; esac
+  printf '%s' "$h"
 }
 
 # codev_master_path — 把母本路径【按仓库根 + 工作区状态】区分开，回填 CODEV_MASTER。
@@ -613,7 +659,7 @@ codev_hash() {
 # 做法：哈希「仓库根 + HEAD + 工作区改动摘要」。任一变化 → 换一个母本目录 → 自然重铺；
 # 没变化 → 命中同一个目录 → 保住"每个签名只 tar 一次"的收益。
 codev_master_path() {
-  local root sig h
+  local root sig h base
   root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
   [ -n "$root" ] || return 1
   # 工作区签名：HEAD + `git status --porcelain`（哪些文件脏了）+ 【脏文件的实际内容】（git diff HEAD 覆盖
@@ -622,11 +668,24 @@ codev_master_path() {
   # 成本只与脏文件规模相关，干净仓库几乎为零。xargs -r：GNU 空输入不执行，BSD 本就不执行且接受 -r 为空操作。
   # 整段在仓库根算：`git ls-files --others` 只列 cwd 之下，从子目录调用签名会不同——同一工作区铺两份母本，
   # 只改子目录之外的未跟踪文件时还会命中旧母本。cd 放在子 shell 里，不改调用方 cwd。
-  sig="$root|$(git rev-parse HEAD 2>/dev/null)|$( cd "$root" 2>/dev/null && { git status --porcelain --untracked-files=all
-        git diff HEAD --binary --no-color --no-ext-diff
-        git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
-          [ -f "$f" ] && [ ! -L "$f" ] && cat -- "$f"; done; } 2>/dev/null | codev_hash)"   # 只 cat 普通文件：FIFO / 指向 /dev/zero 的 symlink 会让 cat 永久挂起
-  h=$(printf '%s' "$sig" | codev_hash | tr -cd '0-9a-f' | cut -c1-16)
+  base=$(git rev-parse --verify HEAD 2>/dev/null) || base=$(git hash-object -t tree /dev/null) || return 1
+  # 空仓库以空树为基线；未跟踪文件带路径和字节长度，避免 ab+c 与 a+bc 拼接碰撞。
+  # pipefail 只在子 shell 生效；上游读取或哈希失败都不得产生可复用的签名。
+  sig=$( ( set -o pipefail
+    ( cd "$root" || exit 1
+      git status --porcelain --untracked-files=all || exit 1
+      git diff "$base" --binary --no-color --no-ext-diff --no-textconv || exit 1
+      git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+          size=$(wc -c < "$f") || exit 1
+          printf '\0%s\0%s\0' "$f" "$size"
+          cat -- "$f" || exit 1
+        fi
+      done
+    ) | codev_hash
+  ) 2>/dev/null ) || { echo "⚠️ 工作区内容读取或哈希失败，退回 text 模式" >&2; return 1; }
+  h=$(printf '%s' "$root|$base|$sig" | codev_hash) || return 1
+  h=$(printf '%s' "$h" | tr -cd '0-9a-f' | cut -c1-16)
   # 哈希为空（shasum 是 perl 脚本，perl 坏了 command -v 仍能找到它；cksum 也失败）就别铺：退成 .0 会让不同仓库/
   # 状态共用同一个母本——正是上面列的"复用错树"事故。返回 1 让调用方退回 text 模式。
   [ -n "$h" ] || { echo "⚠️ 母本签名计算失败（shasum 与 cksum 都没有输出），退回 text 模式" >&2; return 1; }
@@ -890,6 +949,17 @@ codev_repo_copy() {
   return 0
 }
 
+# codev_prepare_call <agent> — 清理本轮输出与计量；在提前跳过路径之前执行，不改变调用者 umask。
+codev_prepare_call() {
+  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" err="$CODEV_DIR/codev-err-$1.txt"
+  case "$agent" in ''|*[!A-Za-z0-9_-]*) echo "⚠️ 无效 agent 标签" >&2; return 1;; esac
+  (
+    umask 077
+    : > "$out" && : > "$err" && chmod 600 "$out" "$err" &&
+    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$out.unwrap"
+  ) || { echo "⚠️ 无法准备 $agent 的输出/计量文件，未启动调用" >&2; return 1; }
+}
+
 # codev_bg_sandboxed <agent> <cmd...> — 非原生只读 agent
 # （reasonix / qoderclicn / opencode / codebuddy）：在【隔离沙盒】里跑，cwd 够不到真实仓库
 # → 从根本上免掉快照/污染问题。默认沙盒里带一份只读仓库副本（见 codev_repo_copy），
@@ -903,7 +973,7 @@ codev_bg_sandboxed() {
   # 【任何提前返回之前就清空】：Claude 按字面路径读 $out，若本轮没跑成而文件还留着上一轮的
   # 评审正文，那份陈旧内容会被当成本轮结论逐字呈现（最坏情况：上一轮说 FAIL 的问题已修好，
   # 这轮却又拿旧文本判一次 FAIL）。所以清空必须在 timeout 缺失、mktemp 失败等所有出口之前。
-  : > "$out"; : > "$err"
+  codev_prepare_call "$agent" || return 1
   if [ -z "$CODEV_TO" ]; then     # 无 timeout：后台裸跑会永久挂起 → 跳过，不阻塞其它
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
@@ -948,7 +1018,7 @@ codev_bg_sandboxed() {
 codev_bg_native() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
-  : > "$out"; : > "$err"          # 同 sandboxed：所有提前返回【之前】就清空，防呈现上一轮陈旧评审
+  codev_prepare_call "$agent" || return 1
   echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
   if [ -z "$CODEV_TO" ]; then
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
