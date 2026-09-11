@@ -870,20 +870,29 @@ mkrb() { local d; d=$(mktemp -d -t codevrb.XXXXXX); ( cd "$d" && git init -q && 
   && git config user.name t && echo a > a.md && echo b > log.md && echo c > c.md && git add -A \
   && git commit -qm init && echo a2 > a.md && echo b2 > log.md && echo c2 > c.md ) >/dev/null 2>&1; printf '%s' "$d"; }
 EMPTY=
-for shape in "a.md $EMPTY" "$EMPTY a.md" "a.md $EMPTY c.md"; do
+# ANSI C 引号保留真实换行；不能通过 $(printf ...) 构造，否则结尾换行在调用前就消失了。
+for shape in "a.md $EMPTY" "$EMPTY a.md" "a.md $EMPTY c.md" $'a.md\n\n' $'a.md\n\n\n' $'a.md\nlog.md\n\n'; do
   RB=$(mkrb)
+  before_head=$(git -C "$RB" rev-parse HEAD)
   ( cd "$RB" && codev_commit_round "$shape" 1 x 0 - m ) >/dev/null 2>&1 \
     && bad "空白占位未被拒: [$shape]" || ok "拒收含空白占位的文件清单: [$shape]"
   # 不只看 rc：真正要防的是"提交了一部分还报成功"，所以断言树没被动过
-  [ -z "$( cd "$RB" && git log --format=%s -1 --skip=0 | grep -x m )" ] && ok "被拒后没有产生提交: [$shape]" \
+  [ "$(git -C "$RB" rev-parse HEAD)" = "$before_head" ] && git -C "$RB" diff --cached --quiet && ok "被拒后没有产生提交或暂存改动: [$shape]" \
     || bad "被拒后仍产生了提交: [$shape]"
   rm -rf "$RB"
 done
 # 合法形状不能被误伤：单文件、单空格多文件、换行分隔（heredoc 常带一个结尾换行）
 RB=$(mkrb); ( cd "$RB" && codev_commit_round "a.md" 1 x 0 - 单文件 ) >/dev/null 2>&1 && ok "合法单文件照常提交" || bad "合法单文件被误拒"; rm -rf "$RB"
 RB=$(mkrb); ( cd "$RB" && codev_commit_round "log.md c.md" 2 x 0 - 多文件 ) >/dev/null 2>&1 && ok "合法多文件照常提交" || bad "合法多文件被误拒"; rm -rf "$RB"
-RB=$(mkrb); ( cd "$RB" && codev_commit_round "$(printf 'a.md\n')" 3 x 0 - 换行 ) >/dev/null 2>&1 \
-  && ok "换行分隔含结尾换行仍可提交" || bad "换行分隔的清单被误拒"; rm -rf "$RB"
+for shape in $'a.md\n' $'a.md\nlog.md' $'a.md\nlog.md\n'; do
+  RB=$(mkrb)
+  (
+    cd "$RB" && codev_commit_round "$shape" 3 x 0 - 换行 >/dev/null 2>&1 || exit 1
+    expected=$(printf '%s' "$shape")
+    [ "$(git show --format= --name-only HEAD)" = "$expected" ] && git diff --cached --quiet
+  ) && ok "真实换行清单完整提交: [$shape]" || bad "换行清单被拒或漏提交: [$shape]"
+  rm -rf "$RB"
+done
 # 42b 写入失败必须自报：调用方按「逐条 codev_finding_add」批量记，没人逐条查 rc，
 # 只返回 1 的话这条发现就和写成功的混在一起、事后从台账里彻底消失（对照组 codev_ledger_append 一直是会喊的）。
 FAILDIR=$(mktemp -d -t codevfail.XXXXXX)
