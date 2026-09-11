@@ -444,7 +444,11 @@ codev_finding_add() {
   case "$9"  in 采纳|驳回|存疑) ;; *) echo "codev_finding_add: 第 9 个实参（verdict）须为 采纳/驳回/存疑，收到「$9」" >&2; return 1;; esac
   case "${10}" in 成立|不成立|待定) ;; *) echo "codev_finding_add: 第 10 个实参（verified）须为 成立/不成立/待定，收到「${10}」" >&2; return 1;; esac
   case "${11}" in 独家|共同) ;; *) echo "codev_finding_add: 第 11 个实参（unique）须为 独家/共同，收到「${11}」" >&2; return 1;; esac
-  codev_tsv_append "$CODEV_FINDINGS" "$(date +%Y-%m-%dT%H:%M)" "$@"
+  # 写失败必须自己喊一声：调用方是按「逐条 codev_finding_add」在批量记，没人逐条查 rc
+  # （SKILL 通用机制 F 就是这么写的）。底层失败时 stderr 上可能只有工具自己的一句无关报错，
+  # 光返回 1 的话，这条发现就和写成功的那些混在一起、事后从台账里彻底消失。同 codev_ledger_append。
+  codev_tsv_append "$CODEV_FINDINGS" "$(date +%Y-%m-%dT%H:%M)" "$@" \
+    || { printf '⚠️ 发现未记入台账（%s）：%s %s %s\n' "$CODEV_FINDINGS" "$6" "$7" "${12}" >&2; return 1; }
 }
 
 # codev_stats [repo] — 按 agent+模型汇总发现台账：声称 P1 里经亲验成立的比例、独家且成立数、总条数、采纳数。
@@ -488,7 +492,10 @@ codev_opinion_add() {
   case "$6"  in 评审|判断|自审|复核) ;; *) echo "codev_opinion_add: 第 6 个实参（role）须为 评审/判断/自审/复核，收到「$6」" >&2; return 1;; esac
   case "$8"  in 提出|采纳|驳回|存疑|未返回) ;; *) echo "codev_opinion_add: 第 8 个实参（stance）须为 提出/采纳/驳回/存疑/未返回，收到「$8」" >&2; return 1;; esac
   case "$9"  in P1|P2|P3|-) ;; *) echo "codev_opinion_add: 第 9 个实参（severity）须为 P1/P2/P3/-，收到「$9」" >&2; return 1;; esac
-  codev_tsv_append "$CODEV_OPINIONS" "$(date +%Y-%m-%dT%H:%M)" "$@" "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}"
+  # 同 codev_finding_add：批量记录时没人逐条查 rc，写失败必须自报，否则这条立场静默消失，
+  # 回放时那位主体就成了"从未表态"——正是本记录要防的"缺席被当成没人反对"。
+  codev_tsv_append "$CODEV_OPINIONS" "$(date +%Y-%m-%dT%H:%M)" "$@" "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}" \
+    || { printf '⚠️ 意见未记入记录（%s）：%s %s %s %s\n' "$CODEV_OPINIONS" "$7" "$4" "$6" "$8" >&2; return 1; }
 }
 
 # codev_opinions [issue [repo [doc [round [task]]]]] — 空参数为该维度不过滤；不传参数回放全部。
@@ -565,7 +572,27 @@ codev_commit_round() {
   [ $# -ge 6 ] || { echo "用法: codev_commit_round files round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
   # 变量名【绝不能叫 path】：zsh 里 path 是绑定 $PATH 的特殊数组，local path=… 会把 PATH 换成该路径，
   # 函数体内 git/mktemp/sed 全部 command not found。同理见 codev_prev_round_commit。
-  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc
+  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc probe nl
+  # 【未绑定变量守卫】首参几乎总是拼出来的（`codev_commit_round "$DOC $CHANGELOG" …`）。少绑一个变量时
+  # 它展开成空串，下面按空白拆词会把空 token 直接丢掉——于是只提交了一个文件，却照常打印「✔ 已提交第 N 轮
+  # 回流」并返回 0，日志改动留在工作区（实测：CHANGELOG 未绑定时提交只含文档、git status 仍 ` M CHANGELOG.md`）。
+  # 打错文件名有 git 的 `pathspec did not match` 兜着，唯独"变量为空"完全无声，正是最常犯的那种。
+  # 空展开必然在字符串里留下痕迹：开头空白（首个变量为空）、结尾空格/制表符（末个为空）、连续两个空白
+  # （中间为空）。据此拒收并点名，不猜是哪个变量。合法清单用【单个】空白分隔，不受影响；
+  # 换行分隔的清单允许一个结尾换行（heredoc 常带），故只把结尾的空格/制表符算作可疑。
+  # nl 必须用【字面换行】赋值：`nl=$(printf '\n')` 得到的是空串（命令替换剥掉全部结尾换行），
+  # 下面的 "$nl"* 会退化成 * 而匹配一切——单文件、正常多文件全被当成"有空白占位"拒收（实测 11 项回归红）。
+  nl='
+'
+  probe=$(printf '%s' "$files" | tr '\t' ' '); probe=${probe%"$nl"}
+  case "$probe" in
+    ' '*|"$nl"*|*' '|*'  '*|*" $nl"*|*"$nl "*|*"$nl$nl"*)
+      # 变量【不能紧贴全角字符】：UTF-8 locale 下 bash 会把 `files」` 一起当变量名（set -u 直接报
+      # unbound variable）。同 codev_report 的 $extra 与 codev_bg_sandboxed 的 $mode，一律用 printf %s 传。
+      echo "⚠️ 文件清单里有空白占位（开头/结尾空白或连续两个空白）：多半是某个变量没绑定展开成了空串。" >&2
+      printf '   收到的首参：「%s」。空 token 会被静默丢弃、只提交剩下的文件却报成功——先把变量绑好再回流。\n' "$files" >&2
+      return 1 ;;   # 此时还没 mktemp 出 msg，没有临时文件要清
+  esac
   shift 6                                   # 剩下的位置参数是要透传的 trailer，先写进 msg 再复用位置参数装文件列表
   msg=$(mktemp -t codev-msg.XXXXXX) || return 1
   {
@@ -1133,11 +1160,13 @@ codev_bg_native() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
   codev_prepare_call "$agent" || return 1
-  echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
+  # ▶ 必须排在跳过判断【之后】（与 codev_bg_sandboxed 一致）：SKILL 通用机制 D 让 Claude 按 ▶ 行
+  # 建"运行中"状态板，先打 ▶ 再打 ⏭ 会让一个根本没启动的 agent 在板上挂成运行中。
   if [ -z "$CODEV_TO" ]; then
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
   fi
+  echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
   local rc
   # umask 077 放进子 shell：不把 umask 泄漏给调用方 shell（前台/内联退化场景会残留 0600）。
   CODEV_T0=$(date +%s)

@@ -16,7 +16,8 @@ codebuddy 429 重置时间、Max turns、context canceled、空输出、部分�
 账本 12 列与 probe 摘要、tokens/成本解析（含 JSON 同名键重复）、模型识别、发现台账与 `codev_stats`、
 意见与判断记录（`codev_opinion_add` 三个枚举列校验 + `codev_opinions` 的四种一致性结论、缺席不当同意、组内顺序、
 按追加顺序改判、仓库/对象/轮次/task 隔离与范围筛选、新 13 列及旧 12 列兼容、P1 级别分歧、缺失修法与补齐后重判）、
-`codev_commit_round`（隔离脏文件、拒收目录、trailer、找回上一轮 commit）、`codev_archive`（归档 + git 忽略，
+`codev_commit_round`（隔离脏文件、拒收目录、trailer、找回上一轮 commit、拒收含空白占位的文件清单且不留提交）、
+账本写入失败时 `codev_finding_add` / `codev_opinion_add` 自报丢失、无 timeout 的跳过路径不打 ▶ 运行中、`codev_archive`（归档 + git 忽略，
 含 worktree 场景）、probe 空台账返回 0、cost/tokens 遇 null 不串号、账本兼容旧 7 列、`codev_commit_round` 多文件
 （zsh 不拆词）、短结论含 401/rate limit 不误判、rc=137 判 timeout、母本签名随脏文件内容变、母本过滤只挡文件不挡目录
 + credentials 源码保留 + 大小写变体、陈旧锁并发回收单一赢家（直接计数进入临界区的 builder）+ 母本 a-w、

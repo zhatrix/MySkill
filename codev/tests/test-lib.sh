@@ -12,7 +12,10 @@ export CODEV_TIMEOUT=600
 source "$LIB" || { echo "FATAL: source 失败"; exit 1; }
 pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "  ✔ $1"; }
-bad()  { fail=$((fail+1)); echo "  ✘ $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/      /'; }
+# 末尾的 return 0 不能省：函数体最后是 `[ -n "${2:-}" ] && …`，只传一个实参时它为假，bad 就返回 1，
+# 于是遍布本文件的 `cmd && bad X || ok Y` 会【继续执行 ok】——同一条断言既记失败又记通过，
+# 输出里紧挨着一对矛盾的 ✘/✔，pass 数还被虚增（实测在修复前的库上跑，每条 ✘ 都配一个假 ✔）。
+bad()  { fail=$((fail+1)); echo "  ✘ $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/      /'; return 0; }
 mk() { printf '%s' "$2" > "$CODEV_DIR/codev-out-$1.txt"; printf '%s' "$3" > "$CODEV_DIR/codev-err-$1.txt"; }
 report() { codev_report "$1" "$2" "$CODEV_DIR/codev-err-$1.txt" 2>&1; }
 
@@ -856,6 +859,50 @@ for field in agent issue; do
     ) && ok "意见写入拒绝空白 $field" || bad "意见接口写入了自身无法有效回放的 $field"
   done
 done
+
+echo "42. 第四轮全库自审：未绑定变量的文件清单、写入失败自报、跳过路径不打运行中"
+# 42a 未绑定变量：`codev_commit_round "$DOC $CHANGELOG"` 少绑一个就展开成空 token，旧行为是静默丢弃
+# 只提交剩下的文件却返回 0 并打 ✔（实测提交只含文档、log 仍是 ` M`）。三种位置都要拒收。
+# 每个形状【独立仓库】：清单被误接受时会真的产生提交，共用一个仓库会让后面的断言读到被改过的树
+# （实测在修复前的库上，第一条提交掉 a.md 后，"开头为空"和"合法单文件"两条都因"没有待提交的改动"
+#  给出与本意相反的结论）。回归测试要指向病因，不能互相污染。
+mkrb() { local d; d=$(mktemp -d -t codevrb.XXXXXX); ( cd "$d" && git init -q && git config user.email t@t \
+  && git config user.name t && echo a > a.md && echo b > log.md && echo c > c.md && git add -A \
+  && git commit -qm init && echo a2 > a.md && echo b2 > log.md && echo c2 > c.md ) >/dev/null 2>&1; printf '%s' "$d"; }
+EMPTY=
+for shape in "a.md $EMPTY" "$EMPTY a.md" "a.md $EMPTY c.md"; do
+  RB=$(mkrb)
+  ( cd "$RB" && codev_commit_round "$shape" 1 x 0 - m ) >/dev/null 2>&1 \
+    && bad "空白占位未被拒: [$shape]" || ok "拒收含空白占位的文件清单: [$shape]"
+  # 不只看 rc：真正要防的是"提交了一部分还报成功"，所以断言树没被动过
+  [ -z "$( cd "$RB" && git log --format=%s -1 --skip=0 | grep -x m )" ] && ok "被拒后没有产生提交: [$shape]" \
+    || bad "被拒后仍产生了提交: [$shape]"
+  rm -rf "$RB"
+done
+# 合法形状不能被误伤：单文件、单空格多文件、换行分隔（heredoc 常带一个结尾换行）
+RB=$(mkrb); ( cd "$RB" && codev_commit_round "a.md" 1 x 0 - 单文件 ) >/dev/null 2>&1 && ok "合法单文件照常提交" || bad "合法单文件被误拒"; rm -rf "$RB"
+RB=$(mkrb); ( cd "$RB" && codev_commit_round "log.md c.md" 2 x 0 - 多文件 ) >/dev/null 2>&1 && ok "合法多文件照常提交" || bad "合法多文件被误拒"; rm -rf "$RB"
+RB=$(mkrb); ( cd "$RB" && codev_commit_round "$(printf 'a.md\n')" 3 x 0 - 换行 ) >/dev/null 2>&1 \
+  && ok "换行分隔含结尾换行仍可提交" || bad "换行分隔的清单被误拒"; rm -rf "$RB"
+# 42b 写入失败必须自报：调用方按「逐条 codev_finding_add」批量记，没人逐条查 rc，
+# 只返回 1 的话这条发现就和写成功的混在一起、事后从台账里彻底消失（对照组 codev_ledger_append 一直是会喊的）。
+FAILDIR=$(mktemp -d -t codevfail.XXXXXX)
+# 父路径是【普通文件】→ 库里的 makedirs 直接失败，是最干净的"写不进去"。
+# （用不存在的多级目录不行：写入路径会自己 makedirs 建出来，写反而成功。）
+: > "$FAILDIR/blocker"
+r=$( CODEV_FINDINGS="$FAILDIR/blocker/f.tsv" CODEV_DIR="$FAILDIR" \
+     codev_finding_add r d 1 a m id P1 A 采纳 成立 独家 "会丢的发现" 2>&1 )
+case "$r" in *未记入台账*) ok "发现写入失败会自报";; *) bad "发现写入失败无提示" "$r";; esac
+r=$( CODEV_OPINIONS="$FAILDIR/blocker/o.tsv" CODEV_DIR="$FAILDIR" \
+     codev_opinion_add r d 1 a m 判断 i 采纳 P1 甲 - 2>&1 )
+case "$r" in *未记入记录*) ok "意见写入失败会自报";; *) bad "意见写入失败无提示" "$r";; esac
+rm -rf "$FAILDIR"
+# 42c 无 timeout 时不能先打 ▶ 再打 ⏭：SKILL 通用机制 D 让 Claude 按 ▶ 行建"运行中"状态板，
+# 先 ▶ 会让一个根本没启动的 agent 在板上挂成运行中。两个入口行为必须一致。
+r=$(CODEV_TO= codev_bg_native fakeagent true 2>&1)
+case "$r" in *"▶"*) bad "native 跳过路径仍打了 ▶ 运行中" "$r";; *"⏭"*) ok "native 无 timeout 只打 ⏭";; *) bad "native 跳过路径无输出" "$r";; esac
+r=$(CODEV_TO= codev_bg_sandboxed fakeagent true 2>&1)
+case "$r" in *"▶"*) bad "sandboxed 跳过路径仍打了 ▶" "$r";; *"⏭"*) ok "sandboxed 无 timeout 只打 ⏭";; *) bad "sandboxed 跳过路径无输出" "$r";; esac
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
