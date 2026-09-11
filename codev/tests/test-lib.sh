@@ -453,7 +453,7 @@ for fx in '# 评审结论 无 P1' \
           '[{"type":"result","result":"   "}]' \
           '[{"type":"result","usage":{"input_tokens":5}}]' \
           '[{"type":"result","result":"x"' \
-          '{"type":"result","result":"x"}'; do
+          '{"type":"message","text":"x"}'; do
   printf '%s' "$fx" > "$CODEV_DIR/codev-out-uw.txt"; rm -f "$CODEV_DIR/codev-metrics-uw.json"
   codev_unwrap_result uw
   [ "$(cat "$CODEV_DIR/codev-out-uw.txt")" = "$fx" ] || { bad "坏输入被改写: $fx"; uwbad=1; break; }
@@ -683,6 +683,74 @@ mkdir "$CODEV_DIR/codev-out-jsonio.txt.unwrap"
 printf '%s' '[{"type":"result","is_error":true,"result":"PASS"}]' > "$CODEV_DIR/codev-out-jsonio.txt"
 r=$(codev_report jsonio 0 "$CODEV_DIR/codev-err-jsonio.txt")
 case "$r" in *'✔'*) bad "正文替换失败掩盖 is_error" "$r";; *'非零退出/报错'*) ok "正文替换失败仍保留结构化错误";; *) bad "替换失败后错误状态丢失" "$r";; esac
+
+echo "40. 第二轮全库自审：结构化状态重放、精确计量与并发持久化"
+printf '%s' '[{"type":"result","is_error":true,"result":"PASS"}]' > "$CODEV_DIR/codev-out-repeat.txt"
+: > "$CODEV_DIR/codev-err-repeat.txt"
+r=$(codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt")
+r=$(codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt")
+case "$r" in *'✔'*) bad "二次 report 把失败变为成功" "$r";; *'非零退出/报错'*) ok "二次 report 保留结构化失败";; *) bad "二次 report 丢失状态" "$r";; esac
+for fx in '  [{"type":"result","is_error":true,"result":"PASS"}]' '{"type":"result","is_error":true,"result":"PASS"}'; do
+  printf '\n%s' "$fx" > "$CODEV_DIR/codev-out-repeat.txt"
+  r=$(codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt")
+  case "$r" in *'✔'*) bad "合法 JSON 形状绕过错误状态" "$r";; *'非零退出/报错'*) ok "识别空白前缀/对象形式的错误 JSON";; *) bad "JSON 状态未识别" "$r";; esac
+done
+printf '%s' '{"type":"result","result":"PASS","usage":{"input_tokens":2,"output_tokens":3}}' > "$CODEV_DIR/codev-out-repeat.txt"
+r=$(codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt")
+case "$r" in *'✔'*'tokens 5'*) ok "对象形式的成功结果也可解包和计量";; *) bad "成功对象解包失败" "$r";; esac
+printf 'PASS changed' > "$CODEV_DIR/codev-out-repeat.txt"
+r=$(codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt")
+case "$r" in *'✔'*) ok "旧状态不污染内容不同的新输出";; *) bad "旧状态污染新输出" "$r";; esac
+printf '%s' '[{"type":"result","is_error":true,"result":"PASS"}]' > "$CODEV_DIR/codev-out-repeat.txt"
+codev_report repeat 0 "$CODEV_DIR/codev-err-repeat.txt" >/dev/null
+r=$(codev_bg_native repeat printf PASS)
+case "$r" in *'✔'*) ok "新调用即使正文相同也不沿用旧状态";; *) bad "新调用误用旧状态" "$r";; esac
+
+printf '%s' '{"cost":1e-5,"currency":"USD","prompt_tokens":9223372036854775807,"completion_tokens":2}' > "$CODEV_DIR/codev-metrics-exact.json"
+[ "$(codev_tokens exact)" = 'tokens 9223372036854775809' ] && ok "大 token 数不经 shell 溢出" || bad "token 溢出或丢失"
+[ "$(codev_cost exact)" = '0.000 USD' ] && ok "科学计数法按真实金额舍入" || bad "科学计数法被截成整数"
+printf '%s' '{"provider":{"prompt_tokens":100,"completion_tokens":20,"cost":50},"prompt_tokens":2,"completion_tokens":3,"cost":0.5,"currency":"USD"}' > "$CODEV_DIR/codev-metrics-exact.json"
+[ "$(codev_tokens exact)" = 'tokens 5' ] && [ "$(codev_cost exact)" = '0.500 USD' ] && ok "只读取顶层 metrics" || bad "嵌套 provider 冒充总计"
+for fx in '{"prompt_tokens":2}' '{"prompt_tokens":2,"completion_tokens":null}' '{"prompt_tokens":2.5,"completion_tokens":3}' '{"prompt_tokens":2,"completion_tokens":3'; do
+  printf '%s' "$fx" > "$CODEV_DIR/codev-metrics-exact.json"
+  [ -z "$(codev_tokens exact)" ] && ok "缺失/无效 token 不伪报完整总计" || bad "缺失或损坏用量仍计数: $fx"
+done
+[ -z "$(CODEV_COST_exact=free codev_cost exact)" ] && ok "无效成本覆盖值不被采信" || bad "任意文字被当成本"
+
+(
+  export CODEV_FINDINGS="$CODEV_DIR/concurrent-findings.tsv" CODEV_OPINIONS="$CODEV_DIR/concurrent-opinions.tsv"
+  for i in $(seq 1 20); do
+    codev_finding_add repo doc 1 agent model "i$i" P1 A 采纳 成立 共同 "desc$i" &
+    codev_opinion_add repo doc 1 agent model 判断 "i$i" 采纳 P1 fix "note$i" &
+  done
+  wait
+  awk -F'\t' 'NF!=13 || $7 !~ /^i[0-9]+$/ || $13 != "desc" substr($7,2){bad=1} END{exit bad || NR!=20}' "$CODEV_FINDINGS" &&
+  awk -F'\t' 'NF!=13 || $8 !~ /^i[0-9]+$/ || $12 != "note" substr($8,2){bad=1} END{exit bad || NR!=20}' "$CODEV_OPINIONS"
+) && ok "并发发现/意见写入行完整且字段关联正确" || bad "并发追加破坏 TSV"
+(
+  export CODEV_OPINIONS="$CODEV_DIR/long-opinions.tsv"
+  long_note=$(head -c 70000 /dev/zero | tr '\0' x)
+  for i in $(seq 1 8); do codev_opinion_add repo doc 1 agent model 判断 "i$i" 采纳 P1 fix "$i:$long_note" & done
+  wait
+  awk -F'\t' 'NF!=13 || length($12)!=70002 || substr($12,1,1)!=substr($8,2){bad=1} END{exit bad || NR!=8}' "$CODEV_OPINIONS"
+) && ok "长记录并发也不分段交错" || bad "长记录被并发切碎"
+(
+  export CODEV_OPINIONS="$CODEV_DIR/broken-opinions.tsv"
+  codev_opinion_add repo doc 1 claude model 判断 broken 采纳 P1 fix -
+  printf 'partial\tcorrupt\n' >> "$CODEV_OPINIONS"
+  codev_opinions broken > "$CODEV_DIR/broken-replay.txt"
+  [ $? -ne 0 ] && ! grep -q '可进执行清单' "$CODEV_DIR/broken-replay.txt"
+) && ok "损坏行不会被忽略后误判可执行" || bad "坏行被忽略并错误放行"
+REPO=$(mktemp -d -t codevreview.XXXXXX)
+(
+  cd "$REPO" && git init -q &&
+  printf original > "$CODEV_DIR/codev-out-immutable.txt" && codev_archive immutable 1 >/dev/null &&
+  codev_archive immutable 1 >/dev/null &&
+  printf changed > "$CODEV_DIR/codev-out-immutable.txt"
+  codev_archive immutable 1 > "$CODEV_DIR/archive-conflict.txt" 2>&1
+  [ $? -ne 0 ] && [ "$(cat .superpowers/codev/immutable/r1/codev-out-immutable.txt)" = original ]
+) && ok "同内容可重复归档，不同内容不能覆盖已归档轮次" || bad "历史归档被新内容覆盖"
+rm -rf "$REPO"
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"

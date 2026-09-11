@@ -66,9 +66,10 @@ brew install coreutils      # 提供 gtimeout
   记录按仓库/对象/轮次/task/问题隔离，历史全部展示，计票只取各判断主体最后追加的记录；P1 级别分歧或缺少具体修法不进入执行清单。
   设 `CODEV_TASK_ID` 标识任务，跨会话恢复须沿用该值；未设置时取 `CODEV_DIR` 会话名。新记录追加 task 为第 13 列，旧 12 列仍可读并提示身份限制，补齐任务归属前仅供回顾，不据此执行或关闭问题。
   跨会话累积，设 `CODEV_OPINIONS` 可改路径。
+  三个账本使用 Python 3 文件锁串行追加完整行；意见文件存在损坏行时，回放返回非零且不据此执行或关闭问题。
 - 每轮回流 commit 只提交显式列出的文件（含对应 changelog），所有 Git 路径按字面解释，不把 `*` 或 pathspec magic 展开为额外文件；trailer 带 `Codev-Round` / `Codev-Reviewed-By: codex(gpt-5.6-sol), …` /
   `Codev-Verified-P1: k (prev j)`，`git log --grep '^Codev-Round: 2'` 可直接查；评审原文归档到 gitignored 的
-  `.superpowers/codev/<文档>/r<N>/`，不进仓库。
+  `.superpowers/codev/<文档>/r<N>/`，不进仓库；归档成功后不被不同内容覆盖，相同内容可重复归档。
 - 改了 `bin/codev-lib.sh` 后 `bash tests/test-lib.sh` 与 `zsh tests/test-lib.sh` 两边都要绿；改文案按 `TESTING.md` 跑微测试与真机清单。
 
 ### 2.4 shell 说明

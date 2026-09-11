@@ -25,6 +25,8 @@
 > 都不继承——所以靠**每次 source 库 + 重设 CODEV_DIR 字面值**拿回函数与路径、**输出走会话目录内字面路径**
 > `$CODEV_DIR/codev-out-<agent>.txt`。per-session 目录避免并发 run 互相覆盖、清理误删（旧版固定 `/tmp/codev-*` 会）。
 
+账本持久化与原子归档需要 Python 3（macOS/Linux 使用标准库 `fcntl` 文件锁）；缺失时明确失败，不退回无锁写入。JSON 计量也使用 Python 3，解析器不可用时不猜测 token 或成本。
+
 | 函数 | 作用 |
 |---|---|
 | `codev_run <cmd…>` | timeout 封装。取代 `$TP <cmd>` 变量前缀——**zsh 不对无引号变量做词拆分**，`$TP cmd`（`TP="/path/timeout 600"`）会把整串当一个命令名执行 → `no such file or directory`、exit 127（本机 shell 是 zsh，实测每个调用都死在这）。`codev_run` 用 `"$@"` 传参，bash/zsh 都对。 |
@@ -34,15 +36,15 @@
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
 | `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；stderr 只看以 ERROR/错误/三位状态码开头的"错误行"，不扫 codex 回显的提示词。 |
-| `codev_tokens <agent>` | 能取到才输出 `tokens N`，四条来源按优先级：① `CODEV_TOKENS_<agent>` 环境变量（编排器直接告知，**子 agent `self`/`check` 唯一的来源**，只认纯数字）；② codex 取 stderr "tokens used"；③ reasonix 取 `--metrics` 写的 JSON（prompt+completion）；④ codebuddy 等 Claude-Code 系 CLI 由 `codev_unwrap_result` 从 `--output-format json` 的末元素归一化后走 ③ 的同一条路径。取不到输出空串。 |
+| `codev_tokens <agent>` | 能取到才输出 `tokens N`：优先 `CODEV_TOKENS_<agent>`（self/check 的来源，只认纯数字）；codex 取 stderr "tokens used"；其它取完整 metrics JSON 的顶层 prompt+completion，两项均须为非负整数，用 Python 整数相加。缺项、坏 JSON 或坏类型输出空串，不把缺项当零、不取嵌套 provider 冒充总量。 |
 | `codev_model_of <agent>` | 模型名：`CODEV_MODEL_<agent>` 环境变量 > codex stderr banner `model:` 行 > `unknown`。调用前 `export CODEV_MODEL_reasonix=deepseek-v4` 之类。 |
-| `codev_unwrap_result <agent>` | Claude-Code 系 CLI 的 JSON 消息数组末元素 `type=result` 携带正文、usage、成本。先校验结构，再原子替换正文并保持 0600，归一化 metrics。由 `codev_report` 自动调用：`is_error=true` 或 `error*` subtype 分别返回 10（max_turns）/11（其它错误），report 优先采用结构化失败，不能被正文 PASS 或 rc=0 覆盖；进程超时仍优先。结构化失败无正文时保留 subtype 提示；普通空正文、坏 JSON 或非字典 usage 保留原文件。 |
-| `codev_cost <agent>` / `codev_session_summary` | 优先 `CODEV_COST_<agent>` 环境变量（形如 `1.29 CNY`），否则取 metrics JSON 的 cost/currency（reasonix 的 `--metrics`、codebuddy 经 `codev_unwrap_result` 归一化的 `total_cost_usd`）；本会话所有调用的 用时/tokens/成本 一览（fan-out 结束后打印）。 |
+| `codev_unwrap_result <agent>` | 接受带前导空白的 JSON 消息数组或单个 result 对象。先校验结构，再将正文按 0600 原子替换，并保存绑定正文 SHA-256 的 `codev-result-<agent>.json` 状态；重复 report 保留结构化失败，新调用准备时清除旧状态，正文变化时不复用旧状态。`is_error=true`/`error*` 返回 10（max_turns）/11（其它错误），report 不因 PASS 或 rc=0 放行；超时仍优先。空错误结果保留 subtype；普通空正文、坏 JSON 或坏 usage 保留原文件。 |
+| `codev_cost <agent>` / `codev_session_summary` | 优先合法 `CODEV_COST_<agent>`（金额加三字母币种，如 `1.29 CNY`），否则解析完整 metrics JSON 顶层 cost/currency。Decimal 处理科学计数法，金额显示保留三位小数，原始精度仍在 metrics；本会话汇总调用用时/token/成本。 |
 | `codev_finding_add …` / `codev_stats [repo]` | 发现台账（`CODEV_FINDINGS`，默认 `~/.local/state/codev/findings.tsv`，13 列）；统计每个 agent/模型的 P1 亲验成立率、独家成立数。awk 用 `LC_ALL=C`：macOS 自带 awk 在 UTF-8 下 `"不成立"=="成立"` 判真。 |
 | `codev_opinion_add <repo> <doc> <round> <agent> <model> <role> <issue> <stance> <severity> <fix> <note>` / `codev_opinions [issue [repo [doc [round [task]]]]]` | 意见与判断记录（`CODEV_OPINIONS`，默认 `~/.local/state/codev/opinions.tsv`）：写入仍为 11 个实参，新增第 13 列 task，取 `CODEV_TASK_ID` 或 `CODEV_DIR` 会话名；跨会话恢复须沿用 task ID。旧 12 列仍可读并提示身份限制。按仓库/对象/轮次/task/问题隔离；回放参数为空则该维度不过滤。完整历史按角色展示，计票只取各判断主体最后追加的记录，不按时间戳或模型重复计票。role=评审/判断/自审/复核，stance=提出/采纳/驳回/存疑/未返回，severity=P1/P2/P3/-，三个枚举列当场校验；缺席**必须显式记 `未返回`**。同修法也须检查 P1 级别分歧；空白、`-` 等占位修法不允许进执行清单。 |
 | `codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [trailer…]` | 回流 commit：首参是空格分隔的【具体文件】列表，只 `git add` 这些文件（绝不 `-A`，传目录直接拒收——否则会把同目录下用户未提交的改动一起提交）。trailer 块 `Codev-Round` / `Codev-Reviewed-By` / `Codev-Verified-P1` + 透传 trailer。无改动则拒绝提交。 |
 | `codev_prev_round_commit <file> <round>` | 找触及该文件且 `Codev-Round: <round-1>` 的最近 commit，供 `git diff` 内联两版差异。 |
-| `codev_archive <slug> <round>` | 把本会话 prompt/out/err/metrics 复制到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`，并把 `.superpowers/` 写进 **common gitdir** 的 `info/exclude`。拒绝空或点路径 slug、非数字轮次；逐文件核对复制结果，失败返回非零并提示目标可能不完整，不宣称归档成功。忽略配置失败仍明确提示，不谎称已忽略。 |
+| `codev_archive <slug> <round>` | prompt/out/err/metrics/result 状态先复制到暂存目录，成功后原子发布到 `<仓库根>/.superpowers/codev/<slug>/r<N>/`；相同内容可重复调用，不同内容拒绝覆盖已发布轮次。复制失败不发布，已有归档保留。拒绝点路径 slug、非数字轮次；继续使用 common gitdir 的忽略规则，忽略配置失败明确提示。 |
 | `codev_ledger_append` / `codev_ledger_recent <agent>` | 跨会话账本 `CODEV_LEDGER`（默认 `~/.local/state/codev/ledger.tsv`；12 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注，quota 的备注带重置时间；`codev_ledger_recent` 同时兼容升级前的旧 7 列布局 时间 agent 类别 rc 用时 提示词字节 输出字节）。`codev_probe` 用它给每个 agent 标"近期 3 次结果"——连续 `quota` 的别再推荐。 |
 | `codev_auth_codex` | codex 多信号鉴权（env 或 `~/.codex/auth.json`）→ `AUTH_OK`/`AUTH_FAILED`。**已被 `codev_probe` 调用**：codex 命中时其 OK 行附带该结论。 |
 | `codev_sbox_gc` | 清理残留：`codev-sbox.*` 超 **60 分钟且 `.codev-owner` 里的 pid 已死**（owner 活着不删，但**超 7 天不看 pid 一律删**——pid 会被复用；60 分钟只是老版本沙盒无标记时的兜底启发）、会话目录 `codev.*` 超 **24 小时且目录内 24 小时内无任何文件写入**（会话目录没有单一持有者 pid，按活动时间判活；且显式跳过本次会话自己的目录）。**已被 `codev_probe` 调用**，Step 0 顺带清。 |
@@ -54,6 +56,8 @@
 `export CODEV_TIMEOUT=1200`（后台 shell 不继承，须逐调用设）。库有回归测试 `bash tests/test-lib.sh`（bash/zsh 都跑）。
 库的卫生规则见文件头注释（不 `set -e/-u`、不改 IFS/PATH、`umask` 收进子 shell、前缀 `codev_`/`CODEV_`、
 bash/zsh 通用——注意 `local` 非 POSIX，仅保证这两个 shell）。下文各 agent 用 `codev_bg_*` 一行式给出精确命令。
+
+三个账本统一通过 `codev_tsv_append` 在独占锁内写完整行，实参布局不变，Tab/CR/LF 统一转空格。发现/意见保存失败返回非零；调用账本失败告警但保留真实 CLI 结果。`codev_opinions` 遇损坏行会返回非零并停止给出可执行/关闭结论，不能把缺失判断静默当作无人反对。已有旧会话使用的是拷贝到会话目录的库，后续调用需更新该副本才能采用新的写入协议。
 
 **提示词一律走文件，禁止内联进命令行**——把完整提示词写入临时文件，命令里用
 `"$(cat "$PROMPT")"` 引用。**绝不**把 `git diff`/用户需求原文直接拼进 `"<完整提示词>"`：

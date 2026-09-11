@@ -25,7 +25,7 @@ codebuddy 429 重置时间、Max turns、context canceled、空输出、部分�
 母本 chmod 校验失败退回 text（chmod 被替身、母本不铺）、签名哈希皆空时不铺母本、长额度页判 quota 而长评审仍 ok、
 shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不看 pid 直接删、`self`（本 agent 的自评）走同一套翻牌/账本/probe、长散文回答含 429/rate limit 仍判 ok、FIFO 不进母本、
 探针 rmdir 失败仍判不安全、扫描钉住的母本与当前不一致时拒铺副本、复用可写母本时补 a-w、长额度页翻牌带开头、
-散文里的 quota limit 词不误杀；全库自审回归覆盖未跟踪内容边界、初始仓库和 textconv 签名、哈希失败传播、字面文件提交、归档复制失败和路径参数、重复调用清理 metrics、输出及 JSON 解包权限、结构化错误优先级与坏 usage；子测试用当前 shell（`TEST_SH`）与探测到的 `CODEV_TO` 起子进程。
+散文里的 quota limit 词不误杀；全库自审回归覆盖未跟踪内容边界、初始仓库和 textconv 签名、哈希失败传播、字面文件提交、归档复制失败和路径参数、重复调用清理 metrics、输出及 JSON 解包权限、结构化错误优先级与坏 usage；第二轮补充结构化状态重复读取、空白/对象 JSON、科学计数法和大整数、缺失计量、并发短/长记录、损坏意见拒绝放行及不可覆盖归档。子测试用当前 shell（`TEST_SH`）与探测到的 `CODEV_TO` 起子进程。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。

@@ -176,18 +176,27 @@ codev_err_lines() {
 # 【fail-safe】任何一步不满足就原样不动：宁可少一条计量，也不能毁掉要逐字呈现的正文。
 # 必须在 codev_classify 之前调用：JSON 包着的正文会让 classify 的结论标记/错误短语判据失准。
 codev_unwrap_result() {
-  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" unwrap_rc
+  local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" result_state="$CODEV_DIR/codev-result-$1.json" unwrap_rc
   [ -s "$out" ] || return 0
-  [ "$(head -c 1 "$out" 2>/dev/null)" = "[" ] || return 0   # 不是 JSON 数组就不碰
+  if [ ! -e "$result_state" ] && ! LC_ALL=C grep -qE '^[[:space:]]*(\[|\{)' "$out"; then return 0; fi
   command -v python3 >/dev/null 2>&1 || return 0
-  if python3 - "$out" "$m" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
-import json, os, sys
-out, mfile = sys.argv[1], sys.argv[2]
-with open(out, encoding="utf-8") as f:
-    d = json.load(f)
-if not isinstance(d, list) or not d:
-    raise SystemExit(1)
-last = d[-1]
+  if python3 - "$out" "$m" "$result_state" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
+import json, os, sys, hashlib, tempfile
+out, mfile, statefile = sys.argv[1:]
+with open(out, "rb") as f:
+    original = f.read()
+if os.path.exists(statefile):
+    try:
+        with open(statefile, encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict) or state.get("version") != 1 or state.get("status") not in (0, 10, 11) or not isinstance(state.get("sha256"), str):
+            raise ValueError("invalid result state")
+    except (OSError, ValueError, TypeError):
+        raise SystemExit(11)
+    if state["sha256"] == hashlib.sha256(original).hexdigest():
+        raise SystemExit(state["status"])
+d = json.loads(original)
+last = d[-1] if isinstance(d, list) and d else d
 if not isinstance(last, dict) or last.get("type") != "result":
     raise SystemExit(1)
 text = last.get("result")
@@ -205,6 +214,16 @@ if not isinstance(u, dict):
     raise SystemExit(failure_status or 1)  # 保留原文，但不能丢失已识别的失败状态
 tmp = out + ".unwrap"
 try:
+    # 先保存绑定正文哈希的结构化状态，再替换正文；重复 report 不会丢掉原始失败标记。
+    state = {"version": 1, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "status": failure_status}
+    state_fd, state_tmp = tempfile.mkstemp(prefix=".codev-result-", dir=os.path.dirname(statefile))
+    try:
+        with os.fdopen(state_fd, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(state_tmp, statefile)
+    finally:
+        if os.path.exists(state_tmp):
+            os.unlink(state_tmp)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -234,8 +253,33 @@ CODEV_UNWRAP_PY
   case "$unwrap_rc" in 10|11) return "$unwrap_rc";; *) return 0;; esac
 }
 
+# codev_metric <agent> <tokens|cost> — 只解析完整 JSON 的顶层计量；缺项、坏类型或无 Python 时不猜总量。
+codev_metric() {
+  [ -s "$CODEV_DIR/codev-metrics-$1.json" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$CODEV_DIR/codev-metrics-$1.json" "$2" <<'CODEV_METRIC_PY' 2>/dev/null || true
+import json, sys, re
+from decimal import Decimal
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f, parse_float=Decimal)
+    if not isinstance(data, dict):
+        raise ValueError("metrics must be an object")
+    if sys.argv[2] == "tokens":
+        a, b = data.get("prompt_tokens"), data.get("completion_tokens")
+        if type(a) is int and type(b) is int and a >= 0 and b >= 0:
+            print(a + b, end="")
+    elif sys.argv[2] == "cost":
+        c, currency = data.get("cost"), data.get("currency") or "?"
+        if type(c) in (int, Decimal) and Decimal(c).is_finite() and c >= 0 and isinstance(currency, str) and re.fullmatch(r"[A-Za-z]{3}|\?", currency):
+            print(f"{c:.3f} {currency}", end="")
+except (OSError, ValueError, TypeError, ArithmeticError):
+    pass
+CODEV_METRIC_PY
+}
+
 codev_tokens() {
-  local agent="$1" err="$CODEV_DIR/codev-err-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" n="" a b v=""
+  local agent="$1" err="$CODEV_DIR/codev-err-$1.txt" n="" v=""
   # 编排器直接告知的用量：子 agent（G1 check / G2 self）没有 CLI、拿不到 metrics 文件，
   # 用量只有编排器手里有。与 codev_model_of 的 CODEV_MODEL_<agent> 同一范式。
   # agent 名先过白名单再 eval（同 codev_model_of），防注入；值必须全是数字才采信。
@@ -244,15 +288,7 @@ codev_tokens() {
   case "$agent" in
     codex)
       n=$(grep -aiA1 'tokens used' "$err" 2>/dev/null | tail -n 1 | tr -cd '0-9') ;;
-    *)
-      if [ -s "$m" ]; then
-        # 只取【第一次出现】：metrics JSON 里同名键会在嵌套的 per-provider 段重复出现，
-        # 不加 head -n1 会把多个数字串接成一个天文数字（实测 5826 → 58265848）。
-        # 同 codev_cost：冒号后紧跟数字，否则 "prompt_tokens": null 会串到下一个键的数字上。
-        a=$(grep -o '"prompt_tokens"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
-        b=$(grep -o '"completion_tokens"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$m" 2>/dev/null | head -n 1 | tr -cd '0-9')
-        [ -n "$a" ] && n=$(( ${a:-0} + ${b:-0} ))
-      fi ;;
+    *) n=$(codev_metric "$agent" tokens) ;;
   esac
   [ -n "$n" ] && printf 'tokens %s' "$n"
   return 0
@@ -274,16 +310,11 @@ codev_model_of() {
 
 # codev_cost <agent> — 能取到才输出 "0.052 CNY"（reasonix --metrics 的 cost/currency 首次出现）；否则空串。
 codev_cost() {
-  local agent="$1" m="$CODEV_DIR/codev-metrics-$1.json" c u v=""
-  # 同 codev_tokens：编排器可直接告知，形如 "1.29 CNY"。只接受 数字/点/空格/字母。
+  local agent="$1" v=""
+  # 同 codev_tokens：编排器可直接告知，必须是金额加三字母币种。
   case "$agent" in *[!A-Za-z0-9_]*|'') ;; *) eval "v=\${CODEV_COST_$agent:-}";; esac
-  case "$v" in '') ;; *[!0-9.\ A-Za-z]*) ;; *) printf '%s' "$v"; return 0;; esac
-  [ -s "$m" ] || return 0
-  # 冒号后必须【紧跟】数字：不锚定的话 "cost": null 会一路吃到同一行下一个数字（实测把 4210 个 token 当成 4210.000 CNY 报出去）。
-  c=$(grep -o '"cost"[[:space:]]*:[[:space:]]*[0-9][0-9.]*' "$m" 2>/dev/null | head -n 1 | sed 's/.*[^0-9.]\([0-9][0-9.]*\)$/\1/')
-  u=$(grep -o '"currency"[[:space:]]*:[[:space:]]*"[A-Za-z]*"' "$m" 2>/dev/null | head -n 1 | sed 's/.*"\([A-Za-z]*\)"$/\1/')
-  [ -n "$c" ] && printf '%.3f %s' "$c" "${u:-?}"
-  return 0
+  if printf '%s\n' "$v" | LC_ALL=C grep -qE '^[0-9]+([.][0-9]+)? [A-Za-z]{3}$'; then printf '%s' "$v"; return 0; fi
+  codev_metric "$agent" cost
 }
 
 # codev_reset_note <text> — 从额度/限流错误串里抽重置时间："将在 X 重置" / "try again at X" / "resets at X"。
@@ -295,17 +326,51 @@ codev_reset_note() {
   return 0
 }
 
-# codev_ledger_append <agent> <class> <rc> <secs> [note] — 追加一行到跨会话账本（失败静默）。
+# codev_tsv_append <file> <fields...> — 在独占文件锁内写完整一行；字段通过 stdin 传递，长备注不受 argv 限制。
+# Python/fcntl 不可用时明确失败，不退回可能交错的逐字段写入。所有三个账本共用此入口。
+codev_tsv_append() {
+  local dest="$1"; shift
+  command -v python3 >/dev/null 2>&1 || { echo "⚠️ 写入账本需要 python3，记录未保存" >&2; return 1; }
+  printf '%s\0' "$@" | python3 -c '
+import os, sys, fcntl
+dest = sys.argv[1]
+fields = sys.stdin.buffer.read().split(b"\0")[:-1]
+row = b"\t".join(f.replace(b"\t", b" ").replace(b"\r", b" ").replace(b"\n", b" ") for f in fields) + b"\n"
+fd = None
+try:
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    start = os.lseek(fd, 0, os.SEEK_END)
+    try:
+        written = 0
+        while written < len(row):
+            n = os.write(fd, row[written:])
+            if n <= 0:
+                raise OSError("incomplete write")
+            written += n
+    except BaseException:
+        os.ftruncate(fd, start)
+        raise
+except OSError as e:
+    print("codev: 账本写入失败: " + str(e), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if fd is not None:
+        os.close(fd)
+' "$dest"
+}
+
+# codev_ledger_append <agent> <class> <rc> <secs> [note] — 追加调用账本；保存失败告警，不覆盖 CLI 结果。
 # 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注（12 列，制表符分隔）。
 codev_ledger_append() {
-  local agent="$1" cls="$2" rc="$3" secs="$4" note="${5:-}" pb=0 ob=0 d tk cost
-  d=$(dirname "$CODEV_LEDGER"); mkdir -p "$d" 2>/dev/null || return 0
+  local agent="$1" cls="$2" rc="$3" secs="$4" note="${5:-}" pb=0 ob=0 tk cost
   [ -s "$CODEV_DIR/codev-prompt-$agent.txt" ] && pb=$(wc -c < "$CODEV_DIR/codev-prompt-$agent.txt" | tr -d ' ')
   [ -s "$CODEV_DIR/codev-out-$agent.txt" ] && ob=$(wc -c < "$CODEV_DIR/codev-out-$agent.txt" | tr -d ' ')
   tk=$(codev_tokens "$agent" | tr -cd '0-9'); cost=$(codev_cost "$agent")
-  note=$(printf '%s' "$note" | tr '\t\n' '  ')
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M)" "$(basename "$CODEV_DIR")" \
-    "$agent" "$(codev_model_of "$agent")" "$cls" "$rc" "$secs" "$pb" "$ob" "${tk:--}" "${cost:--}" "${note:--}" >> "$CODEV_LEDGER" 2>/dev/null
+  codev_tsv_append "$CODEV_LEDGER" "$(date +%Y-%m-%dT%H:%M)" "$(basename "$CODEV_DIR")" \
+    "$agent" "$(codev_model_of "$agent")" "$cls" "$rc" "$secs" "$pb" "$ob" "${tk:--}" "${cost:--}" "${note:--}" \
+    || echo "⚠️ 本次调用用量未保存到 $CODEV_LEDGER" >&2
   return 0
 }
 
@@ -344,11 +409,7 @@ codev_finding_add() {
   case "$9"  in 采纳|驳回|存疑) ;; *) echo "codev_finding_add: 第 9 个实参（verdict）须为 采纳/驳回/存疑，收到「$9」" >&2; return 1;; esac
   case "${10}" in 成立|不成立|待定) ;; *) echo "codev_finding_add: 第 10 个实参（verified）须为 成立/不成立/待定，收到「${10}」" >&2; return 1;; esac
   case "${11}" in 独家|共同) ;; *) echo "codev_finding_add: 第 11 个实参（unique）须为 独家/共同，收到「${11}」" >&2; return 1;; esac
-  local d f
-  d=$(dirname "$CODEV_FINDINGS"); mkdir -p "$d" 2>/dev/null || return 1
-  printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_FINDINGS"
-  for f in "$@"; do printf '\t%s' "$(printf '%s' "$f" | tr '\t\n' '  ')" >> "$CODEV_FINDINGS"; done
-  printf '\n' >> "$CODEV_FINDINGS"
+  codev_tsv_append "$CODEV_FINDINGS" "$(date +%Y-%m-%dT%H:%M)" "$@"
 }
 
 # codev_stats [repo] — 按 agent+模型汇总发现台账：声称 P1 里经亲验成立的比例、独家且成立数、总条数、采纳数。
@@ -386,11 +447,7 @@ codev_opinion_add() {
   case "$6"  in 评审|判断|自审|复核) ;; *) echo "codev_opinion_add: 第 6 个实参（role）须为 评审/判断/自审/复核，收到「$6」" >&2; return 1;; esac
   case "$8"  in 提出|采纳|驳回|存疑|未返回) ;; *) echo "codev_opinion_add: 第 8 个实参（stance）须为 提出/采纳/驳回/存疑/未返回，收到「$8」" >&2; return 1;; esac
   case "$9"  in P1|P2|P3|-) ;; *) echo "codev_opinion_add: 第 9 个实参（severity）须为 P1/P2/P3/-，收到「$9」" >&2; return 1;; esac
-  local d f
-  d=$(dirname "$CODEV_OPINIONS"); mkdir -p "$d" 2>/dev/null || return 1
-  printf '%s' "$(date +%Y-%m-%dT%H:%M)" >> "$CODEV_OPINIONS"
-  for f in "$@"; do printf '\t%s' "$(printf '%s' "$f" | tr '\t\n' '  ')" >> "$CODEV_OPINIONS"; done
-  printf '\t%s\n' "$(printf '%s' "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}" | tr '\t\n' '  ')" >> "$CODEV_OPINIONS"
+  codev_tsv_append "$CODEV_OPINIONS" "$(date +%Y-%m-%dT%H:%M)" "$@" "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}"
 }
 
 # codev_opinions [issue [repo [doc [round [task]]]]] — 空参数为该维度不过滤；不传参数回放全部。
@@ -430,12 +487,14 @@ codev_opinions() {
       else if (adopt == nj)   v = "→ 均认为缺陷成立但修法不同：缺陷 open、修法 disputed，不执行任意一方"
       else                    v = "→ 判断组未达成一致（" stances "）：只执行明确一致且可独立执行的部分"
       if (legacy[g] && (v ~ /可进执行清单|一致驳回/)) v = "→ 旧记录仅供回顾：缺少 task ID，补齐任务归属前不进入执行清单或关闭该项"
+      if (bad) v = "→ 意见文件存在损坏行：修复记录前不据此执行或关闭问题"
       printf "  %s\n", v
       if (p1seen && (sevdiff || missing || nj>2 || v ~ /未达成一致|disputed/)) printf "  %s\n", "⚠️ 涉及 P1：澄清前按潜在阻塞项保留，不得取较低级别放行"
       if (legacy[g]) print "  ⚠️ 旧记录缺少 task ID：仅按仓库/对象/轮次隔离，无法区分同范围内的不同历史任务"
       printf "\n"
     }
-    (NF==12 || NF==13) && (want=="" || $8==want) && (repo=="" || $2==repo) && (doc=="" || $3==doc) && (round=="" || $4==round) && (task=="" || $13==task) {
+    NF && (NF!=12 && NF!=13 || $7 !~ /^(评审|判断|自审|复核)$/ || $9 !~ /^(提出|采纳|驳回|存疑|未返回)$/ || $10 !~ /^(P1|P2|P3|-)$/ || $5=="" || $8=="") { bad++; next }
+    NF && (want=="" || $8==want) && (repo=="" || $2==repo) && (doc=="" || $3==doc) && (round=="" || $4==round) && (task=="" || $13==task) {
       key=part($2) part($3) part($4) part($13) part($8)
       if (!(key in groups)) {
         groups[key]=++count; g=count; legacy[g]=($13=="")
@@ -449,7 +508,7 @@ codev_opinions() {
         latest[g,$5]=$0
       }
     }
-    END { for (g=1; g<=count; g++) flush(g); if (!count) print "  （没有匹配的记录）" }' "$CODEV_OPINIONS"
+    END { for (g=1; g<=count; g++) flush(g); if (bad) { printf "  ⚠️ %d 行意见记录损坏，回放未完成\n", bad; exit 1 } if (!count) print "  （没有匹配的记录）" }' "$CODEV_OPINIONS"
 }
 
 # codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
@@ -528,7 +587,7 @@ codev_prev_round_commit() {
 # 保证不入库（本地生效、不改仓库的 .gitignore）。评审原文不进 git：几十 KB × 多家 × 多轮会堆满仓库。
 codev_archive() {
   [ $# -eq 2 ] || { echo "用法: codev_archive slug round" >&2; return 1; }
-  local slug="$1" round="$2" root gitdir dest f files
+  local slug="$1" round="$2" root gitdir dest f files stage
   case "$round" in ''|*[!0-9]*) echo "⚠️ 归档轮次必须为数字" >&2; return 1;; esac
   root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "⚠️ 非 git 仓库，跳过归档" >&2; return 1; }
   # 不能硬写 $root/.git：worktree / submodule 里 .git 是【文件】，mkdir 会失败，exclude 就写不进去。
@@ -539,24 +598,34 @@ codev_archive() {
   slug=$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-')
   case "$slug" in ''|.|..) echo "⚠️ 归档 slug 无效" >&2; return 1;; esac
   dest="$root/.superpowers/codev/$slug/r$round"
-  mkdir -p "$dest" || return 1
+  command -v python3 >/dev/null 2>&1 || { echo "⚠️ 原子发布归档需要 python3" >&2; return 1; }
+  mkdir -p "${dest%/*}" || return 1
+  stage=$(mktemp -d "${dest%/*}/.r$round.XXXXXX") || return 1
   if ! git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
     [ -n "$gitdir" ] && mkdir -p "$gitdir/info" && printf '.superpowers/\n' >> "$gitdir/info/exclude"
   fi
   # 用 find 而不是 for f in "$CODEV_DIR"/xxx-*：zsh 默认 NOMATCH，glob 匹配不到文件时直接报错终止函数
   # （只有 metrics 缺失就整个归档失败）。find 还顺带能扛住路径里的空格。
-  files=$(mktemp "$CODEV_DIR/codev-archive.XXXXXX") || return 1
+  files=$(mktemp "$CODEV_DIR/codev-archive.XXXXXX") || { rmdir "$stage"; return 1; }
   if ! find "$CODEV_DIR" -maxdepth 1 -type f \( -name 'codev-prompt-*.txt' -o -name 'codev-out-*.txt' \
-    -o -name 'codev-err-*.txt' -o -name 'codev-metrics-*.json' \) -print0 > "$files"; then
-    rm -f "$files"; return 1
+    -o -name 'codev-err-*.txt' -o -name 'codev-metrics-*.json' -o -name 'codev-result-*.json' \) -print0 > "$files"; then
+    rm -f "$files"; rmdir "$stage"; return 1
   fi
   while IFS= read -r -d '' f; do
-    if ! cp -- "$f" "$dest/"; then
-      echo "⚠️ 归档复制失败，目标可能不完整：$dest" >&2
-      rm -f "$files"; return 1
+    if ! cp -- "$f" "$stage/"; then
+      echo "⚠️ 归档复制失败，未发布：$dest" >&2
+      rm -f "$files"; rm -rf "$stage"; return 1
     fi
   done < "$files"
   rm -f "$files"
+  # rename 不会把目录移入已存在的目录；已发布的非空轮次只能幂等复用，不能覆盖历史。
+  if ! python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$stage" "$dest" 2>/dev/null; then
+    if ! diff -qr -- "$stage" "$dest" >/dev/null 2>&1; then
+      echo "⚠️ 归档目标已存在且内容不同，或发布失败；历史未覆盖：$dest" >&2
+      rm -rf "$stage"; return 1
+    fi
+    rm -rf "$stage"
+  fi
   # 只有真的忽略掉了才这么说——评审原文含仓库 diff，被误 `git add -A` 进仓库比不归档更糟。
   if git -C "$root" check-ignore -q ".superpowers/codev/$slug/r$round/x" 2>/dev/null; then
     echo "已归档到 ${dest}（已被 git 忽略）"
@@ -956,7 +1025,7 @@ codev_prepare_call() {
   (
     umask 077
     : > "$out" && : > "$err" && chmod 600 "$out" "$err" &&
-    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$out.unwrap"
+    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$CODEV_DIR/codev-result-$agent.json" "$out.unwrap"
   ) || { echo "⚠️ 无法准备 $agent 的输出/计量文件，未启动调用" >&2; return 1; }
 }
 
