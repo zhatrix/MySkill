@@ -752,6 +752,111 @@ REPO=$(mktemp -d -t codevreview.XXXXXX)
 ) && ok "同内容可重复归档，不同内容不能覆盖已归档轮次" || bad "历史归档被新内容覆盖"
 rm -rf "$REPO"
 
+echo "41. 第三轮全库自审：失败恢复、共享读锁与当前会话保护"
+mk recover '{"type":"result","result":"PASS","usage":{"input_tokens":2,"output_tokens":3},"total_cost_usd":0.25}' ''
+before=$(cat "$CODEV_DIR/codev-out-recover.txt")
+mkdir "$CODEV_DIR/codev-metrics-recover.json"
+r=$(report recover 0)
+[ "$(cat "$CODEV_DIR/codev-out-recover.txt")" = "$before" ] && ok "计量保存失败保留原始结果供重试" || bad "计量失败已不可恢复地解包正文"
+case "$r" in *'✔'*) bad "结果保存失败仍宣称完成" "$r";; *'未能完成解析或保存'*) ok "结果保存失败明确要求重试";; *) bad "保存失败没有明确提示" "$r";; esac
+rmdir "$CODEV_DIR/codev-metrics-recover.json"
+r=$(report recover 0)
+case "$r" in *'✔'*'tokens 5'*'0.250 USD'*) ok "修复存储故障后重试恢复完整计量";; *) bad "重试丢失原始用量" "$r";; esac
+[ -f "$CODEV_DIR/codev-metrics-recover.json" ] && [ -z "$(find "$CODEV_DIR/codev-metrics-recover.json" \( -perm -004 -o -perm -040 \))" ] && ok "归一化 metrics 仅本人可读" || bad "归一化 metrics 缺失或扩大权限"
+mk parserless '{"type":"result","is_error":true,"result":"PASS"}' ''
+r=$(
+  command() { if [ "${1:-}" = -v ] && [ "${2:-}" = python3 ]; then return 1; fi; builtin command "$@"; }
+  report parserless 0
+)
+case "$r" in *'✔'*) bad "没有解析器时结构化错误被判成功" "$r";; *'未能完成解析或保存'*) ok "缺少解析器时不猜测结构化结果成功";; *) bad "缺少解析器无明确提示" "$r";; esac
+r=$(python3() { return 127; }; report parserless 0)
+case "$r" in *'✔'*) bad "损坏解析器时结构化错误被判成功" "$r";; *'未能完成解析或保存'*) ok "解析器异常退出也保守报告失败";; *) bad "解析器异常未识别" "$r";; esac
+mk bracket '[P1] 参数校验遗漏' ''
+r=$(report bracket 0)
+case "$r" in *'✔'*) ok "普通方括号开头的评审正文仍可呈现";; *) bad "把普通正文当成损坏结构化结果" "$r";; esac
+
+(
+  gc_root="$CODEV_DIR/gc-paths"
+  mkdir -p "$gc_root/real/codev.current" "$gc_root/real/codev.stale" "$gc_root/real/codev.parent/nested"
+  ln -s "$gc_root/real" "$gc_root/alias"
+  printf active > "$gc_root/real/codev.current/data"
+  find "$gc_root/real" -exec touch -t 202001010000 {} +
+  CODEV_DIR="$gc_root/alias/codev.current" TMPDIR="$gc_root/real" codev_sbox_gc >/dev/null
+  [ -f "$gc_root/real/codev.current/data" ] && [ ! -e "$gc_root/real/codev.stale" ]
+) && ok "GC 识别当前会话的符号链接路径且仍清理过期会话" || bad "GC 误删符号链接表示的当前会话"
+(
+  gc_root="$CODEV_DIR/gc-trailing"
+  mkdir -p "$gc_root/codev.current"
+  find "$gc_root" -exec touch -t 202001010000 {} +
+  CODEV_DIR="$gc_root/codev.current/" TMPDIR="$gc_root" codev_sbox_gc >/dev/null
+  [ -d "$gc_root/codev.current" ]
+) && ok "GC 忽略当前会话路径的尾斜杠差异" || bad "GC 误删尾斜杠路径的当前会话"
+(
+  gc_root="$CODEV_DIR/gc-ancestor"
+  mkdir -p "$gc_root/codev.parent/nested"
+  find "$gc_root" -exec touch -t 202001010000 {} +
+  CODEV_DIR="$gc_root/codev.parent/nested" TMPDIR="$gc_root" codev_sbox_gc >/dev/null
+  [ -d "$gc_root/codev.parent/nested" ]
+) && ok "GC 不删除包含当前会话的过期父目录" || bad "GC 经父目录误删当前会话"
+
+# 写者暂停在最后一列之前，此时磁盘上的半行恰好像旧 12 列记录。
+# 无共享读锁的回放会把新立场放进旧任务组，仍允许执行原任务中的旧一致意见。
+cat > "$CODEV_DIR/paused-append.py" <<'CODEV_PAUSED_PY'
+import fcntl, os, sys, time
+dest, payload, signal = sys.argv[1:]
+with open(payload, "rb") as f:
+    row = f.read()
+split = row.rfind(b"\t")
+with open(dest, "ab", buffering=0) as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(row[:split])
+    with open(signal, "w"):
+        pass
+    # 尽早结束旧库的错误读取；新库等待共享锁，1 秒后释放即可读到完整行。
+    deadline = time.monotonic() + 1
+    while not os.path.exists(signal + ".read") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    f.write(row[split:])
+CODEV_PAUSED_PY
+(
+  export CODEV_OPINIONS="$CODEV_DIR/read-lock.tsv" CODEV_TASK_ID=read-lock
+  codev_opinion_add repo doc 1 claude model 判断 issue 采纳 P1 fix -
+  codev_opinion_add repo doc 1 codex model 判断 issue 采纳 P1 fix -
+  CODEV_OPINIONS="$CODEV_DIR/append-row.tsv" codev_opinion_add repo doc 1 codex model 判断 issue 存疑 P1 fix changed
+  signal="$CODEV_DIR/paused-ready"
+  python3 "$CODEV_DIR/paused-append.py" "$CODEV_OPINIONS" "$CODEV_DIR/append-row.tsv" "$signal" & writer=$!
+  for i in $(seq 1 200); do [ -f "$signal" ] && break; sleep 0.01; done
+  [ -f "$signal" ] || { wait "$writer"; exit 1; }
+  codev_opinions issue repo doc 1 read-lock > "$signal.result"
+  read_rc=$?
+  : > "$signal.read"
+  wait "$writer" || exit 1
+  [ "$read_rc" = 0 ] && grep -q '未达成一致' "$signal.result" && ! grep -q '可进执行清单' "$signal.result"
+) && ok "意见回放等待正在写入的新立场，不能按旧一致放行" || bad "回放读取半行后错误执行旧判断"
+
+for reader in codev_ledger_recent codev_session_summary codev_stats codev_opinions; do
+  (
+    mkdir -p "$CODEV_DIR/unreadable.tsv"
+    export CODEV_LEDGER="$CODEV_DIR/unreadable.tsv" CODEV_FINDINGS="$CODEV_DIR/unreadable.tsv" CODEV_OPINIONS="$CODEV_DIR/unreadable.tsv"
+    "$reader" agent > "$CODEV_DIR/read-error.txt" 2>&1
+    [ $? -ne 0 ] && ! grep -q '为空\|无账本记录\|可进执行清单' "$CODEV_DIR/read-error.txt"
+  ) && ok "$reader 不把读取失败当成空账本" || bad "$reader 掩盖读取失败"
+done
+for field in agent issue; do
+  for blank in '' '   '; do
+    (
+      export CODEV_OPINIONS="$CODEV_DIR/invalid-identity.tsv"
+      rm -f "$CODEV_OPINIONS"
+      if [ "$field" = agent ]; then
+        codev_opinion_add repo doc 1 "$blank" model 判断 issue 采纳 P1 fix - >/dev/null 2>&1
+      else
+        codev_opinion_add repo doc 1 agent model 判断 "$blank" 采纳 P1 fix - >/dev/null 2>&1
+      fi
+      [ $? -ne 0 ] && [ ! -s "$CODEV_OPINIONS" ]
+    ) && ok "意见写入拒绝空白 $field" || bad "意见接口写入了自身无法有效回放的 $field"
+  done
+done
+
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

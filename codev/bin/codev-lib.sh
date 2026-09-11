@@ -173,13 +173,13 @@ codev_err_lines() {
 # 末元素 type=result 同时带 .result（正文）、.usage（token）、.total_cost_usd（成本）。
 # 这里把正文还原回 codev-out-<agent>.txt，并把用量归一化成 metrics JSON——复用 codev_tokens /
 # codev_cost 既有的解析路径，不必为每个 CLI 各写一套提取器。
-# 【fail-safe】任何一步不满足就原样不动：宁可少一条计量，也不能毁掉要逐字呈现的正文。
+# 先保存计量与状态，再替换正文；保存失败保留原始 JSON 供重试，不能把失败误报为完成。
 # 必须在 codev_classify 之前调用：JSON 包着的正文会让 classify 的结论标记/错误短语判据失准。
 codev_unwrap_result() {
   local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" m="$CODEV_DIR/codev-metrics-$1.json" result_state="$CODEV_DIR/codev-result-$1.json" unwrap_rc
   [ -s "$out" ] || return 0
   if [ ! -e "$result_state" ] && ! LC_ALL=C grep -qE '^[[:space:]]*(\[|\{)' "$out"; then return 0; fi
-  command -v python3 >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 12
   if python3 - "$out" "$m" "$result_state" <<'CODEV_UNWRAP_PY' >/dev/null 2>&1
 import json, os, sys, hashlib, tempfile
 out, mfile, statefile = sys.argv[1:]
@@ -195,62 +195,65 @@ if os.path.exists(statefile):
         raise SystemExit(11)
     if state["sha256"] == hashlib.sha256(original).hexdigest():
         raise SystemExit(state["status"])
-d = json.loads(original)
+try:
+    d = json.loads(original)
+except (ValueError, UnicodeError):
+    raise SystemExit(3)  # 如 [P1] 开头的普通评审文本，不是 JSON 结果封装
 last = d[-1] if isinstance(d, list) and d else d
 if not isinstance(last, dict) or last.get("type") != "result":
-    raise SystemExit(1)
+    raise SystemExit(3)
 text = last.get("result")
 subtype = last.get("subtype", "")
 if not isinstance(subtype, str):
-    raise SystemExit(11 if last.get("is_error") is True else 1)
+    raise SystemExit(11 if last.get("is_error") is True else 12)
 failed = last.get("is_error") is True or subtype.startswith("error")
 failure_status = (10 if "max_turns" in subtype else 11) if failed else 0
 if failed and (text is None or text == ""):
     text = subtype or "structured result reports an error"
 if not isinstance(text, str) or not text.strip():
-    raise SystemExit(failure_status or 1)
+    raise SystemExit(failure_status or 12)
 u = last.get("usage") or {}
 if not isinstance(u, dict):
-    raise SystemExit(failure_status or 1)  # 保留原文，但不能丢失已识别的失败状态
-tmp = out + ".unwrap"
-try:
-    # 先保存绑定正文哈希的结构化状态，再替换正文；重复 report 不会丢掉原始失败标记。
-    state = {"version": 1, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "status": failure_status}
-    state_fd, state_tmp = tempfile.mkstemp(prefix=".codev-result-", dir=os.path.dirname(statefile))
+    raise SystemExit(failure_status or 12)  # 保留原文，但不能丢失已识别的失败状态
+
+def save_json(dest, data):
+    fd, pending = tempfile.mkstemp(prefix=".codev-result-", dir=os.path.dirname(dest))
     try:
-        with os.fdopen(state_fd, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(state_tmp, statefile)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(pending, dest)
     finally:
-        if os.path.exists(state_tmp):
-            os.unlink(state_tmp)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, out)         # 原子替换，半截文件不会被 agent 读到
-except OSError:
-    raise SystemExit(failure_status or 1)
-# 归一化成 codev_tokens/codev_cost 认得的键名；取不到的写 null，两边的正则都要求冒号后紧跟数字，
-# 所以 null 会被安全地当成"没有该项"。
+        if os.path.exists(pending):
+            os.unlink(pending)
+
+# 缺失计量写 null，codev_metric 不会把它当作完整总计。
 metrics = {
     "prompt_tokens": u.get("input_tokens"),
     "completion_tokens": u.get("output_tokens"),
     "cost": last.get("total_cost_usd"),
     "currency": "USD",
 }
+tmp = out + ".unwrap"
 try:
-    if metrics["prompt_tokens"] is not None or metrics["cost"] is not None:
-        with open(mfile, "w", encoding="utf-8") as f:
-            json.dump(metrics, f)
+    # 不可先解包再保存计量：一旦保存失败，原始 usage 就会丢失，重复 report 也无从恢复。
+    if any(metrics[k] is not None for k in ("prompt_tokens", "completion_tokens", "cost")):
+        save_json(mfile, metrics)
+    # 状态仍先于正文提交，重复 report 不会丢掉原始失败标记。
+    state = {"version": 1, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "status": failure_status}
+    save_json(statefile, state)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, out)         # 原子替换，半截文件不会被 agent 读到
 except OSError:
-    raise SystemExit(failure_status or 1)
+    raise SystemExit(failure_status or 12)
 raise SystemExit(failure_status)
 CODEV_UNWRAP_PY
   then return 0
   else unwrap_rc=$?; fi
-  # 10/11 表示成功解包的结构化失败，不是解析失败。report 必须优先采用这一状态。
-  case "$unwrap_rc" in 10|11) return "$unwrap_rc";; *) return 0;; esac
+  # 3=普通文本；10/11=已知结构化失败；其它异常=未能验证/保存，均不能当作成功。
+  case "$unwrap_rc" in 3) return 0;; 10|11) return "$unwrap_rc";; *) return 12;; esac
 }
 
 # codev_metric <agent> <tokens|cost> — 只解析完整 JSON 的顶层计量；缺项、坏类型或无 Python 时不猜总量。
@@ -361,6 +364,33 @@ finally:
 ' "$dest"
 }
 
+# codev_tsv_snapshot <file> — 共享锁内复制为私有临时文件；调用方用完删除，读取失败不输出可用路径。
+# 与追加者锁同一文件，避免读到尚未写完的新判断；不存在的账本产生空副本，I/O 错误明确返回非零。
+codev_tsv_snapshot() {
+  command -v python3 >/dev/null 2>&1 || { echo "⚠️ 读取账本需要 python3，读取未完成" >&2; return 1; }
+  python3 - "$1" "$CODEV_DIR" <<'CODEV_TSV_SNAPSHOT_PY'
+import fcntl, os, shutil, sys, tempfile
+pending = None
+try:
+    fd, pending = tempfile.mkstemp(prefix=".codev-tsv-", dir=sys.argv[2])
+    with os.fdopen(fd, "wb") as copy:
+        try:
+            src = open(sys.argv[1], "rb")
+        except FileNotFoundError:
+            src = None
+        if src is not None:
+            with src:
+                fcntl.flock(src, fcntl.LOCK_SH)
+                shutil.copyfileobj(src, copy)
+    print(pending)
+except OSError as e:
+    if pending is not None:
+        os.unlink(pending)
+    print("codev: 账本读取失败: " + str(e), file=sys.stderr)
+    sys.exit(1)
+CODEV_TSV_SNAPSHOT_PY
+}
+
 # codev_ledger_append <agent> <class> <rc> <secs> [note] — 追加调用账本；保存失败告警，不覆盖 CLI 结果。
 # 列：时间 会话 agent 模型 类别 rc 用时 提示词字节 输出字节 tokens 成本 备注（12 列，制表符分隔）。
 codev_ledger_append() {
@@ -376,11 +406,13 @@ codev_ledger_append() {
 
 # codev_ledger_recent <agent> — 该 agent 最近 3 次类别（旧→新，quota 附重置时间）+ 最近一次时间。
 codev_ledger_recent() {
-  local agent="$1" rows
-  [ -s "$CODEV_LEDGER" ] || return 0
+  local agent="$1" rows snapshot rc
+  snapshot=$(codev_tsv_snapshot "$CODEV_LEDGER") || return 1
   # 兼容升级前写下的旧行：7 列布局是 时间 agent 类别 rc 用时 提示词字节 输出字节（agent 在第 2 列、类别在第 3 列）。
   # 只认 12 列的话，老用户升级后 probe 的"近期 3 次结果"会整片消失，连续 quota 的 agent 就拦不住了。
-  rows=$(grep -a "	$agent	" "$CODEV_LEDGER" 2>/dev/null | awk -F'\t' -v a="$agent" 'NF>=12 && $3==a { print } NF==7 && $2==a { print $1 "\t-\t" $2 "\t-\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t-\t-\t-" }' | tail -n 3)
+  if rows=$(set -o pipefail; awk -F'\t' -v a="$agent" 'NF>=12 && $3==a { print } NF==7 && $2==a { print $1 "\t-\t" $2 "\t-\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t-\t-\t-" }' "$snapshot" | tail -n 3); then rc=0; else rc=$?; fi
+  rm -f "$snapshot"
+  [ "$rc" = 0 ] || return "$rc"
   [ -n "$rows" ] || return 0
   printf '%s (最近 %s)' \
     "$(printf '%s\n' "$rows" | awk -F'\t' '{ if ($5=="quota" && $12!="-") printf "%s(%s) ", $5, $12; else printf "%s ", $5 }' | sed 's/ $//')" \
@@ -389,11 +421,14 @@ codev_ledger_recent() {
 
 # codev_session_summary — 本会话（CODEV_DIR）所有调用的 用时/tokens/成本 一览，fan-out 全部结束后打印一次。
 codev_session_summary() {
-  local sess
+  local sess snapshot rc
   sess=$(basename "$CODEV_DIR")
-  [ -s "$CODEV_LEDGER" ] || { echo "（本会话无账本记录）"; return 0; }
+  snapshot=$(codev_tsv_snapshot "$CODEV_LEDGER") || return 1
+  [ -s "$snapshot" ] || { rm -f "$snapshot"; echo "（本会话无账本记录）"; return 0; }
   echo "本会话用量（agent 模型 类别 用时 tokens 成本）："
-  awk -F'\t' -v s="$sess" '$2==s { printf "  %-10s %-18s %-8s %4ss  %8s  %s\n", $3, $4, $5, $7, $10, $11 }' "$CODEV_LEDGER"
+  if awk -F'\t' -v s="$sess" '$2==s { printf "  %-10s %-18s %-8s %4ss  %8s  %s\n", $3, $4, $5, $7, $10, $11 }' "$snapshot"; then rc=0; else rc=$?; fi
+  rm -f "$snapshot"
+  return "$rc"
 }
 
 # codev_finding_add <repo> <doc> <round> <agent> <model> <id> <severity> <column> <verdict> <verified> <unique> <desc>
@@ -414,19 +449,22 @@ codev_finding_add() {
 
 # codev_stats [repo] — 按 agent+模型汇总发现台账：声称 P1 里经亲验成立的比例、独家且成立数、总条数、采纳数。
 codev_stats() {
-  local repo="${1:-}"
-  [ -s "$CODEV_FINDINGS" ] || { echo "（发现台账为空：${CODEV_FINDINGS}）"; return 0; }
+  local repo="${1:-}" snapshot rc
+  snapshot=$(codev_tsv_snapshot "$CODEV_FINDINGS") || return 1
+  [ -s "$snapshot" ] || { rm -f "$snapshot"; echo "（发现台账为空：${CODEV_FINDINGS}）"; return 0; }
   echo "发现台账统计（agent 模型 | P1 成立/声称 | 独家成立 | 总条数 | 采纳）${repo:+，仓库=$repo}："
   # LC_ALL=C 必须：macOS 自带 awk（BWK 20200816）在 UTF-8 locale 下 "不成立"=="成立" 判真（实测 3/3），
   # 中文字段相等比较只能按字节做。
-  LC_ALL=C awk -F'\t' -v r="$repo" '
+  if (set -o pipefail; LC_ALL=C awk -F'\t' -v r="$repo" '
     r=="" || $2==r {
       k=$5 "\t" $6; n[k]++
       if ($8=="P1") { p1[k]++; if ($11=="成立") ok[k]++ }
       if ($12=="独家" && $11=="成立") u[k]++
       if ($10=="采纳") a[k]++
     }
-    END { for (k in n) { split(k, kk, "\t"); printf "  %-10s %-18s P1 %d/%d  独家成立 %d  总 %d  采纳 %d\n", kk[1], kk[2], ok[k]+0, p1[k]+0, u[k]+0, n[k], a[k]+0 } }' "$CODEV_FINDINGS" | sort
+    END { for (k in n) { split(k, kk, "\t"); printf "  %-10s %-18s P1 %d/%d  独家成立 %d  总 %d  采纳 %d\n", kk[1], kk[2], ok[k]+0, p1[k]+0, u[k]+0, n[k], a[k]+0 } }' "$snapshot" | sort); then rc=0; else rc=$?; fi
+  rm -f "$snapshot"
+  return "$rc"
 }
 
 # codev_opinion_add <repo> <doc> <round> <agent> <model> <role> <issue> <stance> <severity> <fix> <note>
@@ -444,6 +482,9 @@ codev_stats() {
 codev_opinion_add() {
   # 与 codev_finding_add 同理必须是 -eq：-ge 会放过没加引号的多词修法，写出列数错误的坏行。
   [ $# -eq 11 ] || { echo "用法: codev_opinion_add repo doc round agent model role issue stance severity fix note（11 个实参，修法和备注记得加引号）" >&2; return 1; }
+  if ! printf '%s' "$4" | LC_ALL=C grep -q '[^[:space:]]' || ! printf '%s' "$7" | LC_ALL=C grep -q '[^[:space:]]'; then
+    echo "codev_opinion_add: agent 和 issue 不得为空白" >&2; return 1
+  fi
   case "$6"  in 评审|判断|自审|复核) ;; *) echo "codev_opinion_add: 第 6 个实参（role）须为 评审/判断/自审/复核，收到「$6」" >&2; return 1;; esac
   case "$8"  in 提出|采纳|驳回|存疑|未返回) ;; *) echo "codev_opinion_add: 第 8 个实参（stance）须为 提出/采纳/驳回/存疑/未返回，收到「$8」" >&2; return 1;; esac
   case "$9"  in P1|P2|P3|-) ;; *) echo "codev_opinion_add: 第 9 个实参（severity）须为 P1/P2/P3/-，收到「$9」" >&2; return 1;; esac
@@ -454,12 +495,13 @@ codev_opinion_add() {
 # 按 repo/doc/round/task/issue 隔离，只用每位判断主体最后追加的立场计票，完整历史仍按角色展示。
 codev_opinions() {
   [ $# -le 5 ] || { echo "用法: codev_opinions [issue [repo [doc [round [task]]]]]" >&2; return 1; }
-  local want="${1:-}" repo="${2:-}" doc="${3:-}" round="${4:-}" task="${5:-}"
-  [ -s "$CODEV_OPINIONS" ] || { echo "（意见记录为空：${CODEV_OPINIONS}）"; return 0; }
+  local want="${1:-}" repo="${2:-}" doc="${3:-}" round="${4:-}" task="${5:-}" snapshot rc
+  snapshot=$(codev_tsv_snapshot "$CODEV_OPINIONS") || return 1
+  [ -s "$snapshot" ] || { rm -f "$snapshot"; echo "（意见记录为空：${CODEV_OPINIONS}）"; return 0; }
   echo "意见与判断记录（${CODEV_OPINIONS}）${want:+，问题=$want}："
   # 不排序：时间戳只有分钟精度，甚至可能回退；NR 才代表真实追加顺序。
   # LC_ALL=C 避免 macOS awk 的中文相等比较问题；长度前缀避免范围字段拼接碰撞。
-  LC_ALL=C awk -F'\t' -v want="$want" -v repo="$repo" -v doc="$doc" -v round="$round" -v task="$task" '
+  if LC_ALL=C awk -F'\t' -v want="$want" -v repo="$repo" -v doc="$doc" -v round="$round" -v task="$task" '
     function part(s) { return length(s) ":" s }
     function flush(g,   v,i,row,f,nj,adopt,reject,uniqfix,lastfix,stances,p1seen,firstsev,sevdiff,missing,a) {
       printf "%s\n%s%s%s%s", head[g], hist[g,"评审"], hist[g,"自审"], hist[g,"判断"], hist[g,"复核"]
@@ -493,7 +535,7 @@ codev_opinions() {
       if (legacy[g]) print "  ⚠️ 旧记录缺少 task ID：仅按仓库/对象/轮次隔离，无法区分同范围内的不同历史任务"
       printf "\n"
     }
-    NF && (NF!=12 && NF!=13 || $7 !~ /^(评审|判断|自审|复核)$/ || $9 !~ /^(提出|采纳|驳回|存疑|未返回)$/ || $10 !~ /^(P1|P2|P3|-)$/ || $5=="" || $8=="") { bad++; next }
+    NF && (NF!=12 && NF!=13 || $7 !~ /^(评审|判断|自审|复核)$/ || $9 !~ /^(提出|采纳|驳回|存疑|未返回)$/ || $10 !~ /^(P1|P2|P3|-)$/ || $5 !~ /[^[:space:]]/ || $8 !~ /[^[:space:]]/) { bad++; next }
     NF && (want=="" || $8==want) && (repo=="" || $2==repo) && (doc=="" || $3==doc) && (round=="" || $4==round) && (task=="" || $13==task) {
       key=part($2) part($3) part($4) part($13) part($8)
       if (!(key in groups)) {
@@ -508,7 +550,9 @@ codev_opinions() {
         latest[g,$5]=$0
       }
     }
-    END { for (g=1; g<=count; g++) flush(g); if (bad) { printf "  ⚠️ %d 行意见记录损坏，回放未完成\n", bad; exit 1 } if (!count) print "  （没有匹配的记录）" }' "$CODEV_OPINIONS"
+    END { for (g=1; g<=count; g++) flush(g); if (bad) { printf "  ⚠️ %d 行意见记录损坏，回放未完成\n", bad; exit 1 } if (!count) print "  （没有匹配的记录）" }' "$snapshot"; then rc=0; else rc=$?; fi
+  rm -f "$snapshot"
+  return "$rc"
 }
 
 # codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [extra-trailer...]
@@ -644,7 +688,7 @@ codev_report() {
   cls=$(codev_classify "$agent" "$rc" "$out" "$err")
   # 进程超时优先；其余情况下结构化 is_error/subtype 优先于正文中的 PASS、标题或退出码 0。
   if [ "$cls" != timeout ]; then
-    case "$unwrap_rc" in 10) cls=turns;; 11) cls=error;; esac
+    case "$unwrap_rc" in 10) cls=turns;; 11|12) cls=error;; esac
   fi
   [ -n "${CODEV_T0:-}" ] && secs=$(( $(date +%s) - CODEV_T0 ))
   tk=$(codev_tokens "$agent")
@@ -673,6 +717,7 @@ codev_report() {
     empty)   printf '⚠️ %s 空输出（exit=0，stdout/stderr 均无内容，本轮无效）→ 先看 %s 分诊，勿当成"无问题"\n' "$agent" "$err" ;;
     error)   printf '⚠️ %s 非零退出/报错 exit=%s%s（stderr 错误行）:\n' "$agent" "$rc" "${secs:+，用时 ${secs}s}"
              [ "$unwrap_rc" = 11 ] && echo "  结构化结果标记失败，进程退出码 0 不代表评审成功"
+             [ "$unwrap_rc" = 12 ] && echo "  结构化结果未能完成解析或保存，原文保留；修复 Python/存储故障后重试，不能据此认定评审完成"
              if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/  /'; elif [ -s "$err" ]; then tail -n 5 "$err" 2>/dev/null | sed 's/^/  /'; else echo "  (无 stderr)"; fi
              case "$lines" in *"context canceled"*) echo "  → reasonix 上游断流/被掐，多为提示词过大；缩到 ≤45KB 或改路径引用后重试一次";; esac ;;
   esac
@@ -1106,7 +1151,9 @@ codev_bg_native() {
 # 判死三步：先看 .codev-owner 里的 pid 是否还活着（活着不删——但超 7 天不看 pid 一律删，pid 会被复用），再看 mtime 是否超 60 分钟（老版本沙盒没有
 # owner 标记时的兜底启发；CODEV_TIMEOUT ≤ 3000s 让它"多半已死"，但母本等待/构建阶段没有 timeout 管，所以不是证明）。
 codev_sbox_gc() {
-  local t="${TMPDIR:-/tmp}" d n=0 o
+  local t="${TMPDIR:-/tmp}" d n=0 o current
+  t=$(cd "$t" 2>/dev/null && pwd -P) || return 0
+  current=$(cd "$CODEV_DIR" 2>/dev/null && pwd -P) || { echo "⚠️ 无法定位当前会话，跳过残留清理" >&2; return 1; }
   # -mmin 是 BSD/GNU find 都有的；-maxdepth 1 防递归进副本内部。副本被 chmod a-w，rm 前先恢复写权限。
   # 只扫【沙盒】：沙盒天生短命（单次 agent 调用），60 分钟 + owner pid 已死才删。
   # ⚠️ 【不要】把会话目录 codev.* 也按 60 分钟扫：会话目录是长命的（用户看完输出、讨论、再跑一轮
@@ -1119,6 +1166,7 @@ codev_sbox_gc() {
   # （注：命令替换在 bash 和 zsh 下【都会】词拆分，这不是 zsh 特有问题——别被"zsh 不拆分"
   #   的说法误导，那条只适用于未加引号的【变量】展开。）
   while IFS= read -r -d '' d; do
+    case "$current/" in "$d/"*) continue;; esac
     # owner 还活着就不删（7 天内）：60 分钟只是"多半已死"的启发，不是证明（见 codev_bg_sandboxed 写标记处的注释）。
     o=$(cat "$d/.codev-owner" 2>/dev/null)
     # pid 会被复用：owner 早死、pid 落到别的长命进程头上，沙盒就永远"活着"。超过 7 天不管 pid 一律删（CODEV_TIMEOUT 上限 50 分钟）。
@@ -1132,7 +1180,8 @@ codev_sbox_gc() {
   # 会话目录没有单一持有者 pid（编排器每次 Bash 调用都是新 shell），用【活动时间】判活：目录里任一文件 24 小时内
   # 被写过（新的 out/err/metrics/提示词）就还在用，不删——目录本身的 mtime 只在增删条目时变，不够。
   while IFS= read -r -d '' d; do
-    [ "$d" = "$CODEV_DIR" ] && continue
+    # 按物理路径比较，并保护包含当前会话的父目录，兼容 /var、/tmp 别名及尾斜杠。
+    case "$current/" in "$d/"*) continue;; esac
     [ -n "$(find "$d" -type f -mmin -1440 2>/dev/null | head -1)" ] && continue
     chmod -R u+w "$d" 2>/dev/null; rm -rf "$d" 2>/dev/null && n=$((n+1))
   done < <(find "$t" -maxdepth 1 -type d -name 'codev.*' -mmin +1440 -print0 2>/dev/null)
