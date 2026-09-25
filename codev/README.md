@@ -46,6 +46,7 @@
 | `qoderclicn` | Qoder | 账号交互登录 |
 | `opencode` | 多供应商 | `opencode auth` 配 providers |
 | `codebuddy` | 腾讯（Claude Code 分支） | 交互登录 |
+| `pi` | 多供应商（本机 DeepSeek） | `pi auth` |
 
 ### 2.2 装 `timeout`（强烈建议）
 macOS 原生没有 `timeout`。**不装后台慢模型无兜底会永久挂起**，skill 会自动跳过它们。
@@ -58,6 +59,7 @@ brew install coreutils      # 提供 gtimeout
 - `CODEV_TIMEOUT`（默认 600s）：单次 agent 调用的兜底超时。核实型评审、大文档评审建议 `export CODEV_TIMEOUT=1200`。
 - 近期结果账本 `~/.local/state/codev/ledger.tsv`：每次调用记一行类别（ok/quota/auth/turns/timeout/empty/error）。
   `/codev` 探测时会给每个 agent 标"近期 3 次结果"，连续额度耗尽的 agent 不会被推荐。设 `CODEV_LEDGER` 可改路径。
+  `quota` 同时覆盖额度（429/402）与上游过载（503/529）；沙盒 agent 想铺副本却退回空目录时，✔ 行会附"无代码视野"警告、备注记 `退化:空目录`。
 - 发现台账 `~/.local/state/codev/findings.tsv`：每条外部发现的裁决与亲验结果；`codev_stats` 看每个 agent/模型的
   "声称 P1 里亲验成立的比例"和"独家成立"数（这是选模型的依据，不是采纳条数）。
 - 意见与判断记录 `~/.local/state/codev/opinions.tsv`：每个 agent 对每个问题的**每一条立场**单独一行（谁提出、谁采纳、
@@ -66,6 +68,8 @@ brew install coreutils      # 提供 gtimeout
   记录按仓库/对象/轮次/task/问题隔离，历史全部展示，计票只取各判断主体最后追加的记录；P1 级别分歧或缺少具体修法不进入执行清单。
   设 `CODEV_TASK_ID` 标识任务，跨会话恢复须沿用该值；未设置时取 `CODEV_DIR` 会话名。新记录追加 task 为第 13 列，旧 12 列仍可读并提示身份限制，补齐任务归属前仅供回顾，不据此执行或关闭问题。
   跨会话累积，设 `CODEV_OPINIONS` 可改路径。
+- 多轮评审开新一轮前 `codev_round_trend <仓库> <文档 slug>` 看该对象历史每轮的发现数 / P1 / 参与 agent；累计 ≥ 5 轮会直接提示"先和用户看范围"。
+  三个账本的轮次统一写数字（`r12` 会被归一成 `12`），agent 列只收小写标签（模型名写模型列）。
   三个账本使用 Python 3 文件锁串行追加完整行，读取时在共享锁内取得完整副本，避免半行影响统计或判断。
   读取失败返回非零；意见文件存在损坏行时，回放不据此执行或关闭问题；写入接口拒绝空白主体和问题编号。
 - 账本读写、结构化结果处理和归档需要 Python 3。结构化结果先保存计量与状态，再替换正文；解析器或存储故障会明确报错并保留原文，修复故障后可重试 `codev_report`。
@@ -103,7 +107,7 @@ bash/zsh 都能正常跑。
 - 其余 agent 在**隔离沙盒**里跑：cwd 不是真仓库，但沙盒里有一份 `./repo` —— 工作区（含未提交
   改动）的**只读副本**。它们能读全部代码来核实跨文件问题，写入默认只落在副本上、用完即删。
   这是 cwd 隔离 + 副本与母本 `chmod -R a-w`，**不是 OS 级沙盒**：防误写，防不了同用户进程刻意枚举 `$TMPDIR`
-  再改回权限的恶意 agent。仓库敏感要做两件事：设 `CODEV_SANDBOX_MODE=text` 让四个沙盒 agent 只拿提示词文本，
+  再改回权限的恶意 agent。仓库敏感要做两件事：设 `CODEV_SANDBOX_MODE=text` 让五个沙盒 agent 只拿提示词文本，
   **并用 `--agents` 排除 codex/gemini**——它们在真实仓库里跑，只读旗标只挡写不挡读，`.gitignore` 掉的文件照样读得到，
   text 模式对它们不起作用。
 
@@ -177,9 +181,13 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
 | 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟且 owner 进程已死的，超 7 天的不看进程一律清（会话目录 `codev.*` 则是超 24 小时且无文件活动） |
-| gemini 报网络错误 | 本机 gemini 偶发 503/fetch failed，属它自身网络问题，重试或换 agent |
+| gemini 报 503 / 过载 | 翻牌为 `⛔ 额度/限流/过载`（503/529 与 429 同类处置）：本轮无效、隔几分钟重试一次，再失败换 agent。别再钉 `-m gemini-2.5-pro`（已下线） |
+| self / check 翻牌成"空输出" | 多半是没先把 subagent 的回复 Write 进 `codev-out-self.txt` 就 `codev_report`；有 token 数时库会拒绝记账并提示先落盘 |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
-| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型 |
+| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型。命中多时 `codev_scan_triage` 按文件聚合并单列"像真密钥"的高置信行 |
+| `⛔ <agent> 未启动：母本与已扫描版本不一致` | secret 扫描之后工作区又被改了，沙盒 agent 不会退回空目录硬跑；重扫并钉住新母本后再发 |
+| worktree 隔离会话里 codev 命令被宿主拒绝 | 把 Step 0 与后台调用写成 scratchpad 里的脚本文件再 `bash <文件>`；`CODEV_DIR` 仍用 mktemp（见 SKILL Step 0） |
+| 只想让一家看一眼 | `/codev review --agents codex`（或口头"让 codex 看一眼"）走轻量单家复审：不弹问、不起自查自评，保留扫描/翻牌/账本/逐字呈现/亲验 |
 
 ---
 
@@ -210,7 +218,7 @@ codev/
 
 ## 9. 隔离沙盒与只读仓库副本
 
-六个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里）。此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
+七个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里）。此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
 参与：保障级别与 opencode 同为"弱"（提示词只读 + 前后快照核对），但它跑在真实仓库而不是沙盒：
 
 | 档 | agent | 只读保障 | 跑在哪 |

@@ -19,6 +19,17 @@
 
 ### 🔄 Changed
 
+- 2026-09-25 [C043 / 使用审计回流] `reports/2026-09-25-usage-audit.md`：核对 9 月 11 日至 25 日的调用账本（43 个会话 302 次调用）、发现台账（1642 行）、意见记录（1670 行）、14 个真实使用会话的转录与 claude-mem 记忆，按 环境/CLI 故障/库缺陷/编排错误/用户摩擦 五类列出 34 个问题及各自回流状态；统计脚本与原始报告在会话 scratchpad
+- 2026-09-25 [C044 / 使用审计回流] `bin/codev-lib.sh` 的 `codev_classify` / `codev_match_class` / `codev_err_lines`：503/529/overloaded/"experiencing high demand" 归 `quota`（额度/限流/过载），`API Error …`、`status: 5xx`、`"code": 5xx` 行可被抽为错误行；翻牌文案改为"额度/限流/过载"。此前 gemini 7 次调用 4 次 503、self 撞 529 都被记成 error/empty，下一会话照样推荐。回归：43a
+- 2026-09-25 [C045 / 使用审计回流] `codev_model_of` 把裸 `default` 归一为 `<agent>-default`：账本里 codebuddy 同一默认模型被写成 codebuddy-default / default / unknown 三桶，`codev_stats` 每桶都不够 20 条样本。回归：43b
+- 2026-09-25 [C046 / 使用审计回流] `codev_finding_add` / `codev_opinion_add` 新增 `codev_key_round`（`r12` 与 `12` 统一写 `12`，非数字拒收）与 `codev_key_agent`（agent 列只收小写标签，模型名/"实跑/推演"混入即拒收）；此前同一对象轮次写成 5..9 + r10..r14、agent 写成 "self claude-opus-5"（10 行），回放把同一主体当成两个人。写入实参个数与枚举校验不变。回归：43c/43d
+- 2026-09-25 [C047 / 使用审计回流] `SKILL.md` 通用机制 A1 的默认组合按轮次分档：第 1 轮 codex + reasonix（+codebuddy/qoderclicn），第 N ≥ 2 轮 codex + self（+G1 check），reasonix/codebuddy 只在用户点名时加回，推荐语附账本数据（reasonix 33 次 ok 82 CNY、超时也计费、第 2 轮起多次 0 独家；codebuddy 56 次 6 次 1200-1800s 超时零输出）；brainstorm 推荐语注明 gemini 503 率与不钉 `-m gemini-2.5-pro`
+- 2026-09-25 [C048 / 使用审计回流] `SKILL.md` Step 1 新增"轻量单家复审"（`--agents <一家>` 或口头"让 codex 看一眼"：不弹 A1/A2、不起 G1/G2、不做矩阵，保留扫描/翻牌/账本/逐字呈现/亲验）与"同一会话已确认的组合与分工模式沿用不再弹问"；依据：用户三次绕开 codev 自己跑 codex 贴回 127 行结果，单会话最多弹 12 次 A1
+- 2026-09-25 [C049 / 使用审计回流] `SKILL.md` Step 0 新增 worktree 隔离会话的调用方式（Step 0 与后台调用写成 scratchpad 脚本文件、`CODEV_DIR` 仍 mktemp）与 zsh 三个新坑（`=` 开头裸词展开、前缀赋值不作用于下一行、glob 无匹配终止）；`bin/codev-lib.sh` source 时对缺随机后缀的会话目录名告警。依据：四个会话 19 次宿主拒绝、八个会话 15 次 `===== not found`、账本 4 行会话名 "codev"。回归：44c
+- 2026-09-25 [C050 / 使用审计回流] `references/synthesis.md` §6：新增第 0 步 `codev_round_trend`（≥ 5 轮先和用户看范围）与"一个对象只用一个 slug"；收敛判据加"按章节收敛"（连续两轮只产 P3 的章节移出范围）；§6.3 停止条件 3 改为只有判断组成员额度耗尽才停、评审组一家失效而有效外部 ≥ 2 则继续，条件 5 区分"到达上限·末轮无 P1（待复核）"，并在停止后补一次只跑 G1 的末轮回流自查。依据：一份计划跨会话磨到第 14 轮、四个会话停在"到达上限但末轮 P1=0"、一次 qoderclicn 额度耗尽停了整个 `--auto`
+- 2026-09-25 [C051 / 使用审计回流] `SKILL.md` 通用机制 G1 补 `check` 的调用账本收尾片段（此前发现台账 302 条 check 发现对应调用账本只有 15 行），G2 明确"先 Write 正文再 codev_report"并说明库守卫；通用机制 C 新增各 agent 预期用时（账本中位数）与 `⛔ 未启动` 的处理；Step 2F 第 1 步绑定 `SLUG` 并在全部四处沿用，第 6 步归档改在全部 report 完成之后
+- 2026-09-25 [C052 / 使用审计回流] `references/agents.md`：新增 `pi` 条目（2026-09-15 起 14 次实测形态、弱只读级别、计量缺失、一次 6904s 未被安全网兜住）与只读风险表行，`codev_probe` 探测 pi；gemini 去掉 `-m gemini-2.5-pro` 建议并记录 503 死因；reasonix 记录 431KB 文档 bounded reader 失败的行号区间做法与成本数据；codebuddy 固定 `CODEV_MODEL_codebuddy=codebuddy-default` 与超时基线；函数表补 `codev_round_trend` / `codev_prompt_gate` / `codev_scan_triage` 与两道 report 守卫；失败处理表 quota 行覆盖过载。`README.md` / `references/prompts.md` 同步 pi 与新 FAQ。回归：44f
+
 - 2026-09-11 [C005] `specs/2026-09-10-review-protocol-v2.md` 升至 v0.2，按用户确认将两人上限仅用于最终判断组，评审组允许多个 agent；同步选择、差异分工、自审及验收场景，文档一致性与差异检查通过，协议实现尚未开始
 - 2026-09-11 [C007 / 评审回流 / cr-02] `specs/2026-09-10-review-protocol-v2.md` §6.1 明确记录类文件（changelog、发现台账、意见记录、任务状态、轮次归档）不进入三个快照的比对范围，并给出"日志本身是评审对象时重取 `verified_snapshot`"的例外；此前 §5 第 7 步在 `verified_snapshot` 之后写日志，codev 评审自身时 §9 的"最终产物与验证快照一致"永远无法满足。文本核对通过
 - 2026-09-11 [C008 / 评审回流 / cr-03] 同文档 §3.4 增加 |J|=1 单判断主体条款（明确采纳即进执行清单、明确驳回即关闭、存疑或未返回不执行），并把原有条目限定为 |J|=2；此前所有条目按两位判断者书写，"另一人未返回"对单主体恒真，照章执行会让 §3.3 第 1、5 行的单主体任务无任何条目可执行。文本核对通过
@@ -28,6 +39,11 @@
 - 2026-09-11 [C012 / 评审回流] 同文档升至 v0.3，§12 增补 6 个验收场景（判断者修法分歧与缺席、单主体任务、未选入 `self`、日志在评审范围内、旧写入函数未被改动、提交文件清单含未绑定变量）并在实施顺序第 3 步纳入 §8.3。文本核对通过
 
 ### 🐛 Fixed
+
+- 2026-09-25 [C053 / 使用审计回流] `bin/codev-lib.sh` 的 `codev_report`：`self`/`check` 正文文件为空但 `CODEV_TOKENS_<agent>` > 0 时判定漏落盘，不记账、返回 1 并提示先 Write 正文；此前三个会话六次把有报告的 G2 记成 empty，一次靠手工 awk 改账本。token 为 0 的真空回复仍照常归类。回归：43f
+- 2026-09-25 [C054 / 使用审计回流] `codev_bg_sandboxed`：想铺 `./repo` 却退回空目录（超闸门 / 非 git）时写 `codev-degraded-<agent>` 标记，`codev_report` 在 ✔ 后追加"无代码视野"警告并在账本备注记 `退化:空目录`，`codev_prepare_call` 清掉上一轮标记；母本与已扫描版本不一致（`codev_repo_copy` 现返回 2）时**不启动**、打 `⛔ 未启动`、不写账本。此前 2026-09-15 一整轮 codebuddy + pi 在静默 text 模式下白跑、翻牌仍是 ✔。测试 36 的期望同步改为 rc=2。回归：43g/44b
+- 2026-09-25 [C055 / 使用审计回流] `codev_err_lines` 的三位状态码行只认 4xx/5xx 且其后为文字：codex 回显到 stderr 的带行号源码（`354  void …`）不再被当错误行，此前七个会话 35 次 "✔ 但 stderr 含错误行" 全是假警告。回归：44a
+- 2026-09-25 [C056 / 使用审计回流] 新增 `codev_round_trend <repo> <doc>`（各轮 发现/声称 P1/亲验成立 P1/agent，≥ 5 轮提示上限，兼容旧 `r` 前缀行）、`codev_prompt_gate`（按 agent 阈值检查全部提示词体积）、`codev_scan_triage`（secret 扫描命中按文件聚合 + 高置信形态单列，返回 3/0/1）；此前这三段每个会话各自手写一版。回归：43e/44d/44e
 
 - 2026-09-11 [C013 / 修复 / cr-01] `SKILL.md` Step 2F 第 1 步补上 `CHANGELOG=<日志路径>` 绑定，第 6 步补上发出前的非空校验与提交后照 `暂存:` 行核对两个文件；此前第 6 步的 `codev_commit_round "$DOC $CHANGELOG"` 引用了全流程从未赋值的变量，空 token 被按空白拆分丢弃，只提交文档却照样打印「✔ 已提交第 N 轮回流」，日志改动静默留在工作区。已在一次性 git 仓库里复现（提交只含文档、`git status` 仍显示 `M CHANGELOG.md`）并核对修复后的文本；`TESTING.md` 真机清单加了对应勾选项
 - 2026-09-11 [C014 / 修复 / replay-01] `bin/codev-lib.sh` 的意见回放保留完整追加历史，计票仅取同一范围内每个判断主体最后追加的立场，模型变化不新增票，三个判断主体报告选择冲突；回归覆盖同分钟、时间回退、改判后重新形成一致或分歧

@@ -6,6 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # 当前是哪个 shell 在跑测试：子测试要用同一个 shell 起子进程，zsh 跑的时候才真的验到 zsh 路径
 if [ -n "${ZSH_VERSION:-}" ]; then TEST_SH=zsh; else TEST_SH=bash; fi
 LIB="$HERE/../bin/codev-lib.sh"
+export LIB0="$LIB"
 export CODEV_DIR=$(mktemp -d -t codevtest.XXXXXX)
 export CODEV_LEDGER="$CODEV_DIR/ledger.tsv"      # 测试不碰真账本
 export CODEV_TIMEOUT=600
@@ -402,14 +403,14 @@ r=$(report x 0); case "$r" in *"⛔ x 额度"*"reached your usage limit"*) ok "�
 mk x "$(printf 'When the quota limit of the upstream API is hit we degrade gracefully and the usage limit counter resets at midnight. %s' "$(head -c 700 /dev/zero | tr '\0' 'w')")" ""
 r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "散文里的 quota limit/usage limit 词不误杀" || bad "散文被判成 $r"
 
-echo "36. 扫描钉住的母本与当前母本不一致（扫完工作区又被改）→ codev_repo_copy 拒发 rc=1；一致或无钉子 → 正常"
+echo "36. 扫描钉住的母本与当前母本不一致（扫完工作区又被改）→ codev_repo_copy 拒发 rc=2（调用方据此不启动）；一致或无钉子 → 正常"
 REPO=$(mktemp -d -t codevrepo.XXXXXX); SB=$(mktemp -d -t codev-sbox.XXXXXX)
 ( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t && echo v > f.txt && git add -A && git commit -qm i >/dev/null \
   && codev_master_path && printf '%s' "$CODEV_MASTER" > "$CODEV_DIR/codev-scanned-master" && codev_repo_copy "$SB" >/dev/null 2>&1; echo "match rc=$?" > "$T/codev-pin.txt"
   chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB/repo"; echo changed >> f.txt && codev_repo_copy "$SB" >/dev/null 2>&1; echo "mismatch rc=$?" >> "$T/codev-pin.txt"
   rm -f "$CODEV_DIR/codev-scanned-master"; chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB/repo"; codev_repo_copy "$SB" >/dev/null 2>&1; echo "nopin rc=$?" >> "$T/codev-pin.txt" )
 grep -q '^match rc=0$' "$T/codev-pin.txt" && ok "钉子一致 → 铺副本" || bad "一致时被拒" "$(cat "$T/codev-pin.txt")"
-grep -q '^mismatch rc=1$' "$T/codev-pin.txt" && ok "扫后工作区变了 → 拒发" || bad "不一致未拒" "$(cat "$T/codev-pin.txt")"
+grep -q '^mismatch rc=2$' "$T/codev-pin.txt" && ok "扫后工作区变了 → 拒发 rc=2" || bad "不一致未拒" "$(cat "$T/codev-pin.txt")"
 grep -q '^nopin rc=0$' "$T/codev-pin.txt" && ok "无钉子 → 不拦" || bad "无钉子被拒" "$(cat "$T/codev-pin.txt")"
 chmod -R u+w "$SB" 2>/dev/null; rm -rf "$REPO" "$SB" "$T/codev-pin.txt"; rm_masters
 
@@ -912,6 +913,129 @@ r=$(CODEV_TO= codev_bg_native fakeagent true 2>&1)
 case "$r" in *"▶"*) bad "native 跳过路径仍打了 ▶ 运行中" "$r";; *"⏭"*) ok "native 无 timeout 只打 ⏭";; *) bad "native 跳过路径无输出" "$r";; esac
 r=$(CODEV_TO= codev_bg_sandboxed fakeagent true 2>&1)
 case "$r" in *"▶"*) bad "sandboxed 跳过路径仍打了 ▶" "$r";; *"⏭"*) ok "sandboxed 无 timeout 只打 ⏭";; *) bad "sandboxed 跳过路径无输出" "$r";; esac
+
+echo "43. 9/11-9/25 使用审计回流：过载归类、模型名归一、轮次/agent 列收口、轮次趋势"
+# 43a gemini 503 / Claude 529 Overloaded：stdout 空、stderr 无 ERROR 前缀。旧版抽不到错误行 → empty/error，
+# 账本看不出"上游过载"，下一会话照样把它推荐上去（实测 gemini 7 次调用 4 次撞 503）。
+mk gemini "" 'Error: {"error":{"message":"{\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand.\"}}"}
+    at async Turn.run (file:///x/chunk.js:1:1) {
+  status: 503
+}'
+r=$(codev_classify gemini 1 "$CODEV_DIR/codev-out-gemini.txt" "$CODEV_DIR/codev-err-gemini.txt"); [ "$r" = quota ] && ok "gemini 503 → quota" || bad "gemini 503 判成 $r"
+mk self "" "API Error 529 Overloaded（两次重试均在产出前中断，无报告）"
+r=$(codev_classify self 0 "$CODEV_DIR/codev-out-self.txt" "$CODEV_DIR/codev-err-self.txt"); [ "$r" = quota ] && ok "self 529 Overloaded → quota" || bad "529 判成 $r"
+r=$(report self 0); case "$r" in *"⛔"*过载*"529 Overloaded"*) ok "翻牌带过载与原句";; *) bad "翻牌缺过载/原句" "$r";; esac
+# 正文里讨论 503 的评审不能被误杀（同 429 的既有保护）
+mk x "## A. 已查证
+- P2 网关对上游 503 未重试，见 gateway.py:40" ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "正文含 503 仍 ok" || bad "正文含 503 判成 $r"
+# 43b 裸 default 归一成 <agent>-default：同一默认模型三种写法会把 codev_stats 拆成三桶
+[ "$(CODEV_MODEL_codebuddy=default codev_model_of codebuddy)" = codebuddy-default ] && ok "default → codebuddy-default" || bad "default 未归一"
+[ "$(CODEV_MODEL_codebuddy=codebuddy-default codev_model_of codebuddy)" = codebuddy-default ] && ok "显式模型名原样" || bad "显式模型名被改"
+# 43c 轮次：r12 与 12 写进台账都是 12；纯 r / 空 / 非数字拒收
+export CODEV_FINDINGS="$CODEV_DIR/f43.tsv" CODEV_OPINIONS="$CODEV_DIR/o43.tsv"
+codev_finding_add ntms doc-43 r12 codex m r12-codex-01 P1 A 采纳 成立 独家 "带 r 前缀" 2>/dev/null
+codev_finding_add ntms doc-43 12 pi m r12-pi-01 P2 A 采纳 成立 共同 "纯数字" 2>/dev/null
+[ "$(cut -f4 "$CODEV_FINDINGS" | sort -u | tr '\n' ' ')" = "12 " ] && ok "r12/12 归一为 12" || bad "轮次未归一" "$(cut -f4 "$CODEV_FINDINGS")"
+codev_finding_add ntms doc-43 r codex m id P1 A 采纳 成立 独家 x 2>/dev/null && bad "轮次 r 未被拒" || ok "拒收轮次 r"
+codev_opinion_add ntms doc-43 十二 codex m 判断 id 采纳 P1 甲 - 2>/dev/null && bad "中文轮次未被拒" || ok "拒收非数字轮次"
+codev_opinion_add ntms doc-43 r3 codex m 判断 id 采纳 P1 甲 - 2>/dev/null && [ "$(tail -n1 "$CODEV_OPINIONS" | cut -f4)" = 3 ] && ok "意见记录 r3 → 3" || bad "意见记录轮次未归一"
+# 43d agent 列只能是标签：模型名/备注混进来会让回放把同一主体当成两个人
+codev_finding_add ntms doc-43 1 "self claude-opus-5" m id P1 A 采纳 成立 独家 x 2>/dev/null && bad "agent 含模型名未被拒" || ok "finding_add 拒收 agent 含模型名"
+codev_opinion_add ntms doc-43 1 "pi deepseek-v4-pro 实跑" m 评审 id 提出 P1 甲 - 2>/dev/null && bad "agent 含备注未被拒" || ok "opinion_add 拒收 agent 含备注"
+codev_opinion_add ntms doc-43 1 Codex m 评审 id 提出 P1 甲 - 2>/dev/null && bad "大写 agent 未被拒" || ok "拒收大写 agent"
+codev_finding_add ntms doc-43 1 post-self m id P1 A 采纳 成立 独家 x 2>/dev/null && ok "post-self / 连字符标签放行" || bad "合法标签被拒"
+# 43e 轮次趋势：按轮列 发现/声称 P1/成立 P1/agent，≥5 轮提示上限；r 前缀的旧行也算进同一轮
+codev_finding_add ntms doc-43 1 codex m r1-codex-02 P1 A 驳回 不成立 独家 x >/dev/null 2>&1
+printf '2026-09-01T00:00\tntms\tdoc-43\tr5\tcodex\tm\tr5-codex-01\tP1\tA\t采纳\t成立\t独家\t旧行 r 前缀\n' >> "$CODEV_FINDINGS"
+r=$(codev_round_trend ntms doc-43)
+case "$r" in *"r1 "*"声称 P1  2"*"亲验成立 P1  1"*) ok "第 1 轮计数正确（声称 2 成立 1）";; *) bad "第 1 轮计数错" "$r";; esac
+case "$r" in *"r12 "*"codex,pi"*) ok "第 12 轮列出参与 agent";; *) bad "第 12 轮 agent 列表错" "$r";; esac
+case "$r" in *"累计 12 轮"*"第 5 轮上限"*) ok "≥5 轮给出上限提示";; *) bad "缺上限提示" "$r";; esac
+case "$r" in *"r5 "*"声称 P1  1"*) ok "旧行 r5 计入第 5 轮";; *) bad "r 前缀旧行未计入" "$r";; esac
+r=$(codev_round_trend ntms no-such-doc); case "$r" in *"没有任何轮次"*) ok "无记录对象给提示";; *) bad "无记录提示错" "$r";; esac
+codev_round_trend ntms 2>/dev/null && bad "缺参未被拒" || ok "round_trend 缺参拒收"
+# 43f self/check 漏落盘守卫：子 agent 返回了几万 token 的报告、编排器却没先 Write 进正文文件就 report → 旧版记成 empty
+# （9/11-9/25 六次）。有 token 数却没正文 = 漏落盘，拒绝记账；真正的空回复（token 0）仍照常归类。
+mk self "" ""
+n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
+r=$(CODEV_TOKENS_self=183000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1); rc=$?
+case "$rc:$r" in 1:*"先把 subagent"*) ok "有 token 无正文 → 拒绝记账并提示先落盘";; *) bad "漏落盘未被拦（rc=$rc）" "$r";; esac
+[ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$n0" ] && ok "拒绝时账本不加行" || bad "拒绝时仍写了账本"
+r=$(CODEV_TOKENS_self=0 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
+case "$r" in *"空输出"*) ok "token 0 的真空回复仍记 empty";; *) bad "真空回复处理错" "$r";; esac
+mk self "## A. 已查证
+- P2 x" ""
+r=$(CODEV_TOKENS_self=183000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
+case "$r" in *"✔ self"*"tokens 183000"*) ok "落盘后照常 ✔ 并带 token";; *) bad "落盘后未 ✔" "$r";; esac
+# 43g 副本没铺成而退回空目录 = 退化：✔ 后要追加警告、账本备注要留痕；prepare_call 清掉上一轮的标记
+mk reasonix "## A. 已查证
+- P2 y" ""
+printf '%s' "隔离空目录（只喂提示词文本）" > "$CODEV_DIR/codev-degraded-reasonix"
+r=$(report reasonix 0)
+case "$r" in *"✔ reasonix"*"隔离空目录"*"无代码视野"*) ok "退化运行 ✔ 后附警告";; *) bad "退化运行无警告" "$r";; esac
+case "$(tail -n1 "$CODEV_LEDGER" | cut -f12)" in *"退化:空目录"*) ok "账本备注记退化";; *) bad "账本备注缺退化" "$(tail -n1 "$CODEV_LEDGER")";; esac
+codev_prepare_call reasonix >/dev/null 2>&1
+[ -e "$CODEV_DIR/codev-degraded-reasonix" ] && bad "prepare_call 没清退化标记" || ok "prepare_call 清掉退化标记"
+mk reasonix "## A. 已查证
+- P2 y" ""
+r=$(report reasonix 0)
+case "$r" in *"隔离空目录"*) bad "无标记时误报退化" "$r";; *"✔ reasonix"*) ok "无标记时不报退化";; *) bad "正常 ✔ 丢失" "$r";; esac
+
+echo "44. 9/11-9/25 使用审计回流（二）：假错误行、钉子不匹配不启动、会话名告警、提示词闸门、扫描分诊、probe 含 pi"
+# 44a codex 工具轨迹里带行号的源码不是错误行；真 4xx/5xx 状态行仍是
+mk codex "## A. 已查证
+- P2 x" "354  void qc.invalidateQueries({ queryKey: ['x'] })
+310 ) -> None:
+  311 await repo.insert(
+tokens used
+1,234"
+r=$(report codex 0); case "$r" in *"stderr 含错误行"*) bad "源码行号被当错误行" "$r";; *"✔ codex"*) ok "带行号源码不算错误行";; *) bad "✔ 丢失" "$r";; esac
+mk codex "## A. 已查证
+- P2 x" "429 您的使用量已超出频率限制
+500 Internal Server Error
+tokens used
+1,234"
+r=$(report codex 0); case "$r" in *"stderr 含错误行"*"429 您的"*"500 Internal"*) ok "4xx/5xx 状态行仍是错误行";; *) bad "真状态行漏了" "$r";; esac
+# 44b 钉住的母本 ≠ 当前母本 → 不启动（⛔），不退回空目录、不写账本
+GITB=$(mktemp -d -t codevpin.XXXXXX); ( cd "$GITB" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && echo a > a.txt && git add a.txt && git -c user.email=t@t -c user.name=t commit -q -m a )
+printf '%s' "$CODEV_DIR/codev-master-repo.deadbeef00000000" > "$CODEV_DIR/codev-scanned-master"
+n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
+r=$( cd "$GITB" && codev_bg_sandboxed fakepin sh -c 'echo ran' 2>&1 ); rc=$?
+case "$r" in *"⛔ fakepin 未启动"*) ok "钉子不匹配 → ⛔ 未启动";; *) bad "钉子不匹配仍启动/无 ⛔" "$r";; esac
+case "$r" in *"▶"*|*"✔"*) bad "钉子不匹配还打了 ▶/✔" "$r";; *) ok "不打 ▶/✔";; esac
+[ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$n0" ] && ok "未启动不写账本" || bad "未启动却写了账本"
+[ -s "$CODEV_DIR/codev-out-fakepin.txt" ] && bad "未启动却有输出" || ok "未启动无输出文件"
+rm -f "$CODEV_DIR/codev-scanned-master"; chmod -R u+w "$GITB" 2>/dev/null; rm -rf "$GITB"
+# 44c 会话目录名缺随机后缀 → source 时告警（只告警不拦）
+NOSUF=$(mktemp -d -t codevx.XXXXXX)/codev; mkdir -p "$NOSUF"
+r=$( CODEV_DIR="$NOSUF" $TEST_SH -c 'source "$LIB0" && echo sourced' 2>&1 ); 
+case "$r" in *"不像 mktemp"*sourced*) ok "固定目录名告警且仍可用";; *) bad "固定目录名未告警/不可用" "$r";; esac
+r=$( $TEST_SH -c 'source "$LIB0" && echo sourced' 2>&1 ); case "$r" in *"不像 mktemp"*) bad "mktemp 目录误告警" "$r";; *sourced*) ok "mktemp 目录不告警";; *) bad "source 失败" "$r";; esac
+rm -rf "${NOSUF%/codev}"
+# 44d 提示词闸门：按 agent 阈值
+rm -f "$CODEV_DIR"/codev-prompt-*.txt
+r=$(codev_prompt_gate 2>&1) && bad "无提示词时应返回 1" || ok "无提示词时返回 1 并提示"
+head -c 30000 /dev/zero | tr '\0' a > "$CODEV_DIR/codev-prompt-codebuddy.txt"
+head -c 30000 /dev/zero | tr '\0' a > "$CODEV_DIR/codev-prompt-codex.txt"
+head -c 47000 /dev/zero | tr '\0' a > "$CODEV_DIR/codev-prompt-reasonix.txt"
+r=$(codev_prompt_gate 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "有超标返回 1" || bad "超标未返回 1（rc=${rc}）" "$r"
+case "$r" in *"✘ codebuddy"*"✔ codex"*"✘ reasonix"*) ok "codebuddy 25KB / codex 50KB / reasonix 45KB 各按阈值";; *) bad "阈值判定错" "$r";; esac
+head -c 20000 /dev/zero | tr '\0' a > "$CODEV_DIR/codev-prompt-codebuddy.txt"; head -c 40000 /dev/zero | tr '\0' a > "$CODEV_DIR/codev-prompt-reasonix.txt"
+codev_prompt_gate >/dev/null 2>&1 && ok "全部达标返回 0" || bad "全部达标却返回非 0"
+rm -f "$CODEV_DIR"/codev-prompt-*.txt
+# 44e 扫描分诊：按文件聚合 + 高置信形态
+r=$(printf '%s\n' 'src/a.py:12:    token = request.headers.get("X-Token")' 'src/a.py:40:    api_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789"' 'tests/fixtures/x.sql:1:-- password column' 'k.pem:3:-----BEGIN RSA PRIVATE KEY-----' 'cfg.yml:2:aws_key: AKIAABCDEFGHIJKLMNOP' | codev_scan_triage); rc=$?
+[ "$rc" = 3 ] && ok "有高置信命中返回 3" || bad "高置信未返回 3（rc=${rc}）" "$r"
+case "$r" in *"5 命中 / 4 文件"*"高置信 3 条"*) ok "聚合计数正确";; *) bad "聚合计数错" "$r";; esac
+case "$r" in *"src/a.py:40"*"k.pem"*"cfg.yml"*) ok "三条高置信都列出";; *) bad "高置信漏列" "$r";; esac
+case "$r" in *"src/a.py:12"*) bad "普通变量名被当高置信" "$r";; *) ok "变量名 token 不算高置信";; esac
+r=$(printf '%s\n' 'src/a.py:12:    token = request.headers.get("X-Token")' | codev_scan_triage); rc=$?
+[ "$rc" = 0 ] && ok "只有噪音返回 0" || bad "噪音返回 $rc" "$r"
+r=$(printf '' | codev_scan_triage); [ "$?" = 0 ] && ok "空输入返回 0" || bad "空输入返回非 0" "$r"
+# 44f probe 探测 pi
+r=$(PATH=/nonexistent codev_probe 2>/dev/null); case "$r" in *"MISS pi"*|*"OK   pi"*) ok "probe 列出 pi";; *) bad "probe 没列 pi" "$r";; esac
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"

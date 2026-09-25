@@ -33,6 +33,13 @@ if [ -z "${CODEV_DIR:-}" ]; then
   echo "  正确用法：CODEV_DIR=<Step 0 打印的字面路径>; source \"\$CODEV_DIR/codev-lib.sh\"" >&2
   return 1 2>/dev/null || exit 1
 fi
+# 会话名（CODEV_DIR 的 basename）进账本第 2 列，codev_session_summary 按它汇总。它必须带 mktemp 的随机后缀：
+# 2026-09-24 一个 worktree 会话为绕过宿主守卫用了固定目录 scratchpad/codev，账本里留下 4 行会话名 "codev"，跨会话不可区分。
+# 只告警不拦：worktree 里 mktemp 也能用（mktemp -d "<scratchpad>/codev.XXXXXX"），见 SKILL Step 0。
+case "$(basename "$CODEV_DIR")" in
+  *.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]*) ;;
+  *) echo "⚠️ CODEV_DIR=$CODEV_DIR 不像 mktemp 生成的会话目录（缺随机后缀）：账本会话列将不可区分，建议 mktemp -d -t codev.XXXXXX 或 mktemp -d \"<scratchpad>/codev.XXXXXX\"" >&2 ;;
+esac
 
 # 沙盒模式：repo（默认，给只读仓库副本）| text（旧行为，纯空目录只喂提示词文本）。
 CODEV_SANDBOX_MODE="${CODEV_SANDBOX_MODE:-repo}"
@@ -147,7 +154,10 @@ codev_classify() {
 codev_match_class() {
   local t="$1"
   [ -n "$t" ] || return 0
-  if printf '%s' "$t" | grep -qiE 'usage limit|rate limit|credit usage|quota|额度|频率限制|too many requests|insufficient (balance|credit|funds)|resource.?exhausted|(^|[^0-9])(429|402)([^0-9]|$)'; then
+  # 503/529/overloaded 归 quota（额度/限流/过载）：处置完全一样——本轮无效、不呈现、稍后重试或换家补位。
+  # 9/11-9/25 实测 gemini 7 次调用 4 次撞 503（"This model is currently experiencing high demand"）、self 子 agent
+  # 撞 529 Overloaded，旧版都判成 error/empty，账本看不出"上游过载"，下一会话照样推荐它。
+  if printf '%s' "$t" | grep -qiE 'usage limit|rate limit|credit usage|quota|额度|频率限制|too many requests|insufficient (balance|credit|funds)|resource.?exhausted|overloaded|currently unavailable|experiencing high (demand|traffic|load)|(^|[^0-9])(429|402|503|529)([^0-9]|$)'; then
     echo quota; return 0
   fi
   if printf '%s' "$t" | grep -qiE 'unauthorized|not logged in|please (log ?in|login)|invalid api key|authentication|鉴权|认证失败|登录已过期|(^|[^0-9])401([^0-9]|$)'; then
@@ -162,7 +172,12 @@ codev_match_class() {
 codev_err_lines() {
   local err="$1"
   [ -s "$err" ] || return 0
-  grep -aE '^[[:space:]]*(ERROR|Error|error|Err|错误|FATAL|fatal|panic)[:：[:space:]]|^[[:space:]]*[0-9]{3}[[:space:]]|context canceled|[Mm]ax turns' "$err" 2>/dev/null | tail -n 6
+  # "API Error 529 Overloaded"（Claude 系 CLI / self 子 agent）与 gemini 的 `status: 503` / `"code": 503` 行都没有
+  # ERROR 前缀，旧版抽不到 → stdout 空时被判 empty，过载被当成"无输出"。
+  # 三位状态码行只认 4xx/5xx 且其后是文字（不是标点/数字）：codex 的工具轨迹会把 `354  void qc.invalidateQueries(` 这类
+  # 带行号的源码回显到 stderr，旧版把它们当错误行，9/11-9/25 七个会话里 35 次 "✔ 但 stderr 含错误行" 全是这种假警告，
+  # 真截断反而淹没在噪音里。
+  grep -aE '^[[:space:]]*(ERROR|Error|error|Err|错误|FATAL|fatal|panic)[:：[:space:]]|^[[:space:]]*API Error[[:space:]]|^[[:space:]]*[45][0-9]{2}[[:space:]]+[^[:space:][:punct:][:digit:]]|^[[:space:]]*status: [0-9]{3}|"code": ?[0-9]{3}|context canceled|[Mm]ax turns' "$err" 2>/dev/null | tail -n 6
 }
 
 # codev_tokens <agent> — 能拿到才输出 "tokens N"（拿不到输出空串，调用方省略该字段，绝不编造）：
@@ -304,6 +319,9 @@ codev_model_of() {
   local agent="$1" v=""
   case "$agent" in *[!A-Za-z0-9_]*|'') echo unknown; return 0;; esac
   eval "v=\${CODEV_MODEL_$agent:-}"
+  # 裸 "default" 归一成 "<agent>-default"：9/11-9/25 账本里 codebuddy 同一默认模型写成了 codebuddy-default / default /
+  # unknown 三种，codev_stats 按 agent+模型分桶，同一家被拆成三行、样本各自不够 20 条。
+  case "$v" in default|DEFAULT) v="$agent-default";; esac
   [ -n "$v" ] && { printf '%s' "$v"; return 0; }
   if [ "$agent" = codex ] && [ -s "$CODEV_DIR/codev-err-codex.txt" ]; then
     v=$(grep -am1 '^model: ' "$CODEV_DIR/codev-err-codex.txt" 2>/dev/null | sed 's/^model: //' | tr -d '\r')
@@ -444,11 +462,125 @@ codev_finding_add() {
   case "$9"  in 采纳|驳回|存疑) ;; *) echo "codev_finding_add: 第 9 个实参（verdict）须为 采纳/驳回/存疑，收到「$9」" >&2; return 1;; esac
   case "${10}" in 成立|不成立|待定) ;; *) echo "codev_finding_add: 第 10 个实参（verified）须为 成立/不成立/待定，收到「${10}」" >&2; return 1;; esac
   case "${11}" in 独家|共同) ;; *) echo "codev_finding_add: 第 11 个实参（unique）须为 独家/共同，收到「${11}」" >&2; return 1;; esac
+  local round; round=$(codev_key_round "$3" codev_finding_add) || return 1
+  codev_key_agent "$4" codev_finding_add || return 1
   # 写失败必须自己喊一声：调用方是按「逐条 codev_finding_add」在批量记，没人逐条查 rc
   # （SKILL 通用机制 F 就是这么写的）。底层失败时 stderr 上可能只有工具自己的一句无关报错，
   # 光返回 1 的话，这条发现就和写成功的那些混在一起、事后从台账里彻底消失。同 codev_ledger_append。
-  codev_tsv_append "$CODEV_FINDINGS" "$(date +%Y-%m-%dT%H:%M)" "$@" \
+  codev_tsv_append "$CODEV_FINDINGS" "$(date +%Y-%m-%dT%H:%M)" "$1" "$2" "$round" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" \
     || { printf '⚠️ 发现未记入台账（%s）：%s %s %s\n' "$CODEV_FINDINGS" "$6" "$7" "${12}" >&2; return 1; }
+}
+
+# codev_prompt_gate — 发出前按 agent 检查每份提示词的体积（字节）：reasonix ≤ 45KB、codebuddy ≤ 25KB、其它 ≤ 50KB
+# （阈值来源见 SKILL 通用机制 C 与 agents.md，均为实测超时/断流阈值）。任一超标返回 1。9/11-9/25 四个会话各自
+# 手写了一遍这段计数；有超标就停下精简（路径引用代替内联、核实清单收窄），不是"建议"。
+codev_prompt_gate() {
+  local f agent sz lim bad=0 n=0
+  for f in "$CODEV_DIR"/codev-prompt-*.txt; do
+    [ -f "$f" ] || continue        # zsh NOMATCH 时 glob 原样留下，-f 挡住
+    n=$((n+1)); agent=${f##*/codev-prompt-}; agent=${agent%.txt}
+    sz=$(wc -c < "$f" | tr -d ' ')
+    case "$agent" in reasonix) lim=46080;; codebuddy) lim=25600;; *) lim=51200;; esac
+    if [ "$sz" -gt "$lim" ]; then bad=$((bad+1)); printf '✘ %-10s %7s 字节 > 上限 %s（%sKB）→ 停下精简：路径引用代替内联 / 核实清单收窄到 3-8 条\n' "$agent" "$sz" "$lim" "$((lim/1024))"
+    else printf '✔ %-10s %7s 字节 ≤ %sKB\n' "$agent" "$sz" "$((lim/1024))"; fi
+  done
+  [ "$n" -gt 0 ] || { echo "（$CODEV_DIR 下没有 codev-prompt-*.txt——先写提示词再检查）"; return 1; }
+  [ "$bad" = 0 ]
+}
+
+# codev_scan_triage [文件] — 把 secret 扫描的 grep 输出（path:行号:内容 或 path:内容）按文件聚合，并单独列出
+# 【高置信】命中：PRIVATE KEY 块、AKIA/ASIA 前缀、"<key|secret|token|password> = <≥20 位随机串>" 形态。
+# 副本模式整仓扫描噪音天然高（测试固件、变量名），9/11-9/25 每个会话都现写一版不同的聚合脚本；这里固定一版。
+# 返回 3 = 有高置信命中，0 = 只有命名相似的噪音（仍要人看一眼），1 = 参数/读取错误。输入为空时按 0 处理。
+codev_scan_triage() {
+  local src="${1:--}" spool="" rc
+  command -v python3 >/dev/null 2>&1 || { echo "⚠️ codev_scan_triage 需要 python3" >&2; return 1; }
+  # 脚本走 heredoc 占了 python 的 stdin，管道输入先落到会话目录里的临时文件（内容是命中行，用完即删）。
+  if [ "$src" = - ]; then
+    spool=$(mktemp "$CODEV_DIR/codev-scan-triage.XXXXXX") || return 1
+    cat > "$spool" || { rm -f "$spool"; return 1; }
+    src="$spool"
+  fi
+  python3 - "$src" <<'CODEV_TRIAGE_PY'
+import sys, re, collections
+src = sys.argv[1]
+try:
+    data = open(src, encoding='utf-8', errors='replace').read()
+except OSError as e:
+    print(f"⚠️ 读取失败：{e}"); sys.exit(1)
+strong = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![A-Z0-9])A(KIA|SIA)[0-9A-Z]{16}(?![A-Z0-9])|"
+                    r"(api[_-]?key|secret|token|passw(or)?d|credential)[A-Za-z0-9_.-]*['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9+/=_.\-]{20,}", re.I)
+per_file = collections.Counter(); hits = []
+for line in data.splitlines():
+    if not line.strip(): continue
+    parts = line.split(':', 2)
+    if len(parts) == 3 and parts[1].isdigit(): path, loc, content = parts[0], parts[0] + ':' + parts[1], parts[2]
+    elif len(parts) >= 2: path, loc, content = parts[0], parts[0], line[len(parts[0])+1:]
+    else: path, loc, content = '(无路径)', '(无路径)', line
+    per_file[path] += 1
+    if strong.search(content): hits.append((loc, content.strip()[:160]))
+total = sum(per_file.values())
+if total == 0:
+    print("SCAN-TRIAGE: 0 命中"); sys.exit(0)
+print(f"SCAN-TRIAGE: {total} 命中 / {len(per_file)} 文件，高置信 {len(hits)} 条")
+print("按文件（前 25）：")
+for p, n in per_file.most_common(25): print(f"  {n:5d}  {p}")
+if hits:
+    print("高置信（像真密钥，逐条确认；拿不准按真密钥处理）：")
+    for p, c in hits[:20]: print(f"  {p}: {c}")
+    sys.exit(3)
+print("没有高置信形态：其余多为命名相似（变量名/测试固件），仍需扫一眼上表再决定是否发送")
+sys.exit(0)
+CODEV_TRIAGE_PY
+  rc=$?
+  [ -n "$spool" ] && rm -f "$spool"
+  return "$rc"
+}
+
+# codev_key_round <round> <caller> — 三个账本共用的轮次归一：接受 12 或 r12，输出纯数字；其它拒收。
+# 9/11-9/25 的台账里同一对象的轮次既有 5..9 也有 r10..r14（153 行），按轮次筛选/回放时同一轮被拆成两个键，
+# codev_archive 又只收纯数字——同一个数在三处写法不一。这里统一收口，不让调用方自己记。
+codev_key_round() {
+  local r="${1#r}"
+  case "$r" in ''|*[!0-9]*) echo "$2: 轮次须为数字（可带 r 前缀，如 3 / r3），收到「$1」" >&2; return 1;; esac
+  printf '%s' "$r"
+}
+
+# codev_key_agent <agent> <caller> — agent 列只能是标签（codex / self / check / pi …），不能把模型名或
+# "实跑/推演"这类备注塞进来：9/11-9/25 的意见记录里出现了 "self claude-opus-5"、"pi deepseek-v4-pro 实跑"
+# 等 10 行，模型有自己的列、备注有 note 列；agent 列一脏，codev_opinions 按 (agent, issue, role) 取最后立场时
+# 就把同一主体当成两个人，一致性判定失真。
+codev_key_agent() {
+  # 用 LC_ALL=C grep 而不是 case 的 [a-z]：UTF-8 locale 下 bash 的区间按 collation 展开，[a-z] 把 "Codex" 也放行（实测）。
+  printf '%s' "$1" | LC_ALL=C grep -qE '^[a-z][a-z0-9_-]*$' && return 0
+  echo "$2: agent 须为小写标签（字母开头，只含 a-z 0-9 _ -，不含空格/模型名），收到「$1」——模型写第 5 列、备注写 note" >&2
+  return 1
+}
+
+# codev_round_trend <repo> <doc> — 该对象每一轮的 发现总数 / 声称 P1 / 亲验成立 P1 / 参与 agent，末行给累计轮数。
+# 多轮评审开新一轮前先打印它：9/11-9/25 一份计划从第 5 轮跑到第 14 轮、另有 4 个对象跑到第 4-5 轮，
+# synthesis.md §6 的"第 5 轮仍有 P1 → 停下和用户看范围"没被执行——每个新会话都只看到自己那几轮。
+codev_round_trend() {
+  [ $# -eq 2 ] || { echo "用法: codev_round_trend repo doc" >&2; return 1; }
+  local repo="$1" doc="$2" snapshot rc
+  snapshot=$(codev_tsv_snapshot "$CODEV_FINDINGS") || return 1
+  if (set -o pipefail; LC_ALL=C awk -F'\t' -v r="$repo" -v d="$doc" '
+    $2==r && $3==d {
+      k=$4; sub(/^r/, "", k); if (k !~ /^[0-9]+$/) next
+      n[k]++; if ($8=="P1") { p1[k]++; if ($11=="成立") ok[k]++ }
+      if (!index("," ag[k] ",", "," $5 ",")) ag[k]=(ag[k]=="" ? $5 : ag[k] "," $5)
+      if (k+0 > max) max=k+0
+    }
+    END {
+      if (max==0) { printf "（%s / %s 在发现台账里没有任何轮次）\n", r, d; exit 0 }
+      printf "轮次趋势（%s / %s）：\n", r, d
+      for (i=1; i<=max; i++) if (i in n) printf "  r%-3d 发现 %3d ｜ 声称 P1 %2d ｜ 亲验成立 P1 %2d ｜ %s\n", i, n[i], p1[i]+0, ok[i]+0, ag[i]
+      printf "  累计 %d 轮", max
+      if (max>=5) printf "——已到 synthesis.md §6 的第 5 轮上限：先和用户看是不是范围本身有问题，别靠加轮次磨"
+      printf "\n"
+    }' "$snapshot"); then rc=0; else rc=$?; fi
+  rm -f "$snapshot"
+  return "$rc"
 }
 
 # codev_stats [repo] — 按 agent+模型汇总发现台账：声称 P1 里经亲验成立的比例、独家且成立数、总条数、采纳数。
@@ -492,9 +624,11 @@ codev_opinion_add() {
   case "$6"  in 评审|判断|自审|复核) ;; *) echo "codev_opinion_add: 第 6 个实参（role）须为 评审/判断/自审/复核，收到「$6」" >&2; return 1;; esac
   case "$8"  in 提出|采纳|驳回|存疑|未返回) ;; *) echo "codev_opinion_add: 第 8 个实参（stance）须为 提出/采纳/驳回/存疑/未返回，收到「$8」" >&2; return 1;; esac
   case "$9"  in P1|P2|P3|-) ;; *) echo "codev_opinion_add: 第 9 个实参（severity）须为 P1/P2/P3/-，收到「$9」" >&2; return 1;; esac
+  local round; round=$(codev_key_round "$3" codev_opinion_add) || return 1
+  codev_key_agent "$4" codev_opinion_add || return 1
   # 同 codev_finding_add：批量记录时没人逐条查 rc，写失败必须自报，否则这条立场静默消失，
   # 回放时那位主体就成了"从未表态"——正是本记录要防的"缺席被当成没人反对"。
-  codev_tsv_append "$CODEV_OPINIONS" "$(date +%Y-%m-%dT%H:%M)" "$@" "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}" \
+  codev_tsv_append "$CODEV_OPINIONS" "$(date +%Y-%m-%dT%H:%M)" "$1" "$2" "$round" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}" \
     || { printf '⚠️ 意见未记入记录（%s）：%s %s %s %s\n' "$CODEV_OPINIONS" "$7" "$4" "$6" "$8" >&2; return 1; }
 }
 
@@ -712,7 +846,17 @@ codev_archive() {
 # 超时(124)/额度/鉴权/turn/报错/空输出都清楚标注，并附 stderr 里的错误行原句（含 429 的重置时间）。
 # 若调用方设了 CODEV_T0（epoch 秒，codev_bg_* 会设），完成行附"用时 Ns"；能取到 token 就附。
 codev_report() {
-  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note="" unwrap_rc=0
+  local agent="$1" rc="$2" err="$3" out="$CODEV_DIR/codev-out-$1.txt" cls secs="" extra="" lines tk cost note="" unwrap_rc=0 v=""
+  # self / check 没有 CLI：正文要由编排器先用 Write 落进 codev-out-<agent>.txt 再 report。9/11-9/25 六次把有报告的
+  # G2 记成 empty，全是这一步漏了（子 agent 明明返回了几万 token 的报告）。有 token 数却没正文 = 漏落盘，不记账，
+  # 让调用方先落盘再来；真正的空回复（529 过载）token 为 0，仍照常归类。
+  case "$agent" in self|check)
+    eval "v=\${CODEV_TOKENS_$agent:-}"
+    if [ ! -s "$out" ] && printf '%s' "$v" | LC_ALL=C grep -qE '^0*[1-9][0-9]*$'; then
+      printf '⚠️ %s 的正文文件为空但 CODEV_TOKENS_%s=%s：先把 subagent 的最终回复用 Write 写进 %s 再 codev_report（本次未记账）\n' "$agent" "$agent" "$v" "$out"
+      return 1
+    fi ;;
+  esac
   codev_unwrap_result "$agent" || unwrap_rc=$?
   cls=$(codev_classify "$agent" "$rc" "$out" "$err")
   # 进程超时优先；其余情况下结构化 is_error/subtype 优先于正文中的 PASS、标题或退出码 0。
@@ -732,10 +876,14 @@ codev_report() {
   # 一起误扫，吞掉退出码；ASCII 冒号 + printf 稳）。
   case "$cls" in
     ok)      printf '✔ %s 完成 exit=0%s\n' "$agent" "$extra"
-             [ -n "$lines" ] && { printf '  ⚠️ 但 stderr 含错误行（输出可能被截断，核对正文是否完整）:\n'; printf '%s\n' "$lines" | sed 's/^/  /'; } ;;
+             [ -n "$lines" ] && { printf '  ⚠️ 但 stderr 含错误行（输出可能被截断，核对正文是否完整）:\n'; printf '%s\n' "$lines" | sed 's/^/  /'; }
+             if [ -s "$CODEV_DIR/codev-degraded-$agent" ]; then
+               printf '  ⚠️ 该 agent 是在【隔离空目录】里跑的（想铺 ./repo 副本但没铺成：母本≠已扫描版本 / 超闸门 / 非 git），结论只基于提示词文本——按"无代码视野"降置信，B 栏假设别当已查证\n'
+               note="退化:空目录"
+             fi ;;
     timeout) printf '⏭ %s 跳过（超时 rc=%s%s，撞 CODEV_TIMEOUT=%ss 安全网%s）→ 缩小核实范围/改路径引用少内联/或 export CODEV_TIMEOUT=1200 后重试\n' \
                "$agent" "$rc" "$([ "$rc" = 137 ] && printf '，进程 trap 了 TERM 由 -k 补 KILL')" "$CODEV_TIMEOUT" "${secs:+，用时 ${secs}s}" ;;
-    quota)   printf '⛔ %s 额度/限流（exit=%s，本轮无效，勿当评审呈现）:\n' "$agent" "$rc"
+    quota)   printf '⛔ %s 额度/限流/过载（exit=%s，本轮无效，勿当评审呈现）:\n' "$agent" "$rc"
              { [ -n "$lines" ] && printf '%s\n' "$lines"; [ -s "$out" ] && head -c 600 "$out"; } | sed 's/^/  /'   # 长额度页只显示开头 600 字节
              echo "  → 跳过该 agent；错误串里若有重置时间，之后再试；换其它 agent 补位" ;;
     auth)    printf '⛔ %s 鉴权失败（exit=%s）→ 按 agents.md 的登录命令处理后重试:\n' "$agent" "$rc"
@@ -1068,7 +1216,7 @@ codev_repo_copy() {
   # 母本就是另一份没扫过的树——拒发，退回 text 并告警，别把没扫过的内容发出去。没有钉子（未扫或 text 模式）就不拦。
   if [ -s "$CODEV_DIR/codev-scanned-master" ] && [ "$(cat "$CODEV_DIR/codev-scanned-master")" != "$CODEV_MASTER" ]; then
     echo "⚠️ 工作区在 secret 扫描之后又变了（母本 $(basename "$CODEV_MASTER") ≠ 已扫描的 $(basename "$(cat "$CODEV_DIR/codev-scanned-master")")），拒绝铺副本；重扫后再发" >&2
-    return 1
+    return 2   # 2 = 钉子不匹配：调用方必须【中止启动】，不能退回空目录（见 codev_bg_sandboxed）
   fi
   # 从母本给这个 agent 拷一份【独立】副本：`cp -c` 在 APFS 上走 clonefile（写时复制）——
   # 秒级完成、几乎不占额外磁盘，但各 agent 之间【互不影响】（实测改 clone1 不影响母本和 clone2）。
@@ -1099,12 +1247,12 @@ codev_prepare_call() {
   (
     umask 077
     : > "$out" && : > "$err" && chmod 600 "$out" "$err" &&
-    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$CODEV_DIR/codev-result-$agent.json" "$out.unwrap"
+    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$CODEV_DIR/codev-result-$agent.json" "$out.unwrap" "$CODEV_DIR/codev-degraded-$agent"
   ) || { echo "⚠️ 无法准备 $agent 的输出/计量文件，未启动调用" >&2; return 1; }
 }
 
 # codev_bg_sandboxed <agent> <cmd...> — 非原生只读 agent
-# （reasonix / qoderclicn / opencode / codebuddy）：在【隔离沙盒】里跑，cwd 够不到真实仓库
+# （reasonix / qoderclicn / opencode / codebuddy / pi）：在【隔离沙盒】里跑，cwd 够不到真实仓库
 # → 从根本上免掉快照/污染问题。默认沙盒里带一份只读仓库副本（见 codev_repo_copy），
 # 设 CODEV_SANDBOX_MODE=text 可退回旧的"空目录只喂文本"。
 # 输出走会话目录字面路径 $CODEV_DIR/codev-out-<agent>.txt。
@@ -1129,7 +1277,17 @@ codev_bg_sandboxed() {
     # 标记写不进去 = 沙盒目录不可写，agent 也没法在里面干活；且没标记的活沙盒超 60 分钟会被 GC 当残留删掉。
     echo "⚠️ $agent 沙盒不可写（owner 标记写入失败），跳过"; rm -rf "$sbox" 2>/dev/null; return 1
   fi
-  if [ "$CODEV_SANDBOX_MODE" = repo ] && codev_repo_copy "$sbox"; then
+  local copy_rc=1
+  if [ "$CODEV_SANDBOX_MODE" = repo ]; then copy_rc=0; codev_repo_copy "$sbox" || copy_rc=$?; fi
+  # 钉子不匹配（工作区在 secret 扫描之后又变了）= 提示词承诺了 ./repo 但发出去的会是空目录：agent 只能对着文本猜、
+  # 翻牌却仍是 ✔。2026-09-15 实测一整轮 codebuddy + pi 就这样白跑（"只在 ▶ 行看得出来"）。这种情况直接不启动，
+  # 让编排器重扫（SKILL 2B 第 3 步）再发；其它铺失败（超闸门 / 非 git）仍退回空目录并打退化标记。
+  if [ "$copy_rc" = 2 ]; then
+    [ -n "$sbox" ] && { chmod -R u+w "$sbox" 2>/dev/null; rm -rf "$sbox"; }
+    echo "⛔ $agent 未启动：母本与已扫描版本不一致（工作区在 secret 扫描之后被改）→ 重跑 2B 第 3 步的扫描并钉住新母本后再发，别退回空目录硬跑"
+    return 1
+  fi
+  if [ "$copy_rc" = 0 ]; then
     # 副本可能【建成了但里面没东西】：空仓库、或全部文件都命中密钥过滤（实测两种都 rc=0、0 文件）。
     # 此时提示词还在承诺"可以读 ./repo 核实"，agent 找不到任何代码 → 又回到"瞎子"状态，
     # 而 ▶ 行却显示副本就绪，用户无从察觉。故实测文件数，为 0 就如实标出。
@@ -1143,6 +1301,10 @@ codev_bg_sandboxed() {
     # cwd 里却躺着半个 repo，它若发现了就会基于残缺代码评审（比看不到更糟）。
     chmod -R u+w "$sbox/repo" 2>/dev/null; rm -rf "$sbox/repo" 2>/dev/null   # 残留可能是 a-w 的
     mode="隔离空目录（只喂提示词文本）"
+    # 想要副本却没铺成（母本 ≠ 已扫描版本 / 超闸门 / 非 git）= 【退化】：agent 只能对着提示词猜。9/11-9/25 的
+    # 会话里这种情况只在 ▶ 行露一次脸，收尾翻牌仍是 ✔、账本无痕，综合时被当成"看过代码的评审"。
+    # 留个标记让 codev_report 在 ✔ 后追加警告并写进账本备注；用户显式 text 模式不算退化。
+    [ "$CODEV_SANDBOX_MODE" = repo ] && printf '%s' "$mode" > "$CODEV_DIR/codev-degraded-$agent" 2>/dev/null
   fi
   # 用 printf 传 $mode：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
   # （实测 echo "…（$mode）" 只输出到"启动（"就截断）。同 codev_report 里 $rc 的处理。
@@ -1238,7 +1400,7 @@ codev_auth_codex() {
 codev_probe() {
   local c r
   codev_sbox_gc          # 顺手回收上一轮被杀进程漏下的沙盒（含仓库副本，会堆磁盘）
-  for c in codex gemini reasonix qoderclicn opencode codebuddy; do
+  for c in codex gemini reasonix qoderclicn opencode codebuddy pi; do
     if command -v "$c" >/dev/null 2>&1; then
       r=$(codev_ledger_recent "$c")
       if [ "$c" = codex ]; then echo "OK   codex ($(codev_auth_codex))${r:+  近期: $r}"; else echo "OK   $c${r:+  近期: $r}"; fi

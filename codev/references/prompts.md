@@ -2,7 +2,7 @@
 
 规则：
 - **每个**发给外部 agent 的提示词都以「文件系统边界」段落开头。
-- **沙盒 agent**（reasonix / qoderclicn / opencode / codebuddy）的提示词还要前置「工作副本」段落，
+- **沙盒 agent**（reasonix / qoderclicn / opencode / codebuddy / pi）的提示词还要前置「工作副本」段落，
   告诉它 `./repo` 里有整份代码可读——否则它不知道能读，白白当瞎子。
 - 用具体内容替换 `<占位符>`。用中文写提示词（除非仓库/需求是英文语境）。
 - 要求 agent 输出**结构化、可执行、带文件:行号**的结论，方便后续跨模型综合。
@@ -171,7 +171,7 @@ DIFF_END
 > 一句"请运行 `git diff <base>` 只评审这些改动 + <关注点>"（不是 `<base>...HEAD`，那只含已提交范围）+ **未跟踪新文件
 > 路径清单**（`git diff` 不含 untracked，codex 不知道哪些是新增的；没有就写"无"），让 codex
 > 自己生成 diff（从而不带 `--base`、避开 argv 互斥、保住关注点，见 agents.md）。故 codex 的 prompt 里
-> **不内联 diff 文本**，只给指令；下面这个内联 diff 的模板是给 reasonix/qoderclicn/opencode/codebuddy 用的。
+> **不内联 diff 文本**，只给指令；下面这个内联 diff 的模板是给 reasonix/qoderclicn/opencode/codebuddy/pi 用的。
 > 下方模板外层用四个反引号，内层的三反引号 diff 围栏才不会提前闭合。
 
 ````

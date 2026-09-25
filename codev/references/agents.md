@@ -8,6 +8,7 @@
 - **reasonix**（DeepSeek）：`reasonix setup` 配 API key。
 - **qoderclicn / codebuddy**：各自账号交互登录。
 - **opencode**：`opencode auth` 配置 providers。
+- **pi**：`pi auth` 配 provider（本机用 `--provider deepseek`）。
 - **timeout**：macOS 无原生 `timeout`，`brew install coreutils` 装 `gtimeout`。
 
 ---
@@ -34,13 +35,14 @@
 | `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo.<签名>`（签名 = 仓库根 + HEAD + 脏文件内容，见 `codev_master_path`），**每个签名只做一次**，同会话改了代码再评自动换新母本；建成后 `chmod -R a-w`。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
 | `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
 | `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
-| `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/429/402，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
+| `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流/**过载**：429/402/503/529、"overloaded"、"experiencing high demand"，附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**两道守卫**：① `self`/`check` 正文文件为空但 `CODEV_TOKENS_<agent>` > 0 → 判定漏落盘，不记账、返回 1，提示先 Write 正文再 report（09-11 至 09-25 六次有报告的 G2 被记成 empty 都是这一步漏了）；② 沙盒 agent 想铺 `./repo` 却退回了空目录（母本≠已扫描版本 / 超闸门 / 非 git）→ ✔ 后追加"无代码视野"警告，账本备注记 `退化:空目录`（用户显式 `CODEV_SANDBOX_MODE=text` 不算退化）。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
 | `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；stderr 只看以 ERROR/错误/三位状态码开头的"错误行"，不扫 codex 回显的提示词。 |
 | `codev_tokens <agent>` | 能取到才输出 `tokens N`：优先 `CODEV_TOKENS_<agent>`（self/check 的来源，只认纯数字）；codex 取 stderr "tokens used"；其它取完整 metrics JSON 的顶层 prompt+completion，两项均须为非负整数，用 Python 整数相加。缺项、坏 JSON 或坏类型输出空串，不把缺项当零、不取嵌套 provider 冒充总量。 |
 | `codev_model_of <agent>` | 模型名：`CODEV_MODEL_<agent>` 环境变量 > codex stderr banner `model:` 行 > `unknown`。调用前 `export CODEV_MODEL_reasonix=deepseek-v4` 之类。 |
 | `codev_unwrap_result <agent>` | 接受带前导空白的 JSON 消息数组或单个 result 对象。先校验结构，按 0600 原子保存 metrics 和绑定正文 SHA-256 的 `codev-result-<agent>.json`，最后替换正文；保存失败保留原始 usage 供重试。重复 report 保留结构化失败，新调用清除旧状态，正文变化时不复用旧状态。`is_error=true`/`error*` 返回 10（max_turns）/11（其它错误）；解析器缺失、异常退出或结果保存失败返回 12，report 均不因 PASS 或 rc=0 放行；超时仍优先。空错误结果保留 subtype，不能处理的正文保留原文件；可解析时仍允许 `[P1]` 等普通文本。 |
 | `codev_cost <agent>` / `codev_session_summary` | 优先合法 `CODEV_COST_<agent>`（金额加三字母币种，如 `1.29 CNY`），否则解析完整 metrics JSON 顶层 cost/currency。Decimal 处理科学计数法，金额显示保留三位小数，原始精度仍在 metrics；本会话汇总调用用时/token/成本。 |
-| `codev_finding_add …` / `codev_stats [repo]` | 发现台账（`CODEV_FINDINGS`，默认 `~/.local/state/codev/findings.tsv`，13 列）；统计每个 agent/模型的 P1 亲验成立率、独家成立数。awk 用 `LC_ALL=C`：macOS 自带 awk 在 UTF-8 下 `"不成立"=="成立"` 判真。 |
+| `codev_finding_add …` / `codev_stats [repo]` | 发现台账（`CODEV_FINDINGS`，默认 `~/.local/state/codev/findings.tsv`，13 列）；统计每个 agent/模型的 P1 亲验成立率、独家成立数。awk 用 `LC_ALL=C`：macOS 自带 awk 在 UTF-8 下 `"不成立"=="成立"` 判真。**轮次收口**：`12` 与 `r12` 都写成 `12`（其它拒收）；**agent 列只收小写标签**（`codex` / `self` / `check` / `pi`，字母开头、只含 a-z 0-9 _ -），模型名写第 5 列、"实跑/推演"写 desc/note——09-11 至 09-25 的记录里同一对象轮次写成 5..9 + r10..r14、agent 写成 "self claude-opus-5"，回放时同一主体被当成两个人。 |
+| `codev_round_trend <repo> <doc>` | 该对象每一轮的 发现数 / 声称 P1 / 亲验成立 P1 / 参与 agent + 累计轮数，≥ 5 轮直接提示 synthesis.md §6 的上限。多轮评审开第 N ≥ 2 轮前先打印：09-11 至 09-25 一份计划从第 5 轮磨到第 14 轮，每个新会话只看到自己那几轮。`<doc>` 要与 `codev_finding_add` 的 doc 列、`codev_archive` 的 slug 一致。 |
 | `codev_opinion_add <repo> <doc> <round> <agent> <model> <role> <issue> <stance> <severity> <fix> <note>` / `codev_opinions [issue [repo [doc [round [task]]]]]` | 意见与判断记录（`CODEV_OPINIONS`，默认 `~/.local/state/codev/opinions.tsv`）：写入仍为 11 个实参，新增第 13 列 task，取 `CODEV_TASK_ID` 或 `CODEV_DIR` 会话名；跨会话恢复须沿用 task ID。旧 12 列仍可读并提示身份限制。按仓库/对象/轮次/task/问题隔离；回放参数为空则该维度不过滤。完整历史按角色展示，计票只取各判断主体最后追加的记录，不按时间戳或模型重复计票。role=评审/判断/自审/复核，stance=提出/采纳/驳回/存疑/未返回，severity=P1/P2/P3/-，三个枚举列当场校验；缺席**必须显式记 `未返回`**。同修法也须检查 P1 级别分歧；空白、`-` 等占位修法不允许进执行清单。 |
 | `codev_commit_round <files> <round> <reviewers> <p1> <prev_p1> <summary> [trailer…]` | 回流 commit：首参是空格分隔的【具体文件】列表，**清单里有开头/结尾空白或连续两个空白即拒收**（那是某个变量没绑定展开成空串的痕迹；空 token 会被静默丢弃、只提交剩下的文件却报成功）。只 `git add` 这些文件（绝不 `-A`，传目录直接拒收——否则会把同目录下用户未提交的改动一起提交）。trailer 块 `Codev-Round` / `Codev-Reviewed-By` / `Codev-Verified-P1` + 透传 trailer。无改动则拒绝提交。 |
 | `codev_prev_round_commit <file> <round>` | 找触及该文件且 `Codev-Round: <round-1>` 的最近 commit，供 `git diff` 内联两版差异。 |
@@ -79,13 +81,13 @@ PROMPT="$CODEV_DIR/codev-prompt-<agent>.txt"   # 放会话目录；用 cat > "$P
 失败/空输出判定综合 **exit code + stdout + stderr** 三者（`codev_report` 已据此翻牌）；若 stdout 为空但
 stderr 含有效正文（非鉴权/报错），也逐字呈现并标注"来源 stderr"。
 
-非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy）的只读保障按运行位置三选一：
+非原生只读 agent（reasonix / qoderclicn / opencode / codebuddy / pi）的只读保障按运行位置三选一：
 - **(a) 默认 & 首选：隔离沙盒 + 只读仓库副本**——cwd 是 `mktemp -d` 出来的沙盒，里面有 `./repo`
   （工作区副本，`chmod -R a-w`）。真实仓库不在 cwd 里，所以它**防误写不防故意**：顺手的相对路径写入
   只会落到副本上、随沙盒一起删掉（免掉快照/归因/污染问题），有 shell 的 agent 用绝对路径仍能碰到沙盒外
   （见下方「边界说明」）。同时 agent **能读到全部代码**。这是 (a') 的严格升级版。
 - **(a') 隔离空目录只喂文本**（`CODEV_SANDBOX_MODE=text`）——旧默认。仅在不想让 agent 看到仓库
-  其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。**只影响这四个沙盒 agent**：codex/gemini
+  其余部分（如只想要纯粹的 diff 意见）、或副本超体积闸门时用。**只影响这五个沙盒 agent**：codex/gemini
   在真仓库跑，只读旗标只挡写不挡读，仓库敏感时要另用 `--agents` 把它们排除。
 - **(b) 确需在真实仓库 cwd 跑**：则**必须逐 agent 前后快照核对 + 串行**（并行无法归因、会互相污染）。
   有了 (a) 之后基本没有理由再走 (b)。
@@ -273,7 +275,12 @@ fi
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   codev_bg_native gemini env GEMINI_CLI_TRUST_WORKSPACE=true gemini -p "$(cat "$PROMPT")" --approval-mode plan
   ```
-  可选 `-m <model>` 指定模型（建议显式指定以固定评审质量，如 `-m gemini-2.5-pro`）。
+  **别钉旧模型名**：2026-09-23 实测 `-m gemini-2.5-pro` 已下线（`ModelNotFoundError`，5 秒退出）。不传 `-m` 用 CLI 默认，
+  并在调用里 `export CODEV_MODEL_gemini=gemini-default`（要指定模型就先 `gemini --list-models` 之类确认存在）。
+- **⚠️ 503 过载是它的头号死因**：2026-09-11 至 09-25 共 7 次调用，4 次 `status: 503`（"This model is currently experiencing
+  high demand" / "The service is currently unavailable"）或撞超时零输出。`codev_report` 现在把 503/529 归 `quota`
+  （额度/限流/过载）：本轮无效、不呈现，隔一会儿重试一次或换家补位，别连着重试三次（每次都是 600-1200s 白等）。
+  它没有 `--metrics`，账本 tokens 恒为 `-`。
 - **只读保证**：`--approval-mode plan` 为**原生只读模式**（不改文件）。
 - **非受信目录**：非交互模式在未信任目录会报 "not running in a trusted directory" 直接失败；
   用 `GEMINI_CLI_TRUST_WORKSPACE=true`（或 `--skip-trust`）。
@@ -294,6 +301,13 @@ fi
 - **⚠️ 提示词 ≤ 45KB**：近 7 次实测 27-48KB 六次成功，一次 40KB 双大文档任务 stderr 只剩一行
   `错误： context canceled`、stdout 空（`codev_report` 归为 error 并提示）。窄任务稳，"两份大文档一起核对"必超时——
   用路径引用 + 核实清单收窄。
+- **⚠️ 大文件别让它整读**：2026-09-14 实测对 431KB 的计划文档，它的 `read_file` 报
+  `did not complete safely: … the bounded reader cannot establish one source version; inspect explicit ranges`，
+  两次重试都废（error，各 1-2 CNY）。文档 > 100KB 时提示词里给**行号区间**（章节目录 + `sed -n 'A,Bp' ./repo/<路径>`），
+  写明"一次性整读会失败，只按区间读"。
+- **⚠️ 成本与收益**：2026-09-11 至 09-25 共 39 次调用，33 次 ok 合计 82 CNY，单次中位 3M tokens、719s；
+  **超时也照样计费**（1200s 超时零输出一次 4.4 CNY，09-24 一天三次失败 ≈ 9 CNY）。核实型多轮评审里第 2 轮起
+  它多次交出 0 条独家发现（09-17 两轮 9M tokens 全是重复项）。默认只放第 1 轮或用户点名；N ≥ 2 轮默认 codex + self。
 - **⚠️ `--effort medium` 在 DeepSeek thinking 模型上会直接报错退出**（实测 exit=1：
   `provider "deepseek-pro" uses DeepSeek thinking; effort must be high, max, or disabled`）。
   **reasonix 是全局"默认 medium"规则的例外**：给它 `high`（或 `max`/不传）。传 medium 等于白跑一轮。
@@ -353,6 +367,27 @@ fi
 - **鉴权**：`opencode auth`（providers）。`opencode models` 查可用模型。
 - **角色**：灵活切换多家模型，做交叉对比很方便。
 
+## pi — 多供应商（本机走 DeepSeek）
+
+- **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）。2026-09-15 起在 ntms 里临时接入、共 14 次，
+  13 次 ok、1 次超时，这里把实测形态登记下来：
+  ```bash
+  CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
+  root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1
+  export CODEV_MODEL_pi=deepseek-v4-pro
+  codev_bg_sandboxed pi pi -p --provider deepseek --model deepseek-v4-pro --thinking high --no-session --no-context-files \
+    --exclude-tools edit,write -- "$(cat "$PROMPT")"
+  ```
+  `--no-session`：不落会话文件；`--no-context-files`：不读 cwd 的 AGENTS.md/CLAUDE.md（沙盒里本来也没有，防它顺着路径找）；
+  `--thinking high|xhigh|max` 是推理强度（`--xhigh` 用 `max`）。
+- **只读保证**：**弱**（同 opencode）：`--exclude-tools edit,write` 禁了写工具但 `bash` 还在，能绕过；靠沙盒 + 副本 `a-w`。
+  想要 harness 级就用 `--tools read`（白名单只留 read，但它就没有 grep/find 了，核实型评审会变钝）。
+- **计量**：没有 `--metrics`，账本 tokens 恒为 `-`；`--mode json` 是否带 usage **未实测**，验过再改这一行。
+- **⚠️ 超时安全网一次没兜住**：2026-09-15 一次 `CODEV_TIMEOUT=1800` 的调用跑了 6904s 才以 rc=124 结束（原因未查明：
+  `timeout -k 15` 应在 1815s 内结束）。对它要用 `Monitor` 盯输出文件，超过上限 10 分钟还没翻牌就手动 `pkill -f 'pi -p'`。
+- **鉴权**：`pi auth`。
+- **角色**：能进 `./repo` 跑 bash（grep/测试）核实的执行型评审，独家发现率高于纯符号推理的 reasonix/codebuddy。
+
 ## codebuddy — 腾讯（Claude Code 分支）
 
 - **调用**（非原生只读，用 `codev_bg_sandboxed`；沙盒内有 `./repo` 只读副本）。
@@ -390,6 +425,10 @@ fi
   `400 invalid parameter value` → 服务端拒首条请求，多为 CLI 版本过旧（2026-08-11 实测
   升级 CLI 后消失），提示用户升级 codebuddy；其余（空 stderr / 鉴权字样）才判不可用，
   **跳过它**并如实告诉用户"codebuddy 无输出/超时，已跳过；可运行 `codebuddy` 交互登录后重试"。
+- **模型名进账本**：它没有 `-m`，每次调用前 `export CODEV_MODEL_codebuddy=codebuddy-default`（固定写这一个值；
+  写 `default` 库会归一成同名，写 unknown/漏写会把同一家拆成三桶，`codev_stats` 每桶都凑不够 20 条样本）。
+- **超时基线**：2026-09-11 至 09-25 共 56 次，6 次在 1200-1800s 撞超时零输出（提示词都已在 4-11KB、核实清单已收窄），
+  1 次结构化 is_error。收窄提示词能降但不能消掉超时；核实型任务给它 3 条以内，或第 2 轮起换 codex + self。
 - **鉴权**：`codebuddy`（交互登录）。
 - **角色**：中文语境下的代码评审。
 
@@ -400,10 +439,10 @@ fi
 | 类别 | 翻牌 | 处置 |
 |---|---|---|
 | `timeout` | `⏭ 超时 rc=124/137，撞 CODEV_TIMEOUT`（137 = 进程 trap 了 TERM、由 `-k` 补 KILL） | 先确认已后台执行；改路径引用少内联、核实清单收窄到 3-8 条、`export CODEV_TIMEOUT=1200` 后重试一次 |
-| `quota` | `⛔ 额度/限流` + 错误行原句 | 本轮无效，**不呈现其输出**；有重置时间就记下到点再试；换别家补位；账本会标记，下次默认不推荐 |
+| `quota` | `⛔ 额度/限流/过载` + 错误行原句（含 429/402 额度与 503/529 过载） | 本轮无效，**不呈现其输出**；额度类有重置时间就记下到点再试；过载类（gemini 503、self/check 的 `API Error 529 Overloaded`）隔几分钟重试**一次**，再失败就换别家补位或标"本轮无 X 样本"；账本会标记，下次默认不推荐 |
 | `auth` | `⛔ 鉴权失败` | 给对应登录命令，跳过 |
 | `turns` | `⚠️ turn 预算耗尽` | codebuddy 调 `--max-turns 64` + 收窄核实范围后重试一次 |
-| `empty` | `⚠️ 空输出 exit 0` | 本轮无效，**不得当成"无问题"**；读 err 分诊，多为上游断流；重试一次或跳过 |
+| `empty` | `⚠️ 空输出 exit 0` | 本轮无效，**不得当成"无问题"**；读 err 分诊，多为上游断流；重试一次或跳过。`self`/`check` 出现 empty 先想是不是**没先把 subagent 回复 Write 进 `codev-out-<agent>.txt`**——有 token 数的话库会直接拒绝记账 |
 | `error` | `⚠️ 非零退出` + 错误行 | reasonix `context canceled` → 缩提示词到 ≤45KB 重试一次；其余按错误行处理 |
 | `ok` 但附"stderr 含错误行" | `✔` + ⚠️ | 正文可能被截断（codex 出过：核对全做完、输出阶段撞额度）；呈现前确认有完整结论段 |
 
@@ -422,6 +461,7 @@ fi
 | qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
 | codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
 | opencode | **弱**（`edit` 禁了但 `bash` 没禁，可绕过；且权限表随用户配置漂移） | `--agent plan` | 沙盒 `codev_bg_sandboxed` |
+| pi | **弱**（同 opencode：`--exclude-tools edit,write` 留着 `bash`）；`--tools read` 可升 harness 级但失去 grep | `--exclude-tools edit,write`（2026-09-15 起 14 次实测） | 沙盒 `codev_bg_sandboxed` |
 | reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错；`--help` 里另有 `--allowed-tools "<规则>"`，**未实测**能否做成只读白名单，验过再升级此行） | 沙盒 `codev_bg_sandboxed` |
 
 三层纵深防御，下面四个 agent **三层都要上**，不能只靠其中一层：
