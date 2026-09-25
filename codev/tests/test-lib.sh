@@ -960,7 +960,7 @@ codev_round_trend ntms 2>/dev/null && bad "缺参未被拒" || ok "round_trend �
 mk self "" ""
 n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
 r=$(CODEV_TOKENS_self=183000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1); rc=$?
-case "$rc:$r" in 1:*"先把 subagent"*) ok "有 token 无正文 → 拒绝记账并提示先落盘";; *) bad "漏落盘未被拦（rc=$rc）" "$r";; esac
+case "$rc:$r" in 1:*"正文与错误文件都为空"*) ok "有 token、正文与错误都空 → 拒绝记账并提示落盘";; *) bad "漏落盘未被拦（rc=${rc}）" "$r";; esac
 [ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$n0" ] && ok "拒绝时账本不加行" || bad "拒绝时仍写了账本"
 r=$(CODEV_TOKENS_self=0 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
 case "$r" in *"空输出"*) ok "token 0 的真空回复仍记 empty";; *) bad "真空回复处理错" "$r";; esac
@@ -971,16 +971,16 @@ case "$r" in *"✔ self"*"tokens 183000"*) ok "落盘后照常 ✔ 并带 token"
 # 43g 副本没铺成而退回空目录 = 退化：✔ 后要追加警告、账本备注要留痕；prepare_call 清掉上一轮的标记
 mk reasonix "## A. 已查证
 - P2 y" ""
-printf '%s' "隔离空目录（只喂提示词文本）" > "$CODEV_DIR/codev-degraded-reasonix"
+printf '%s' "副本没铺成，退回隔离空目录（超闸门 / 非 git / 铺失败）" > "$CODEV_DIR/codev-degraded-reasonix"
 r=$(report reasonix 0)
-case "$r" in *"✔ reasonix"*"隔离空目录"*"无代码视野"*) ok "退化运行 ✔ 后附警告";; *) bad "退化运行无警告" "$r";; esac
-case "$(tail -n1 "$CODEV_LEDGER" | cut -f12)" in *"退化:空目录"*) ok "账本备注记退化";; *) bad "账本备注缺退化" "$(tail -n1 "$CODEV_LEDGER")";; esac
+case "$r" in *"✔ reasonix"*"没有代码视野"*"隔离空目录"*) ok "退化运行 ✔ 后附警告并带原因";; *) bad "退化运行无警告" "$r";; esac
+case "$(tail -n1 "$CODEV_LEDGER" | cut -f12)" in *"退化:无代码视野"*) ok "账本备注记退化";; *) bad "账本备注缺退化" "$(tail -n1 "$CODEV_LEDGER")";; esac
 codev_prepare_call reasonix >/dev/null 2>&1
 [ -e "$CODEV_DIR/codev-degraded-reasonix" ] && bad "prepare_call 没清退化标记" || ok "prepare_call 清掉退化标记"
 mk reasonix "## A. 已查证
 - P2 y" ""
 r=$(report reasonix 0)
-case "$r" in *"隔离空目录"*) bad "无标记时误报退化" "$r";; *"✔ reasonix"*) ok "无标记时不报退化";; *) bad "正常 ✔ 丢失" "$r";; esac
+case "$r" in *"没有代码视野"*) bad "无标记时误报退化" "$r";; *"✔ reasonix"*) ok "无标记时不报退化";; *) bad "正常 ✔ 丢失" "$r";; esac
 
 echo "44. 9/11-9/25 使用审计回流（二）：假错误行、钉子不匹配不启动、会话名告警、提示词闸门、扫描分诊、probe 含 pi"
 # 44a codex 工具轨迹里带行号的源码不是错误行；真 4xx/5xx 状态行仍是
@@ -991,12 +991,10 @@ mk codex "## A. 已查证
 tokens used
 1,234"
 r=$(report codex 0); case "$r" in *"stderr 含错误行"*) bad "源码行号被当错误行" "$r";; *"✔ codex"*) ok "带行号源码不算错误行";; *) bad "✔ 丢失" "$r";; esac
-mk codex "## A. 已查证
+mk codebuddy "## A. 已查证
 - P2 x" "429 您的使用量已超出频率限制
-500 Internal Server Error
-tokens used
-1,234"
-r=$(report codex 0); case "$r" in *"stderr 含错误行"*"429 您的"*"500 Internal"*) ok "4xx/5xx 状态行仍是错误行";; *) bad "真状态行漏了" "$r";; esac
+500 Internal Server Error"
+r=$(report codebuddy 0); case "$r" in *"stderr 含错误行"*"429 您的"*"500 Internal"*) ok "非 codex 的 4xx/5xx 状态行仍是错误行";; *) bad "真状态行漏了" "$r";; esac
 # 44b 钉住的母本 ≠ 当前母本 → 不启动（⛔），不退回空目录、不写账本
 GITB=$(mktemp -d -t codevpin.XXXXXX); ( cd "$GITB" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && echo a > a.txt && git add a.txt && git -c user.email=t@t -c user.name=t commit -q -m a )
 printf '%s' "$CODEV_DIR/codev-master-repo.deadbeef00000000" > "$CODEV_DIR/codev-scanned-master"
@@ -1028,14 +1026,89 @@ rm -f "$CODEV_DIR"/codev-prompt-*.txt
 # 44e 扫描分诊：按文件聚合 + 高置信形态
 r=$(printf '%s\n' 'src/a.py:12:    token = request.headers.get("X-Token")' 'src/a.py:40:    api_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789"' 'tests/fixtures/x.sql:1:-- password column' 'k.pem:3:-----BEGIN RSA PRIVATE KEY-----' 'cfg.yml:2:aws_key: AKIAABCDEFGHIJKLMNOP' | codev_scan_triage); rc=$?
 [ "$rc" = 3 ] && ok "有高置信命中返回 3" || bad "高置信未返回 3（rc=${rc}）" "$r"
-case "$r" in *"5 命中 / 4 文件"*"高置信 3 条"*) ok "聚合计数正确";; *) bad "聚合计数错" "$r";; esac
+case "$r" in *"5 命中 / 4 个来源"*"高置信 3 条"*) ok "聚合计数正确";; *) bad "聚合计数错" "$r";; esac
 case "$r" in *"src/a.py:40"*"k.pem"*"cfg.yml"*) ok "三条高置信都列出";; *) bad "高置信漏列" "$r";; esac
-case "$r" in *"src/a.py:12"*) bad "普通变量名被当高置信" "$r";; *) ok "变量名 token 不算高置信";; esac
+hi=$(printf '%s\n' "$r" | sed -n '/^高置信/,/^其余命中原文/p')
+case "$hi" in *"src/a.py:12"*) bad "普通变量名被当高置信" "$r";; *) ok "变量名 token 不算高置信";; esac
 r=$(printf '%s\n' 'src/a.py:12:    token = request.headers.get("X-Token")' | codev_scan_triage); rc=$?
 [ "$rc" = 0 ] && ok "只有噪音返回 0" || bad "噪音返回 $rc" "$r"
 r=$(printf '' | codev_scan_triage); [ "$?" = 0 ] && ok "空输入返回 0" || bad "空输入返回非 0" "$r"
 # 44f probe 探测 pi
 r=$(PATH=/nonexistent codev_probe 2>/dev/null); case "$r" in *"MISS pi"*|*"OK   pi"*) ok "probe 列出 pi";; *) bad "probe 没列 pi" "$r";; esac
+
+echo "45. f2ef64a 评审回流：过载词只认 stderr、状态行不回退、codex 不认裸号行、闸门 zsh 安全、分诊不放过真密钥、轮次/agent/归档口径一致"
+# 45a 短 stdout 里讨论 overloaded/503 的正常回复不能被判 quota（f2ef64a 前是 ok）
+mk x "Yes. When the connection pool is overloaded the worker returns 503 and the client backs off; that path looks correct to me." ""
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = ok ] && ok "短回复谈 overloaded/503 → ok" || bad "短回复被判 $r"
+# 45b 状态码后紧跟标点的真错误行仍被抽出（f2ef64a 前：401 → auth）
+mk x "" '401 {"error":"unauthorized"}'
+r=$(codev_classify x 1 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = auth ] && ok "401 {…} → auth" || bad "401 {…} 判成 $r"
+mk x "" '403 - Forbidden: token lacks scope'
+r=$(codev_classify x 0 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = error ] && ok "403 - … rc=0 → error（不是 empty）" || bad "403 - … 判成 $r"
+mk x "" '429 (Too Many Requests)'
+r=$(codev_classify x 1 "$CODEV_DIR/codev-out-x.txt" "$CODEV_DIR/codev-err-x.txt"); [ "$r" = quota ] && ok "429 (…) → quota" || bad "429 (…) 判成 $r"
+# 45c 成功码行不是错误行
+mk x "## A. 已查证
+- P2 x" '  status: 200
+  { "code": 200, "msg": "ok" }'
+r=$(report x 0); case "$r" in *"stderr 含错误行"*) bad "200 行被当错误行" "$r";; *"✔ x"*) ok "status: 200 / code 200 不算错误行";; *) bad "✔ 丢失" "$r";; esac
+# 45d codex：回显源码/夹具里的 4xx/5xx 号与 status 行都不算；空 stdout 时不被判 quota；ERROR: 行照常
+mk codex "## A. 已查证
+- P2 x" '412  const handler = async (req) => {
+  503  return overloaded ? retry() : ok
+    status: 503
+  { "code": 429 }
+tokens used
+1,234'
+r=$(report codex 0); case "$r" in *"stderr 含错误行"*) bad "codex 回显被当错误行" "$r";; *"✔ codex"*) ok "codex 回显 4xx/5xx 源码与夹具不算错误行";; *) bad "✔ 丢失" "$r";; esac
+: > "$CODEV_DIR/codev-out-codex.txt"
+r=$(codev_classify codex 0 "$CODEV_DIR/codev-out-codex.txt" "$CODEV_DIR/codev-err-codex.txt"); [ "$r" = empty ] && ok "codex 空 stdout + 回显 503 源码 → empty（不是 quota）" || bad "codex 回显判成 $r"
+printf '%s\n' '503  return overloaded' 'ERROR: You have hit your usage limit.' > "$CODEV_DIR/codev-err-codex.txt"
+r=$(codev_classify codex 0 "$CODEV_DIR/codev-out-codex.txt" "$CODEV_DIR/codev-err-codex.txt"); [ "$r" = quota ] && ok "codex ERROR: 行仍判 quota" || bad "codex ERROR 行判成 $r"
+# 45e 闸门在 zsh/bash 下没有提示词文件时不中断后续命令
+r=$(CODEV_DIR="$(mktemp -d -t codevgate.XXXXXX)" $TEST_SH -c 'source "$LIB0" 2>/dev/null; codev_prompt_gate; echo "after rc=$?"; rm -rf "$CODEV_DIR"' 2>&1)
+case "$r" in *"先写提示词"*"after rc=1"*) ok "无提示词：提示 + rc=1 + 后续命令照跑";; *) bad "无提示词时中断或无提示" "$r";; esac
+# 45f 分诊：真密钥各种形态必须高置信；引用不算；无文件名输入按"未带文件名"聚合；其余命中打出原文
+r=$(printf '%s\n' 'cfg/.env:4:DB_PASSWORD=Sup3r!S3cret#2024' 'deploy/app.yml:7:  password: "hunter2-prod"' 'src/s.py:3:JWT_SECRET = "k9$Lp@2x!Qz"' 'config/prod.yml:9:  api_key: plainwordsecret' | codev_scan_triage); rc=$?
+[ "$rc" = 3 ] && ok "特殊字符/短值/配置裸值密钥 → rc=3" || bad "真密钥被放过（rc=${rc}）" "$r"
+case "$r" in *"高置信 4 条"*) ok "四条全部高置信";; *) bad "高置信条数错" "$r";; esac
+r=$(printf '%s\n' 'src/a.py:12:    password = settings.DATABASE_PASSWORD_VALUE' 'src/b.py:3:    token = os.environ["API_TOKEN"]' 'src/c.ts:8:  const secret = process.env.SECRET;' 'k8s/x.yml:4:  password: ${DB_PASSWORD}' 'src/d.py:9:  if password == "":' | codev_scan_triage); rc=$?
+[ "$rc" = 0 ] && ok "属性/环境变量/占位符引用与比较 → rc=0" || bad "引用被当真密钥（rc=${rc}）" "$r"
+case "$r" in *"其余命中原文"*"settings.DATABASE_PASSWORD_VALUE"*) ok "噪音命中打出原文";; *) bad "噪音没打原文" "$r";; esac
+r=$(printf '%s\n' '44:token = request.headers.get("X")' '47:api_key = "sk-abcdefghijklmnopqrstuvwxyz"' '49:password column' | codev_scan_triage); rc=$?
+case "$rc:$r" in 3:*"3 命中 / 1 个来源"*"(未带文件名)"*"行 47"*) ok "无文件名输入按一桶聚合、行号标成 行 N";; *) bad "无文件名输入处理错（rc=${rc}）" "$r";; esac
+# 45g 轮次口径：前导零、读取端 r 前缀、归档接受 rN
+export CODEV_FINDINGS="$CODEV_DIR/f45.tsv" CODEV_OPINIONS="$CODEV_DIR/o45.tsv"
+codev_finding_add ntms d45 05 codex m a P1 A 采纳 成立 独家 x 2>/dev/null; codev_finding_add ntms d45 5 pi m b P2 A 采纳 成立 共同 y 2>/dev/null
+[ "$(cut -f4 "$CODEV_FINDINGS" | sort -u | tr '\n' ' ')" = "5 " ] && ok "05/5 归一为 5" || bad "前导零未归一" "$(cut -f4 "$CODEV_FINDINGS")"
+codev_finding_add ntms d45 0 codex m c P1 A 采纳 成立 独家 x 2>/dev/null && bad "轮次 0 未被拒" || ok "拒收轮次 0"
+printf '2026-09-01T00:00\tntms\td45\t05\tcodex\tm\told\tP1\tA\t采纳\t成立\t独家\t旧行 05\n' >> "$CODEV_FINDINGS"
+r=$(codev_round_trend ntms d45); case "$r" in *"r5 "*"发现   3"*) ok "round_trend 把旧 05 行并入 r5";; *) bad "round_trend 漏 05 行" "$r";; esac
+codev_opinion_add ntms d45 r3 codex m 判断 r3-codex-01 采纳 P1 甲 - 2>/dev/null
+printf '2026-09-01T00:00\tntms\td45\tr3\tclaude\tm\t判断\tr3-codex-01\t采纳\tP1\t甲\t-\t%s\n' "${CODEV_TASK_ID:-$(basename "$CODEV_DIR")}" >> "$CODEV_OPINIONS"
+r=$(codev_opinions r3-codex-01 ntms d45 r3)
+case "$r" in *"判断 codex(m)"*"判断 claude(m)"*"一致采纳同一修法"*) [ "$(printf '%s\n' "$r" | grep -c '^r3-codex-01 ')" = 1 ] && ok "按 r3 筛选：旧 r3 行与新 3 行同组、两位判断者一起计票" || bad "新旧轮次拆成两组" "$r";; *) bad "按 r3 筛选未把新旧行合组" "$r";; esac
+r=$(codev_opinions r3-codex-01 ntms d45 03); case "$r" in *"一致采纳同一修法"*) ok "按 03 筛选同样命中";; *) bad "03 筛选错" "$r";; esac
+AR=$(mktemp -d -t codevarch.XXXXXX); ( cd "$AR" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m i
+  printf 'p' > "$CODEV_DIR/codev-prompt-zz.txt"; codev_archive slug45 r12 >/dev/null 2>&1 && [ -f "$AR/.superpowers/codev/slug45/r12/codev-prompt-zz.txt" ] ) \
+  && ok "codev_archive 接受 r12 → r12 目录" || bad "codev_archive 拒收 r12"
+( cd "$AR" && codev_archive slug45 x1 >/dev/null 2>&1 ) && bad "非数字轮次未被拒" || ok "codev_archive 拒收非数字轮次"
+rm -f "$CODEV_DIR/codev-prompt-zz.txt"; rm -rf "$AR"
+# 45h agent 列：夹换行的值不能绕过校验
+codev_finding_add ntms d45 1 "$(printf 'codex\nself claude-opus-5')" m id P1 A 采纳 成立 独家 x 2>/dev/null && bad "换行 agent 未被拒" || ok "拒收夹换行的 agent"
+codev_opinion_add ntms d45 1 "$(printf 'codex\nx')" m 评审 id 提出 P1 甲 - 2>/dev/null && bad "意见换行 agent 未被拒" || ok "意见记录拒收夹换行的 agent"
+# 45i self 以 529 结束：err 写了错误原句、token>0、无正文 → 照常记账并归 quota（不再被守卫拒绝）
+: > "$CODEV_DIR/codev-out-self.txt"; printf '%s\n' 'API Error 529 Overloaded' > "$CODEV_DIR/codev-err-self.txt"
+n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
+r=$(CODEV_TOKENS_self=45000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
+case "$r" in *"⛔ self"*过载*) ok "self 529 + token>0 → ⛔ 过载";; *) bad "self 529 未归过载" "$r";; esac
+[ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$((n0+1))" ] && [ "$(tail -n1 "$CODEV_LEDGER" | cut -f5)" = quota ] && ok "记一行 quota" || bad "529 未记账或类别错" "$(tail -n1 "$CODEV_LEDGER")"
+# 45j 副本 0 文件同样打退化标记
+GITZ=$(mktemp -d -t codevzero.XXXXXX); ( cd "$GITZ" && git init -q && echo x > .env && git add -f .env && git -c user.email=t@t -c user.name=t commit -q -m e )
+r=$( cd "$GITZ" && codev_bg_sandboxed fakezero sh -c 'echo "## A. 已查证"; echo "- P2 z"' 2>&1 )
+case "$r" in *"副本内 0 个文件"*"✔ fakezero"*"没有代码视野"*) ok "0 文件副本 ✔ 后附无代码视野警告";; *) bad "0 文件副本未警告" "$r";; esac
+case "$(tail -n1 "$CODEV_LEDGER" | cut -f12)" in *"退化:无代码视野"*) ok "0 文件副本账本备注记退化";; *) bad "0 文件副本备注缺退化" "$(tail -n1 "$CODEV_LEDGER")";; esac
+chmod -R u+w "$GITZ" 2>/dev/null; rm -rf "$GITZ"
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"

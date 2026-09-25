@@ -40,6 +40,15 @@
 
 ### 🐛 Fixed
 
+- 2026-09-25 [C057 / 评审修复 / f2ef64a] `bin/codev-lib.sh` 分类回退：过载词（503/529/overloaded/currently unavailable/experiencing high demand）只对 stderr 错误行生效，短 stdout 里讨论过载的正常回复恢复为 ok；`codev_err_lines` 改为 `<err> [agent]`，对 codex 只认 `ERROR:`/`API Error`/context canceled/Max turns，不认裸状态码与 status 行（其 stderr 是回显源码与夹具的工具轨迹，号段白名单挡不住第 400-599 行），其它 agent 认 `4xx/5xx` 后接任意内容（`401 {…}` → auth、`403 - …` → error、`429 (…)` → quota 恢复）与 `status: 4xx/5xx`，去掉会匹配 `"code": 200` 的 JSON 规则。回归：45a-45d
+- 2026-09-25 [C058 / 评审修复 / f2ef64a] `codev_scan_triage` 高置信判定改为"敏感键名被赋字面值"：引号串 ≥ 6 字符、配置类文件裸值、代码里含非标识符字符的裸值都算，属性/环境变量/占位符引用与 `==` 比较不算（此前 `DB_PASSWORD=Sup3r!S3cret#2024`、`password: "hunter2-prod"` 返回 0，`settings.X` 反被判真）；无文件名的 `行:内容` 输入归"(未带文件名)"一桶、行号标成"行 N"（此前 234 条命中被算成 234 个文件）；其余命中打出原文前 40 行。SKILL 各扫描 grep 加 `-H`。回归：45f
+- 2026-09-25 [C059 / 评审修复 / f2ef64a] `codev_prompt_gate` 改用 find 枚举，zsh 下没有提示词文件时不再因 glob NOMATCH 中断调用方整条命令。回归：45e
+- 2026-09-25 [C060 / 评审修复 / f2ef64a] self/check 漏落盘守卫改为"token > 0 且正文与 err 都为空"才拒绝；`SKILL.md` G2 收尾片段不再清空 err 文件，subagent 以 529 等错误结束时把错误原句写进 err，照常记账并归 `⛔ 过载`（此前文档承诺的过载路径走不通：守卫拒绝记账，或 err 被清空后记成空输出）。回归：45i
+- 2026-09-25 [C061 / 评审修复 / f2ef64a] 轮次口径统一到底：`codev_key_round` 去前导零并拒收 0（`05` 与 `5` 同键）；`codev_opinions` 读取端的筛选与分组按同口径归一（此前按 `r3` 筛选匹配不到新写的 `3`，新旧行分成两组各算一半票）；`codev_round_trend` 按数字键聚合；`codev_archive` 走 `codev_key_round`，接受 `r12`。回归：45g
+- 2026-09-25 [C062 / 评审修复 / f2ef64a] `codev_key_agent` 先拒含换行的值（此前第一行干净即放行，写入时换行被压成空格，又写出"agent + 模型名"）。回归：45h
+- 2026-09-25 [C063 / 评审修复 / f2ef64a] 副本建成但 0 个文件时同样打退化标记；✔ 后警告带上原因，账本备注统一为 `退化:无代码视野`。清理钉子不匹配改为不启动后残留的"退回 text"注释与文案（库注释、✔ 警告、`references/agents.md`、`SKILL.md`）。回归：45j
+- 2026-09-25 [C064 / 评审修复 / f2ef64a] `references/synthesis.md` §6.3 停止后补 G1 的命令改为 `git show "$(codev_prev_round_commit <文件> K+1)" -- <文件>`；此前的 `git diff <第 K 轮提交>` 在回流已提交后恒为空。`references/agents.md` 函数表补 `codev_prompt_gate` / `codev_scan_triage` 两行（C052 称已补但实际缺失）。`tests/test-lib.sh` 修一处 `$rc）` 紧贴全角括号在失败分支触发的 unbound variable。新增第 45 节 27 项回归，在 f2ef64a 的库上 bash 27 项、zsh 28 项失败，最终 bash/zsh 各 329 项通过
+
 - 2026-09-25 [C053 / 使用审计回流] `bin/codev-lib.sh` 的 `codev_report`：`self`/`check` 正文文件为空但 `CODEV_TOKENS_<agent>` > 0 时判定漏落盘，不记账、返回 1 并提示先 Write 正文；此前三个会话六次把有报告的 G2 记成 empty，一次靠手工 awk 改账本。token 为 0 的真空回复仍照常归类。回归：43f
 - 2026-09-25 [C054 / 使用审计回流] `codev_bg_sandboxed`：想铺 `./repo` 却退回空目录（超闸门 / 非 git）时写 `codev-degraded-<agent>` 标记，`codev_report` 在 ✔ 后追加"无代码视野"警告并在账本备注记 `退化:空目录`，`codev_prepare_call` 清掉上一轮标记；母本与已扫描版本不一致（`codev_repo_copy` 现返回 2）时**不启动**、打 `⛔ 未启动`、不写账本。此前 2026-09-15 一整轮 codebuddy + pi 在静默 text 模式下白跑、翻牌仍是 ✔。测试 36 的期望同步改为 rc=2。回归：43g/44b
 - 2026-09-25 [C055 / 使用审计回流] `codev_err_lines` 的三位状态码行只认 4xx/5xx 且其后为文字：codex 回显到 stderr 的带行号源码（`354  void …`）不再被当错误行，此前七个会话 35 次 "✔ 但 stderr 含错误行" 全是假警告。回归：44a

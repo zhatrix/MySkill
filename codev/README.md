@@ -59,7 +59,8 @@ brew install coreutils      # 提供 gtimeout
 - `CODEV_TIMEOUT`（默认 600s）：单次 agent 调用的兜底超时。核实型评审、大文档评审建议 `export CODEV_TIMEOUT=1200`。
 - 近期结果账本 `~/.local/state/codev/ledger.tsv`：每次调用记一行类别（ok/quota/auth/turns/timeout/empty/error）。
   `/codev` 探测时会给每个 agent 标"近期 3 次结果"，连续额度耗尽的 agent 不会被推荐。设 `CODEV_LEDGER` 可改路径。
-  `quota` 同时覆盖额度（429/402）与上游过载（503/529）；沙盒 agent 想铺副本却退回空目录时，✔ 行会附"无代码视野"警告、备注记 `退化:空目录`。
+  `quota` 同时覆盖额度（429/402）与上游过载（stderr 里的 503/529）；沙盒 agent 没有代码视野时（副本没铺成或 0 个文件），✔ 行会附"没有代码视野"警告、备注记 `退化:无代码视野`。
+  账本与归档的轮次都接受 `3` / `r3` / `03`，统一存成 `3`。
 - 发现台账 `~/.local/state/codev/findings.tsv`：每条外部发现的裁决与亲验结果；`codev_stats` 看每个 agent/模型的
   "声称 P1 里亲验成立的比例"和"独家成立"数（这是选模型的依据，不是采纳条数）。
 - 意见与判断记录 `~/.local/state/codev/opinions.tsv`：每个 agent 对每个问题的**每一条立场**单独一行（谁提出、谁采纳、
@@ -184,7 +185,7 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | gemini 报 503 / 过载 | 翻牌为 `⛔ 额度/限流/过载`（503/529 与 429 同类处置）：本轮无效、隔几分钟重试一次，再失败换 agent。别再钉 `-m gemini-2.5-pro`（已下线） |
 | self / check 翻牌成"空输出" | 多半是没先把 subagent 的回复 Write 进 `codev-out-self.txt` 就 `codev_report`；有 token 数时库会拒绝记账并提示先落盘 |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
-| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型。命中多时 `codev_scan_triage` 按文件聚合并单列"像真密钥"的高置信行 |
+| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型。命中多时把 grep 结果接给 `codev_scan_triage`：按文件聚合、单列"像真密钥"的行、打出其余原文；它是启发式，返回 0 也要看完原文 |
 | `⛔ <agent> 未启动：母本与已扫描版本不一致` | secret 扫描之后工作区又被改了，沙盒 agent 不会退回空目录硬跑；重扫并钉住新母本后再发 |
 | worktree 隔离会话里 codev 命令被宿主拒绝 | 把 Step 0 与后台调用写成 scratchpad 里的脚本文件再 `bash <文件>`；`CODEV_DIR` 仍用 mktemp（见 SKILL Step 0） |
 | 只想让一家看一眼 | `/codev review --agents codex`（或口头"让 codex 看一眼"）走轻量单家复审：不弹问、不起自查自评，保留扫描/翻牌/账本/逐字呈现/亲验 |

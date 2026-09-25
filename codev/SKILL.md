@@ -237,11 +237,13 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
    [ "${n:-0}" -gt 0 ] || { echo "SCAN: 还没有提示词文件——先写提示词再扫"; exit 1; }
    # 上一行已保证至少有一个文件，glob 此时必有匹配（zsh 不会 NOMATCH）。不要用 find -exec grep：
    # find 会把 grep 的 2（出错，如文件不可读）折成 1，"出错"分支永远走不到、出错被判成"干净"（实测）。
-   grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$CODEV_DIR"/codev-prompt-*.txt
+   grep -HainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$CODEV_DIR"/codev-prompt-*.txt   # -H：只有一个提示词文件时也带文件名，codev_scan_triage 才能按文件聚合
    case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac
    ```
-   命中行多时别现写聚合脚本：`grep … | codev_scan_triage` 按文件聚合并单独列出"像真密钥"的高置信形态（PRIVATE KEY /
-   AKIA·ASIA / `key|secret|token|password = <≥20 位随机串>`），返回 3 = 有高置信、0 = 只有命名相似的噪音（仍要扫一眼）。
+   命中行多时别现写聚合脚本：把同一条 grep（带 `-H`）接到 `| codev_scan_triage`，它按文件聚合、单列"像真密钥"的高置信行
+   （PRIVATE KEY / AKIA·ASIA / 敏感键名被赋了字面值：引号串、配置文件裸值、含特殊字符的裸值；`settings.X`、`os.environ[…]`、
+   `${VAR}` 这类引用不算），并打出其余命中原文前 40 行。返回 3 = 有高置信、0 = 只有命名相似（仍要看完原文再决定）。
+   规则是启发式的：返回 0 不等于干净，拿不准就当真密钥处理。
    扫描前先 `codev_prompt_gate`：按 agent 阈值（reasonix 45KB / codebuddy 25KB / 其它 50KB）逐份检查提示词体积，任一 ✘ 就停下精简。
 2. **将进副本的整个工作区**（**仅副本模式**，即默认）：`codev_bg_sandboxed` 铺 `./repo` **不分模式**，brainstorm /
    challenge / consult 同样把整个工作区发给沙盒 agent。跑 Step 2B 第 3 步片段的 repo 分支：先铺母本、扫母本里的
@@ -323,7 +325,7 @@ reasonix ≈ 12 分钟、pi ≈ 13 分钟、self/check ≈ 13 分钟（G1/G2 是
 不计入矩阵，如实告知类别与 stderr 错误行（含 429 的重置时间），不阻塞其它 agent。
 `⛔` 里的**过载**（gemini `status: 503`、self/check 的 `API Error 529 Overloaded`）隔几分钟**重试一次**，再失败就
 换家补位或在综合里标"本轮无 X 样本"（G2 缺席时"Claude vs 外部"一致率写"本轮无 self 样本"，不跳过整轮）。
-`✔` 行下若附"该 agent 是在【隔离空目录】里跑的"→ 它没看到代码，按无代码视野降置信，B 栏假设一律进 0.5 回填、不当已查证。
+`✔` 行下若附"该 agent 没有代码视野（原因）"→ 它没看到代码，按无代码视野降置信，B 栏假设一律进 0.5 回填、不当已查证。
 `✔` 但附"stderr 含错误行"→ 正文可能被截断，呈现前核对是否有完整结论段。实时盯用 `Monitor` 跟踪输出路径（见 D）。
 全部 agent 结束后跑一次 `codev_session_summary`（用时/tokens/成本一览）并原样打印。
 
@@ -399,17 +401,21 @@ codex/gemini，快照差异可唯一归因到 self；快照要比两样，`git s
 # 发出前（一次 Bash 调用）：提示词写到 $CODEV_DIR/codev-prompt-self.txt（账本"提示词字节"与 codev_archive 都靠它）；
 # 模型 id 与开始时间【落盘】——接收阶段是另一次 Bash 调用，export 与 CODEV_T0 都不会带过去，不落盘账本就记 unknown / 用时 0：
 CODEV_DIR=<会话目录>; printf '%s' '<当前 Claude 模型 id>' > "$CODEV_DIR/self-model"; date +%s > "$CODEV_DIR/self-t0"
-# 收到后：subagent 的最终回复原样写进 $CODEV_DIR/codev-out-self.txt（Write 工具），然后在【新的】Bash 调用里：
+# 收到后先落盘（Write 工具），二选一：
+#   - subagent 返回了报告 → 最终回复原样写进 $CODEV_DIR/codev-out-self.txt，err 文件写空；
+#   - subagent 以错误结束（API Error 529 Overloaded、流中断等，没有报告）→ 正文不写，把错误原句写进 $CODEV_DIR/codev-err-self.txt。
+# 然后在【新的】Bash 调用里：
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
 export CODEV_MODEL_self=$(cat "$CODEV_DIR/self-model"); CODEV_T0=$(cat "$CODEV_DIR/self-t0")
 # 【必填】子 agent 没有 CLI、拿不到 metrics 文件，用量只有编排器手里有：把 Agent 工具完成通知里的
 # <usage><subagent_tokens> 数字原样填进来。不填就记 0——G1/G2 曾是全场最大的一笔支出却在账本上隐形
 # （实测每个子 agent 单次 17 万-24 万 token，每轮两个）。只接受纯数字，脏值会被丢弃。
 export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
-: > "$CODEV_DIR/codev-err-self.txt"; codev_report self 0 "$CODEV_DIR/codev-err-self.txt"
+codev_report self 0 "$CODEV_DIR/codev-err-self.txt"   # 别在这里清空 err 文件：错误原句是过载归类的唯一依据
 ```
-**顺序不能反**：先 Write 正文文件，再 `codev_report`。9/11-9/25 六次把有报告的 G2 记成"空输出"都是先 report 后落盘；
-库现在会拦：正文文件为空但 `CODEV_TOKENS_self` > 0 就拒绝记账并提示先落盘（真空回复如 529 过载 token 为 0，照常归 `⛔ 过载`）。
+**顺序不能反**：先落盘（正文或错误原句），再 `codev_report`。9/11-9/25 六次把有报告的 G2 记成"空输出"都是先 report 后落盘；
+库现在会拦：`CODEV_TOKENS_self` > 0 而正文与 err 文件**都**为空就拒绝记账并提示补齐。subagent 撞 529 时照上面把错误原句写进
+err 文件，token 照填（失败前已消耗），翻牌为 `⛔ 过载`、账本记 `quota`。
 自评结果**逐字呈现**（E，框标 `SELF（模型：…）`）、进一致性矩阵（独家/共同）、编号 `r<N>-self-<两位序号>`、记台账。
 综合时固定给「Claude vs 外部 agent」一致率（synthesis.md §4，不再是"若此前跑过 /code-review 才加"）。
 **只读旗标**：`self` 没有沙盒级保证，靠提示词 + 快照核对——保障级别与 opencode 同为"弱"，但运行位置在真实仓库而非沙盒；
@@ -500,7 +506,7 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
      # 路径名单独扫一遍（credentials.sql 这类靠文件名才抓得到），内容用 grep -r 直接扫母本：输出带 路径:行号，
      # 命中后才能按文件聚合、区分真密钥与命名相似；读文件失败 grep 自己返回 2 → 按命中处理（fail closed）。
      find "$CODEV_MASTER" -type f | sed "s|^$CODEV_MASTER/||" | grep -aiE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})'; rp=$?
-     grep -rainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$CODEV_MASTER"; rc=$?
+     grep -rHainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$CODEV_MASTER"; rc=$?
      if [ "$rp" = 0 ] || [ "$rc" = 0 ]; then rs=0; elif [ "$rp" = 1 ] && [ "$rc" = 1 ]; then rs=1; else rs=2; fi
    else
      # text 模式：外发的只有提示词，即 diff + 纳入的未跟踪文件（路径清单也会进 codex 提示词，所以文件名同样要扫）。
@@ -510,14 +516,14 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
      git ls-files --others --exclude-standard >> "$IN" || { echo "SCAN: 枚举未跟踪文件失败，按命中处理"; exit 1; }
      git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do cat -- "$f" >> "$IN" || exit 9; done
      [ $? = 0 ] || { echo "SCAN: 读未跟踪文件失败（权限/IO），按命中处理"; exit 1; }
-     grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$IN"; rs=$?
+     grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$IN"; rs=$?   # 单一合并输入没有文件名：codev_scan_triage 会按"(未带文件名)"一桶聚合、行号标成 行 N
      rm -f "$IN"   # 扫描输入含整仓改动，用完即删
    fi
    case $rs in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 扫描本身出错，按命中处理";; esac
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    # grep 的退出码：0 命中 / 1 干净 / 2 出错——别把"干净"的 1 当失败，也别把 2 当干净。
    # 干净时把【已扫过的母本】钉住：扫描与 fan-out 是两次 Bash 调用，中间工作区若被改，codev_repo_master 会按新签名另铺
-   # 一份【没扫过】的母本；codev_repo_copy 发现当前母本 ≠ 钉住的这份就拒发（退回 text 并告警）。
+   # 一份【没扫过】的母本；codev_repo_copy 发现当前母本 ≠ 钉住的这份就返回 2，codev_bg_sandboxed 打 ⛔ 未启动、不发这一家。
    [ "${CODEV_SANDBOX_MODE:-repo}" = repo ] && printf '%s' "$CODEV_MASTER" > "$CODEV_DIR/codev-scanned-master"
    # -a：二进制内容也按文本扫；ASIA：AWS STS 临时凭证前缀（AKIA 只覆盖长期密钥）。
    # grep 的退出码：0 命中 / 1 干净 / 2 出错——别把"干净"的 1 当失败，也别把 2 当干净。
@@ -594,7 +600,7 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
    codex 用 `codex exec`（不是 `review`——没有 diff 可评），`-c 'model_reasoning_effort="medium"'`；
    复杂文档 `export CODEV_TIMEOUT=1200`。
 4. secret 扫描：提示词文件（通用机制 B）+ **文档正文**（内联/路径引用都要，agent 会读它）：
-   `grep -ainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$DOC"; case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac`
+   `grep -HainE '(api[_-]?key|secret|password|passwd|token|credential|-----BEGIN [A-Z ]*PRIVATE KEY-----|A(KIA|SIA)[0-9A-Z]{16})' "$DOC"; case $? in 0) echo "SCAN: 命中";; 1) echo "SCAN: 干净";; *) echo "SCAN: 出错，按命中处理";; esac`
    + 副本模式下按 2B 第 3 步扫母本。
 5. 并行发出（C，扫描通过后；**G2 自评同时发出**——同一份文档评审提示词去掉「工作副本」段交给 `self`）→ 运行时显示（D）→ 忠实呈现（E）→ 事实核查回填 + **P1 亲验** → 综合（F）：
    产出「与代码脱节清单（逐条 成立/不成立 + 依据）+ 方案风险 + 遗漏项 + 可否进入下一步」；
