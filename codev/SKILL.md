@@ -242,7 +242,8 @@ codev_probe        # 列出 OK/MISS 的 agent（codex 附鉴权 AUTH_OK/AUTH_FAI
    ```
    命中行多时别现写聚合脚本：把同一条 grep（带 `-H`）接到 `| codev_scan_triage`，它按文件聚合、单列"像真密钥"的高置信行
    （PRIVATE KEY / AKIA·ASIA / 敏感键名被赋了字面值：引号串、配置文件裸值、含特殊字符的裸值；`settings.X`、`os.environ[…]`、
-   `${VAR}` 这类引用不算），并打出其余命中原文前 40 行。返回 3 = 有高置信、0 = 只有命名相似（仍要看完原文再决定）。
+   `${VAR}` 这类引用不算），并逐行完整打出其余命中原文。返回 3 = 有高置信、4 = 其余原文超过 200 行没列全（按命中处理）、
+   0 = 只有命名相似（仍要看完原文再决定）。
    规则是启发式的：返回 0 不等于干净，拿不准就当真密钥处理。
    扫描前先 `codev_prompt_gate`：按 agent 阈值（reasonix 45KB / codebuddy 25KB / 其它 50KB）逐份检查提示词体积，任一 ✘ 就停下精简。
 2. **将进副本的整个工作区**（**仅副本模式**，即默认）：`codev_bg_sandboxed` 铺 `./repo` **不分模式**，brainstorm /
@@ -323,7 +324,7 @@ reasonix ≈ 12 分钟、pi ≈ 13 分钟、self/check ≈ 13 分钟（G1/G2 是
 `✔ 完成` / `⏭ 超时` / `⛔ 额度/限流` / `⛔ 鉴权失败` / `⚠️ turn 预算耗尽` / `⚠️ 空输出` / `⚠️ 非零退出`，
 非 ✔ 的一律**本轮无效**：不呈现其输出文件内容（额度错误串常被打到 stdout，exit 还是 0——qoderclicn 实测），
 不计入矩阵，如实告知类别与 stderr 错误行（含 429 的重置时间），不阻塞其它 agent。
-`⛔` 里的**过载**（gemini `status: 503`、self/check 的 `API Error 529 Overloaded`）隔几分钟**重试一次**，再失败就
+`⛔` 里的**过载**（gemini `status: 503` / `[API Error: {"error":{"code":503…}}]`、self/check 的 `API Error: 529 {…}`）隔几分钟**重试一次**，再失败就
 换家补位或在综合里标"本轮无 X 样本"（G2 缺席时"Claude vs 外部"一致率写"本轮无 self 样本"，不跳过整轮）。
 `✔` 行下若附"该 agent 没有代码视野（原因）"→ 它没看到代码，按无代码视野降置信，B 栏假设一律进 0.5 回填、不当已查证。
 `✔` 但附"stderr 含错误行"→ 正文可能被截断，呈现前核对是否有完整结论段。实时盯用 `Monitor` 跟踪输出路径（见 D）。
@@ -385,7 +386,7 @@ reasonix ≈ 12 分钟、pi ≈ 13 分钟、self/check ≈ 13 分钟（G1/G2 是
 发现编号 `r<N>-check-<两位序号>`，台账 agent 写 `check`（不写 `self`：
 G1 修掉的东西外审根本没见过，混进 `self` 会污染 `codev_stats` 里"外审比 Claude 多看出多少"的对比）。
 **G1 也要进调用账本**（9/11-9/25 发现台账里 302 条 `check` 发现，调用账本只有 15 行——G1 是每轮最大的一笔 Claude 开销却几乎隐形）：
-发出前 `printf '%s' '<模型 id>' > "$CODEV_DIR/check-model"; date +%s > "$CODEV_DIR/check-t0"`；收到后把 subagent 最终回复 Write 进
+发出前 `CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; codev_prepare_call check || exit 1; printf '%s' '<模型 id>' > "$CODEV_DIR/check-model"; date +%s > "$CODEV_DIR/check-t0"`；收到后把 subagent 最终回复 Write 进
 `$CODEV_DIR/codev-out-check.txt`，再在新的 Bash 调用里照 G2 的收尾片段做（把 `self` 换成 `check`、tokens 填该 subagent 的
 `subagent_tokens`）。
 
@@ -400,10 +401,14 @@ codex/gemini，快照差异可唯一归因到 self；快照要比两样，`git s
 ```bash
 # 发出前（一次 Bash 调用）：提示词写到 $CODEV_DIR/codev-prompt-self.txt（账本"提示词字节"与 codev_archive 都靠它）；
 # 模型 id 与开始时间【落盘】——接收阶段是另一次 Bash 调用，export 与 CODEV_T0 都不会带过去，不落盘账本就记 unknown / 用时 0：
-CODEV_DIR=<会话目录>; printf '%s' '<当前 Claude 模型 id>' > "$CODEV_DIR/self-model"; date +%s > "$CODEV_DIR/self-t0"
+# codev_prepare_call 必做：self/check 没有 codev_bg_* 替它清上一轮的正文/err/状态文件，它清完还写本轮调用戳——
+# 没戳 codev_report 会拒绝记账（--auto 多轮复用同一 CODEV_DIR 时，本轮只写了 529 err，上一轮报告就会被当成本轮 ✔）。
+CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"; codev_prepare_call self || exit 1
+printf '%s' '<当前 Claude 模型 id>' > "$CODEV_DIR/self-model"; date +%s > "$CODEV_DIR/self-t0"
 # 收到后先落盘（Write 工具），二选一：
 #   - subagent 返回了报告 → 最终回复原样写进 $CODEV_DIR/codev-out-self.txt，err 文件写空；
-#   - subagent 以错误结束（API Error 529 Overloaded、流中断等，没有报告）→ 正文不写，把错误原句写进 $CODEV_DIR/codev-err-self.txt。
+#   - subagent 以错误结束（`API Error: 529 {…}`、流中断等，没有报告）→ 正文留空（prepare 已清空），把错误原句原样写进
+#     $CODEV_DIR/codev-err-self.txt——Agent 工具若把这句错误当"最终回复"交回来，也照这条写进 err，不要写进正文。
 # 然后在【新的】Bash 调用里：
 CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
 export CODEV_MODEL_self=$(cat "$CODEV_DIR/self-model"); CODEV_T0=$(cat "$CODEV_DIR/self-t0")
@@ -414,7 +419,7 @@ export CODEV_TOKENS_self=<该 subagent 的 subagent_tokens>
 codev_report self 0 "$CODEV_DIR/codev-err-self.txt"   # 别在这里清空 err 文件：错误原句是过载归类的唯一依据
 ```
 **顺序不能反**：先落盘（正文或错误原句），再 `codev_report`。9/11-9/25 六次把有报告的 G2 记成"空输出"都是先 report 后落盘；
-库现在会拦：`CODEV_TOKENS_self` > 0 而正文与 err 文件**都**为空就拒绝记账并提示补齐。subagent 撞 529 时照上面把错误原句写进
+库现在会拦两件事：没有本轮调用戳（发出前没 `codev_prepare_call self`）拒绝记账；`CODEV_TOKENS_self` > 0 而正文与 err 文件**都**为空也拒绝并提示补齐。subagent 撞 529 时照上面把错误原句写进
 err 文件，token 照填（失败前已消耗），翻牌为 `⛔ 过载`、账本记 `quota`。
 自评结果**逐字呈现**（E，框标 `SELF（模型：…）`）、进一致性矩阵（独家/共同）、编号 `r<N>-self-<两位序号>`、记台账。
 综合时固定给「Claude vs 外部 agent」一致率（synthesis.md §4，不再是"若此前跑过 /code-review 才加"）。
@@ -468,7 +473,8 @@ err 文件，token 照填（失败前已消耗），翻牌为 `⛔ 过载`、账
    不是上一段说的"base 无效"。`|| true` 吞掉它，否则把这段和 base 检查放进同一次 Bash 调用时，
    最后的 rc=1 会被误读成 base 无效而停下问用户；用 `&&` 串到后面的命令上则后面的全不执行。
 2. 选 agent（A）。**G1 自查**：第 1 轮 fresh-subagent 按 prompts.md「自审模板（第 1 轮变体）」看这份 diff + 未跟踪文件；
-   `--round N ≥ 2` 时按 synthesis.md §6.1 给它上一轮回流 diff（`git diff $(codev_prev_round_commit <文件> N)`）+ 上一轮
+   `--round N ≥ 2` 时按 synthesis.md §6.1 给它上一轮回流 diff（`PREV=$(codev_prev_round_commit <文件> N)` 后
+   `git diff "$PREV^" -- <文件>`：回流提交之前 → 当前工作树；别写 `git diff "$PREV"`，回流已提交时它恒为空）+ 上一轮
    已采纳/已驳回编号清单。"必须修"由 Claude 亲验后先修掉（改动后重新确认 `git diff "$BASE"` 非空），再进第 3 步。
 3. **组提示词 + 发送前 secret 扫描**：先按第 4 步的要求把每个 agent 的提示词写成 `$CODEV_DIR/codev-prompt-<agent>.txt`
    （**只写文件，不发出**），再扫。扫两个范围：通用机制 B 的提示词文件扫描（所有 agent），以及下面这段——
@@ -590,12 +596,13 @@ err 文件，token 照填（失败前已消耗），翻牌为 `⛔ 过载`、账
    空目录时提示词已经发出去了，到那时只能撤回重发。铺好的母本随后被各 agent 直接复用，不多花时间。
 2. 选 agent（A）。**G1 自查（每轮）**：第 1 轮给 fresh-subagent 文档路径 + prompts.md「自审模板（第 1 轮变体）」；
    `--round N ≥ 2` 时：`PREV=$(codev_prev_round_commit "$DOC" N)` 找到上一轮回流 commit（找不到就让用户给），
-   `git diff "$PREV" -- "$DOC"` 就是"本轮改动"，按 synthesis.md §6.1 给它文档路径 + 该 diff + 上一轮编号清单。
+   `git diff "$PREV^" -- "$DOC"` 就是"本轮改动"（上一轮回流提交之前 → 当前工作树，含那次回流及之后未提交的改动；
+   `git diff "$PREV"` 在回流已提交后恒为空），按 synthesis.md §6.1 给它文档路径 + 该 diff + 上一轮编号清单。
    自审发现由 Claude 亲验后直接改进文档，再进外审。
 3. 组提示词（prompts.md「文档评审模板」，先写文件不发出）：路径引用 + 章节目录 + 关注点 + **点名 3-8 条核实项**
    （文档里最关键、最可能与代码脱节的 `文件:行号` / 表名 / 函数 / 迁移号断言）+ 两档结论；
    `--round ≥ 2` 附「回归核对」段（上一轮发现编号清单：已采纳的逐条判 已修 / 未修 / 修出新问题；**已驳回的列出驳回依据，
-   要求除非有新证据否则不要重提**）+ **必带**内联 `git diff "$PREV" -- "$DOC"`（≤15KB 直接放；超了放 `--stat` + 改动章节；
+   要求除非有新证据否则不要重提**）+ **必带**内联 `git diff "$PREV^" -- "$DOC"`（≤15KB 直接放；超了放 `--stat` + 改动章节；
    diff 不是文档全文，路径引用规则不适用——副本无 `.git`，agent 自己跑不出两版差异）。
    codex 用 `codex exec`（不是 `review`——没有 diff 可评），`-c 'model_reasoning_effort="medium"'`；
    复杂文档 `export CODEV_TIMEOUT=1200`。

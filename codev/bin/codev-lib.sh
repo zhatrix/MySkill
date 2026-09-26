@@ -112,8 +112,8 @@ codev_run() {
 #   - codebuddy 429 的错误串里带【重置时间】，不显示出来用户就得自己翻 err 文件；
 #   - reasonix "context canceled"、codebuddy "Max turns (N) exceeded" 都是 stdout 空 + 一行 stderr。
 # 误报防护：stdout 只在【很短】（<600 字节）时才拿去匹配额度模式——正常评审正文里出现 "quota"/"429"
-# （比如被评审的代码就是限流模块）不该被误判；stderr 只看"错误行"（以 ERROR/error/错误/三位状态码开头的行），
-# 不扫 codex 回显的提示词和文件清单。
+# （比如被评审的代码就是限流模块）不该被误判；stderr 只看 codev_err_lines 抽出的"错误行"（按 agent 区分格式，
+# codex 只认它自己的 `ERROR:` 行），不扫 codex 回显的提示词、源码和文件清单。
 codev_classify() {
   local agent="$1" rc="$2" out="$3" err="$4" osz=0 short="" errlines="" c=""
   # 124 = timeout 发 TERM 后退出；137 = 子进程 trap 了 TERM、-k 补 KILL 后退出（timeout 自身也回 137）。
@@ -126,6 +126,17 @@ codev_classify() {
   #    也不到 600 字节，光靠额度/鉴权关键词会把有效评审判成 auth/quota 丢掉，还进账本记它一次失败。
   #    结论标记（PASS/FAIL/LGTM/P1-P3/✔/结论/发现/Markdown 标题）是错误串里绝不会出现的东西。
   if [ -n "$short" ] && ! printf '%s' "$short" | grep -qE '(^|[^A-Za-z])(PASS|FAIL|LGTM|P[123])([^A-Za-z]|$)|✔|结论|发现|^#'; then
+    # ①a 短 stdout 本身【就是一句错误】（按句式认，不按词认）：以 `API Error` / `[API Error` / `ERROR:` / `Error:` 开头，
+    #    或整段只是 "service/model/server is (currently) unavailable/overloaded"。这类才启用过载词（503/529/overloaded）——
+    #    "连接池 overloaded 时返回 503" 这种讨论过载的正常短回复不是错误句式，不受影响。
+    #    Agent 工具会把 subagent 的 `API Error: 529 {…}` 当最终回复交回来，qoderclicn 把错误打到 stdout，都走这条。
+    if printf '%s' "$short" | tr '\n' ' ' | grep -qiE '^[[:space:]]*(the )?(service|model|server|api|upstream)( is| has been)? (currently |temporarily )?(unavailable|overloaded)[.!]?[[:space:]]*$'; then
+      echo quota; return 0
+    fi
+    if printf '%s' "$short" | sed -n '/[^[:space:]]/{p;q;}' | grep -qE '^[[:space:]]*(\[?API Error|ERROR:|Error:)'; then
+      c=$(codev_match_class "$short" err); [ -n "$c" ] && { echo "$c"; return 0; }
+      echo error; return 0
+    fi
     c=$(codev_match_class "$short"); [ -n "$c" ] && { echo "$c"; return 0; }
   fi
   # ①' 长 stdout（≥600 字节）不能一律放行：额度/登录页也可能是一整页 HTML/说明文（三轮评审都提了这条）。
@@ -154,7 +165,8 @@ codev_classify() {
 # 第二参数为 err 时（文本来自 stderr 错误行）额外认上游过载：503/529/overloaded/"currently unavailable"/
 # "experiencing high demand" 归 quota（额度/限流/过载），处置完全一样——本轮无效、不呈现、稍后重试或换家补位。
 # 9/11-9/25 实测 gemini 7 次调用 4 次撞 503、self 子 agent 撞 529 Overloaded，旧版都判成 error/empty。
-# 过载词【只对 stderr 生效】：短 stdout 是正文候选，"连接池 overloaded 时返回 503" 这类正常短回复不能被判成 quota。
+# 过载词只在调用方确认文本是【错误句式】时启用：stderr 错误行，或以错误前缀开头 / 整段只是"服务不可用"的短 stdout
+# （见 codev_classify ①a）；"连接池 overloaded 时返回 503" 这类讨论过载的正常短回复不能被判成 quota。
 codev_match_class() {
   local t="$1" over=''
   [ -n "$t" ] || return 0
@@ -169,21 +181,28 @@ codev_match_class() {
   return 0
 }
 
-# codev_err_lines <errfile> [agent] — 从 stderr 里抽"错误行"（最多 6 行）：以 ERROR/Error/error/错误/Err、
-# "API Error" 开头的行，"context canceled"/"Max turns" 这类无前缀的已知致命句，以及（非 codex）以 4xx/5xx 状态码或
-# `status: 4xx/5xx` 开头的行。
-# - "API Error 529 Overloaded"（Claude 系 CLI / self 子 agent）、gemini 的 `status: 503` 没有 ERROR 前缀，旧版抽不到 →
-#   stdout 空时被判 empty，过载被当成"无输出"。
-# - codex 的 stderr 是工具轨迹：会把带行号的源码（`354  void qc…`、`503  return overloaded…`）和 YAML/JSON 夹具
-#   （`status: 200`、`"code": 429`）原样回显，9/11-9/25 七个会话 35 次"✔ 但 stderr 含错误行"全是这种假警告。
-#   codex 自己的错误一律带 `ERROR:` 前缀，所以对 codex【不认】裸状态码行和 status 行——不靠号段白名单去猜哪行是源码。
-# - 其它 agent 的裸状态码行后面可以是任何内容（`401 {"error":…}`、`403 - Forbidden`、`429 (Too Many Requests)`），
-#   只要求 4xx/5xx：200 这类成功码不是错误。
+# codev_err_lines <errfile> [agent] — 从 stderr 里抽"错误行"（最多 6 行），格式按 agent 区分：
+# - codex：stderr 是工具轨迹，会把带行号的源码（`354  void qc…`、`12: const s = "Max turns";`）、YAML/JSON 夹具
+#   （`status: 503`、`  error: "quota",`）原样回显，9/11-9/25 七个会话 35 次"✔ 但 stderr 含错误行"全是这种假警告。
+#   它自己的运行错误一律是【行首、不缩进、全大写】的 `ERROR: …`（ntms 归档里全部 12 条 usage limit 都是这个格式），
+#   所以对 codex 只认这一种，外加 Claude 系的 `API Error` 行。
+# - 其它 agent：
+#   · `ERROR/Error/error/错误/FATAL/panic` 前缀行；
+#   · `API Error 529 …` / `API Error: 529 {…}`（Claude Code 真实格式带冒号）/ `[API Error: {…}]`（gemini 包装）；
+#   · 单行 JSON 错误体 `{"error":{"code":503,…}}`（gemini）——只认行首就是 `{"error"`，不认任意位置的 `"code": NNN`
+#     （那会把成功 JSON 与源码里的夹具也抽出来）；
+#   · 4xx/5xx 状态行：数字后是【一个空格再接内容】或行尾（`401 {"error":…}`、`403 - Forbidden`、`429 (Too Many…)`、
+#     `429 您的使用量…`），不认 `413:  const x` 这种"行号 + 冒号"的源码回显；`status: 4xx/5xx` 行；
+#   · `context canceled` 只认出现在行尾（reasonix 实际是 `错误： context canceled`），`Max turns (N) exceeded` 要带括号数字
+#     ——源码里的字符串字面量 `"context canceled";` / `"Max turns"` 不算。
 codev_err_lines() {
   local err="$1" agent="${2:-}" pat
   [ -s "$err" ] || return 0
-  pat='^[[:space:]]*(ERROR|Error|error|Err|错误|FATAL|fatal|panic)[:：[:space:]]|^[[:space:]]*API Error[[:space:]]|context canceled|[Mm]ax turns'
-  [ "$agent" = codex ] || pat="$pat"'|^[[:space:]]*[45][0-9]{2}([^0-9]|$)|^[[:space:]]*status: [45][0-9]{2}([^0-9]|$)'
+  if [ "$agent" = codex ]; then
+    pat='^ERROR:[[:space:]]|^[[:space:]]*\[?API Error:?[[:space:]]'
+  else
+    pat='^[[:space:]]*(ERROR|Error|error|Err|错误|FATAL|fatal|panic)[:：[:space:]]|^[[:space:]]*\[?API Error:?[[:space:]]|^[[:space:]]*\{"error":|^[[:space:]]*[45][0-9]{2}( [^[:space:]]|$)|^[[:space:]]*status: [45][0-9]{2}([^0-9]|$)|context canceled[[:space:]]*$|[Mm]ax turns \([0-9]+\) exceeded'
+  fi
   grep -aE "$pat" "$err" 2>/dev/null | tail -n 6
 }
 
@@ -484,10 +503,12 @@ codev_finding_add() {
 codev_prompt_gate() {
   local f agent sz lim bad=0 n=0 list
   # 用 find 而不是 glob：zsh 默认 NOMATCH，没有提示词文件时 glob 直接报错、连调用方后续命令一起中断（同 codev_archive）。
-  list=$(find "$CODEV_DIR" -maxdepth 1 -type f -name 'codev-prompt-*.txt' 2>/dev/null | sort)
+  # -type f -o -type l：提示词可能是符号链接（指向别处生成的文件），只找普通文件会把它静默跳过，超限链接就漏检了。
+  list=$(find "$CODEV_DIR" -maxdepth 1 \( -type f -o -type l \) -name 'codev-prompt-*.txt' 2>/dev/null | sort)
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     n=$((n+1)); agent=${f##*/codev-prompt-}; agent=${agent%.txt}
+    if [ ! -f "$f" ]; then bad=$((bad+1)); printf '✘ %-10s 断链或不是普通文件（%s）→ 修好提示词文件再发\n' "$agent" "$f"; continue; fi
     sz=$(wc -c < "$f" | tr -d ' ')
     case "$agent" in reasonix) lim=46080;; codebuddy) lim=25600;; *) lim=51200;; esac
     if [ "$sz" -gt "$lim" ]; then bad=$((bad+1)); printf '✘ %-10s %7s 字节 > 上限 %s（%sKB）→ 停下精简：路径引用代替内联 / 核实清单收窄到 3-8 条\n' "$agent" "$sz" "$lim" "$((lim/1024))"
@@ -502,11 +523,15 @@ CODEV_GATE_LIST
 # codev_scan_triage [文件] — 把 secret 扫描的 grep 输出按文件聚合，并单独列出【高置信】命中。
 # 输入格式：`path:行号:内容`（grep -Hn）、`path:内容`（grep -H）或 `行号:内容`（单文件 grep -n，无文件名）；
 # 扫描时请带 -H，否则只能按"(未带文件名)"一桶聚合。
-# 高置信 = 像真值而不是引用：PRIVATE KEY 块、AKIA/ASIA 前缀、以及【敏感键名 = 字面值】——引号里的字面串（≥ 6 字符）、
-# 配置类文件（.env/.yml/.ini/.properties/.toml/.conf/.cfg/.json）里的裸值、代码里含标识符以外字符的裸值
-# （`DB_PASSWORD=Sup3r!S3cret#2024`）。`settings.X`、`os.environ[…]`、`get(…)`、`${VAR}` 这类引用不算。
-# 其余命中原文（前 40 行）也打印出来——只给文件计数的话人没法"扫一眼"判断。
-# 返回 3 = 有高置信命中，0 = 只有命名相似的噪音（仍要人看一眼），1 = 参数/读取错误。输入为空时按 0 处理。
+# 高置信（任一规则命中即算；新规则只叠加、不替换旧规则——连续两轮替换规则各自漏掉了对方抓得到的形态）：
+#   1. 形态：PRIVATE KEY 块、AKIA/ASIA、已知凭证前缀（ghp_/github_pat_/sk_live_/sk-…/xox?-/npm_/AIza/glpat-）；
+#   2. 旧规则：敏感键名后接 ≥ 20 位 token（排除 `settings.X` 这类属性链与全大写环境变量名）；
+#   3. 字面值：敏感键名被赋了字面值（=、:、:= 都认，`==` 比较不算；一行多个语句逐个查）——引号串 ≥ 6 字符、
+#      `get("K", "默认值")` / `${VAR:-默认值}` 里的默认值、配置类文件里的裸值、代码里不含空白/括号且带数字或符号的裸值；
+#      纯数字、版本号、token 数量/时长类键名（max_tokens、token_ttl、js-tokens…）不算。
+# 其余命中原文逐行完整打印；超过 200 行只打前 200 行并返回 4（检查未完成）。
+# 返回 3 = 有高置信命中，4 = 原文未列全（按命中处理），0 = 只有命名相似的噪音（仍要人看完原文），1 = 参数/读取错误。
+# 规则是启发式的：0 不等于干净。
 codev_scan_triage() {
   local src="${1:--}" spool="" rc
   command -v python3 >/dev/null 2>&1 || { echo "⚠️ codev_scan_triage 需要 python3" >&2; return 1; }
@@ -523,21 +548,57 @@ try:
     data = open(src, encoding='utf-8', errors='replace').read()
 except OSError as e:
     print(f"⚠️ 读取失败：{e}"); sys.exit(1)
-hard = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![A-Z0-9])A(KIA|SIA)[0-9A-Z]{16}(?![A-Z0-9])")
-assign = re.compile(r"(api[_-]?key|secret|token|passw(or)?d|passwd|pwd|credential)[A-Za-z0-9_.-]*['\"]?\s*(?<![=!<>])[:=](?!=)\s*(.*)$", re.I)
-CONFIG = re.compile(r"(^|/)\.env[^/]*$|\.(ya?ml|ini|properties|toml|conf|cfg|json)$", re.I)
-REF = re.compile(r"^(\$\{?[A-Za-z_]|<[^>]*>$|%\(|\{\{|(os\.)?(environ|getenv)|process\.env|None$|null$|nil$|true$|false$|undefined$)", re.I)
-IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(\[.*\]|\(.*\))?[,;]?$")
-def literal(value, path):
+KW = r"(api[_-]?key|secret|token|passw(or)?d|passwd|pwd|credential)"
+HARD = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![A-Z0-9])A(KIA|SIA)[0-9A-Z]{16}(?![A-Z0-9])|"
+                  r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|[sr]k_(live|test)_[A-Za-z0-9]{10,}|"
+                  r"sk-(proj-|ant-)?[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|npm_[A-Za-z0-9]{30,}|"
+                  r"AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20})")
+OLD = re.compile(KW + r"[A-Za-z0-9_.-]*['\"]?\s*(?<![=!<>])(:=|=(?!=)|:(?!=))\s*['\"]?([A-Za-z0-9+/=_.\-]{20,})", re.I)
+ASSIGN = re.compile(r"([A-Za-z0-9_.-]*" + KW + r"[A-Za-z0-9_.-]*)['\"]?\s*(?<![=!<>])(:=|=(?!=)|:(?!=))\s*(.*)$", re.I)
+CONFIG = re.compile(r"(^|/)\.env[^/]*$|\.(ya?ml|ini|properties|toml|conf|cfg|json|npmrc|netrc)$", re.I)
+# 键名末词是数量/时长/元数据时，值不是凭证：max_tokens、token_ttl、tokenType、secret_name、password_url…（驼峰与下划线都拆）
+META = {"ttl","count","limit","len","length","size","timeout","expiry","expires","expiration","lifetime","max","min",
+        "type","kind","name","id","header","prefix","field","url","uri","endpoint","path","file","env","var","label","hint"}
+def meta_key(key):
+    if re.search(r"tokens\b|tokens[_-]|^(max|min)[_-]", key, re.I): return True
+    words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", key)
+    return bool(words) and words[-1].lower() in META
+REF = re.compile(r"^(\$[A-Za-z_{(]|<[^>]*>$|%\(|\{\{|(os\.)?(environ|getenv)|process\.env|ENV\[|None$|null$|nil$|true$|false$|undefined$)", re.I)
+IDENT_CHAIN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+NUMLIKE = re.compile(r"^[~^v]?[0-9][0-9._:-]*$")
+QUOTED = re.compile(r"(['\"`])((?:(?!\1).){6,})\1")
+SHDEFAULT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=]([^}]+)\}")
+def lit_ok(v):
+    v = v.strip()
+    return len(v) >= 6 and not NUMLIKE.match(v) and not REF.match(v)
+def literal(key, value, path):
+    if meta_key(key): return False
     v = value.strip().rstrip(',;').strip()
     if not v: return False
+    m = SHDEFAULT.search(v)
+    if m: return lit_ok(m.group(1).strip("'\""))
     if v[0] in "\"'`":
         q = v[0]; end = v.find(q, 1)
-        inner = v[1:end] if end > 0 else v[1:]
-        return len(inner) >= 6 and not REF.match(inner)
-    if REF.match(v): return False
-    if CONFIG.search(path): return len(v) >= 4
-    return not IDENT.match(v) and len(v) >= 6
+        return lit_ok(v[1:end] if end > 0 else v[1:])
+    if '(' in v:                                   # 调用：只看默认值参数（第二个及以后的字面串）
+        qs = [m.group(2) for m in QUOTED.finditer(v)]
+        return len(qs) >= 2 and lit_ok(qs[-1])
+    if REF.match(v) or NUMLIKE.match(v): return False
+    if CONFIG.search(path): return len(v) >= 6
+    if re.search(r"\s", v) or IDENT_CHAIN.match(v): return False
+    return len(v) >= 8 and bool(re.search(r"[0-9!@#$%^&*+/=~]", v))
+def old_rule(content):
+    for m in OLD.finditer(content):
+        t = m.group(4)
+        if IDENT_CHAIN.match(t) and ('.' in t or t.isupper()): continue
+        return True
+    return False
+def high(content, path):
+    if HARD.search(content) or old_rule(content): return True
+    for seg in re.split(r";|\s,\s", content):
+        for m in ASSIGN.finditer(seg):
+            if literal(m.group(1), m.group(5), path): return True
+    return False
 per_file = collections.Counter(); hits = []; rest = []
 for line in data.splitlines():
     if not line.strip(): continue
@@ -551,11 +612,7 @@ for line in data.splitlines():
     else:
         path, loc, content = '(未带文件名)', '(未带文件名)', line
     per_file[path] += 1
-    m = assign.search(content)
-    if hard.search(content) or (m and literal(m.group(3), path)):
-        hits.append((loc, content.strip()[:160]))
-    else:
-        rest.append((loc, content.strip()[:160]))
+    (hits if high(content, path) else rest).append((loc, content.strip()))
 total = sum(per_file.values())
 if total == 0:
     print("SCAN-TRIAGE: 0 命中"); sys.exit(0)
@@ -564,11 +621,15 @@ print("按文件（前 25）：")
 for p, n in per_file.most_common(25): print(f"  {n:5d}  {p}")
 if hits:
     print("高置信（像真密钥，逐条确认；拿不准按真密钥处理）：")
-    for p, c in hits[:40]: print(f"  {p}: {c}")
+    for p, c in hits: print(f"  {p}: {c}")
+LIMIT = 200
 if rest:
-    print(f"其余命中原文（前 40 / 共 {len(rest)}，逐行扫一眼，形态不在上面规则里的真密钥只能靠人看出来）：")
-    for p, c in rest[:40]: print(f"  {p}: {c}")
+    print(f"其余命中原文（完整行，共 {len(rest)} 行；形态不在上面规则里的真密钥只能靠人看出来）：")
+    for p, c in rest[:LIMIT]: print(f"  {p}: {c}")
 if hits: sys.exit(3)
+if len(rest) > LIMIT:
+    print(f"⚠️ 还有 {len(rest) - LIMIT} 行没列出：检查未完成，按命中处理——缩小扫描范围或直接看完整 grep 输出")
+    sys.exit(4)
 print("没有高置信形态：其余多为命名相似（变量名/测试固件），看完上面原文再决定是否发送")
 sys.exit(0)
 CODEV_TRIAGE_PY
@@ -588,6 +649,10 @@ codev_key_round() {
   [ -n "$r" ] || { echo "$2: 轮次须为正整数，收到「$1」" >&2; return 1; }
   printf '%s' "$r"
 }
+
+# 同一口径的 awk 版本：codev_opinions / codev_round_trend 共用这一段文本，与 codev_key_round 同规则
+# （去 r 前缀、去前导零、必须是正整数），非法返回空串。别在各 awk 里各写一版——三处实现不一致是 5861656 的评审发现。
+CODEV_AWK_RK='function rk(s) { sub(/^r/, "", s); sub(/^0+/, "", s); return (s ~ /^[0-9]+$/) ? s : "" }'
 
 # codev_key_agent <agent> <caller> — agent 列只能是标签（codex / self / check / pi …），不能把模型名或
 # "实跑/推演"这类备注塞进来：9/11-9/25 的意见记录里出现了 "self claude-opus-5"、"pi deepseek-v4-pro 实跑"
@@ -609,10 +674,10 @@ codev_round_trend() {
   [ $# -eq 2 ] || { echo "用法: codev_round_trend repo doc" >&2; return 1; }
   local repo="$1" doc="$2" snapshot rc
   snapshot=$(codev_tsv_snapshot "$CODEV_FINDINGS") || return 1
-  if (set -o pipefail; LC_ALL=C awk -F'\t' -v r="$repo" -v d="$doc" '
+  if (set -o pipefail; LC_ALL=C awk -F'\t' -v r="$repo" -v d="$doc" "$CODEV_AWK_RK"'
     $2==r && $3==d {
-      k=$4; sub(/^r/, "", k); if (k !~ /^[0-9]+$/) next
-      k=k+0; if (k==0) next
+      k=rk($4); if (k=="") next
+      k=k+0
       n[k]++; if ($8=="P1") { p1[k]++; if ($11=="成立") ok[k]++ }
       if (!index("," ag[k] ",", "," $5 ",")) ag[k]=(ag[k]=="" ? $5 : ag[k] "," $5)
       if (k+0 > max) max=k+0
@@ -683,16 +748,17 @@ codev_opinion_add() {
 codev_opinions() {
   [ $# -le 5 ] || { echo "用法: codev_opinions [issue [repo [doc [round [task]]]]]" >&2; return 1; }
   local want="${1:-}" repo="${2:-}" doc="${3:-}" round="${4:-}" task="${5:-}" snapshot rc
+  # 给了轮次筛选就必须合法：空串才表示"不过滤"。非法值（r / 0 / abc）若归一成空串，筛选会悄悄扩大到全部轮次，
+  # 还照样给出"可进执行清单"（5861656 评审复现）。
+  if [ -n "$round" ]; then round=$(codev_key_round "$round" codev_opinions) || return 1; fi
   snapshot=$(codev_tsv_snapshot "$CODEV_OPINIONS") || return 1
   [ -s "$snapshot" ] || { rm -f "$snapshot"; echo "（意见记录为空：${CODEV_OPINIONS}）"; return 0; }
   echo "意见与判断记录（${CODEV_OPINIONS}）${want:+，问题=$want}："
   # 不排序：时间戳只有分钟精度，甚至可能回退；NR 才代表真实追加顺序。
   # LC_ALL=C 避免 macOS awk 的中文相等比较问题；长度前缀避免范围字段拼接碰撞。
-  if LC_ALL=C awk -F'\t' -v want="$want" -v repo="$repo" -v doc="$doc" -v round="$round" -v task="$task" '
+  if LC_ALL=C awk -F'\t' -v want="$want" -v repo="$repo" -v doc="$doc" -v round="$round" -v task="$task" "$CODEV_AWK_RK"'
     function part(s) { return length(s) ":" s }
-    # 轮次与写入端 codev_key_round 同口径：r3 / 03 / 3 是同一轮（旧记录里存的可能是 r3）。
-    function rk(s) { sub(/^r/, "", s); if (s ~ /^[0-9]+$/) s = s + 0; return s "" }
-    BEGIN { if (round != "") round = rk(round) }
+    # 轮次与写入端 codev_key_round 同口径（共用 CODEV_AWK_RK）：r3 / 03 / 3 是同一轮（旧记录里存的可能是 r3）。
     function flush(g,   v,i,row,f,nj,adopt,reject,uniqfix,lastfix,stances,p1seen,firstsev,sevdiff,missing,a) {
       printf "%s\n%s%s%s%s", head[g], hist[g,"评审"], hist[g,"自审"], hist[g,"判断"], hist[g,"复核"]
       nj = judges[g]+0
@@ -725,7 +791,7 @@ codev_opinions() {
       if (legacy[g]) print "  ⚠️ 旧记录缺少 task ID：仅按仓库/对象/轮次隔离，无法区分同范围内的不同历史任务"
       printf "\n"
     }
-    NF && (NF!=12 && NF!=13 || $7 !~ /^(评审|判断|自审|复核)$/ || $9 !~ /^(提出|采纳|驳回|存疑|未返回)$/ || $10 !~ /^(P1|P2|P3|-)$/ || $5 !~ /[^[:space:]]/ || $8 !~ /[^[:space:]]/) { bad++; next }
+    NF && (NF!=12 && NF!=13 || rk($4)=="" || $7 !~ /^(评审|判断|自审|复核)$/ || $9 !~ /^(提出|采纳|驳回|存疑|未返回)$/ || $10 !~ /^(P1|P2|P3|-)$/ || $5 !~ /[^[:space:]]/ || $8 !~ /[^[:space:]]/) { bad++; next }
     NF && (want=="" || $8==want) && (repo=="" || $2==repo) && (doc=="" || $3==doc) && (round=="" || rk($4)==round) && (task=="" || $13==task) {
       rr=rk($4)
       key=part($2) part($3) part(rr) part($13) part($8)
@@ -756,7 +822,9 @@ codev_commit_round() {
   [ $# -ge 6 ] || { echo "用法: codev_commit_round files round reviewers p1 prev_p1 summary [trailer...]" >&2; return 1; }
   # 变量名【绝不能叫 path】：zsh 里 path 是绑定 $PATH 的特殊数组，local path=… 会把 PATH 换成该路径，
   # 函数体内 git/mktemp/sed 全部 command not found。同理见 codev_prev_round_commit。
-  local files="$1" round="$2" rev="$3" p1="$4" prev="$5" summary="$6" msg t rc probe nl
+  local files="$1" round rev="$3" p1="$4" prev="$5" summary="$6" msg t rc probe nl
+  # trailer 只写规范轮次（与三个账本、codev_archive 同口径）：写成 r3 / 08 的话 codev_prev_round_commit 按数字找不到它。
+  round=$(codev_key_round "$2" codev_commit_round) || return 1
   # 【未绑定变量守卫】首参几乎总是拼出来的（`codev_commit_round "$DOC $CHANGELOG" …`）。少绑一个变量时
   # 它展开成空串，下面按空白拆词会把空 token 直接丢掉——于是只提交了一个文件，却照常打印「✔ 已提交第 N 轮
   # 回流」并返回 0，日志改动留在工作区（实测：CHANGELOG 未绑定时提交只含文档、git status 仍 ` M CHANGELOG.md`）。
@@ -832,11 +900,16 @@ $t"; done
 }
 
 # codev_prev_round_commit <path> <round> — 找触及 <path> 且 trailer 为 Codev-Round: <round-1> 的最近 commit（找不到输出空）。
+# 取"上一轮回流改了什么"用 `git diff "$PREV^" -- <path>`（回流提交之前 → 当前工作树：含那次回流及之后未提交的改动）；
+# 别写 `git diff "$PREV"`——回流已经提交，工作树与它相同时 diff 恒为空。
 # 用途：第 N 轮提示词里内联 `git diff <该 commit> -- <path>`，让 agent 看到两版之间的真实差异而不是手写的"改动章节"。
 codev_prev_round_commit() {
-  local f="$1" round="$2" prev                 # 变量名不能叫 path：zsh 里它绑定 $PATH，见 codev_commit_round 的注释
+  local f="$1" round prev                      # 变量名不能叫 path：zsh 里它绑定 $PATH，见 codev_commit_round 的注释
+  # 先归一再算术：r5 在算术里是未定义变量（得 -1、静默返回空），08 在 bash 里是非法八进制（中断调用方）。
+  round=$(codev_key_round "$2" codev_prev_round_commit) || return 1
   prev=$((round - 1)); [ "$prev" -ge 1 ] || return 0
-  git log --format=%H --grep="^Codev-Round: $prev\$" -- "$f" 2>/dev/null | head -n 1
+  # 历史 trailer 可能写成 r3 / 03（归一之前的提交），按同口径匹配。
+  git log --format=%H -E --grep="^Codev-Round: r?0*$prev\$" -- "$f" 2>/dev/null | head -n 1
 }
 
 # codev_archive <slug> <round> — 把本会话的 prompt/out/err/metrics 归档到 <仓库根>/.superpowers/codev/<slug>/r<N>/。
@@ -903,6 +976,13 @@ codev_report() {
   # 全是先 report 后落盘。所以：有 token 数、正文和 err 却都是空的 = 两样都没落盘，不记账、让调用方补齐再来。
   # 失败的 subagent 同样消耗 token（529 前可能已跑了 10 分钟），只要 err 里写了错误原句就照常归类（过载 → quota）。
   case "$agent" in self|check)
+    # 调用戳：self/check 没有 codev_bg_* 替它清旧文件，发出前必须 codev_prepare_call（清空上一轮的正文/err/状态并写戳），
+    # 记账后戳被消费。没有戳 = 本轮没准备过，正文/err 可能是上一轮留下的：--auto 多轮复用同一 CODEV_DIR 时，
+    # 本轮 subagent 撞 529、只写了 err，旧报告就会被当成本轮 ✔（5861656 评审复现）。
+    if [ ! -f "$CODEV_DIR/codev-call-$agent" ]; then
+      printf '⚠️ %s 没有本轮调用戳：发出前先 codev_prepare_call %s（清掉上一轮的正文与错误文件），再落盘、再 codev_report（本次未记账）\n' "$agent" "$agent"
+      return 1
+    fi
     eval "v=\${CODEV_TOKENS_$agent:-}"
     if [ ! -s "$out" ] && [ ! -s "$err" ] && printf '%s' "$v" | LC_ALL=C grep -qE '^0*[1-9][0-9]*$'; then
       printf '⚠️ %s 的正文与错误文件都为空但 CODEV_TOKENS_%s=%s：subagent 返回了报告就用 Write 写进 %s，以错误结束就把错误原句写进 %s，再 codev_report（本次未记账）\n' "$agent" "$agent" "$v" "$out" "$err"
@@ -955,6 +1035,7 @@ codev_report() {
 $( [ -s "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -lt 600 ] && cat "$out" )")
   fi
   codev_ledger_append "$agent" "$cls" "$rc" "${secs:-0}" "$note"
+  case "$agent" in self|check) rm -f "$CODEV_DIR/codev-call-$agent";; esac   # 消费调用戳：同一份文件不能再记第二次
 }
 
 # codev_repo_copy <sbox> — 在沙盒里铺一份【只读仓库副本】到 <sbox>/repo。
@@ -1300,7 +1381,8 @@ codev_prepare_call() {
   (
     umask 077
     : > "$out" && : > "$err" && chmod 600 "$out" "$err" &&
-    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$CODEV_DIR/codev-result-$agent.json" "$out.unwrap" "$CODEV_DIR/codev-degraded-$agent"
+    rm -f "$CODEV_DIR/codev-metrics-$agent.json" "$CODEV_DIR/codev-result-$agent.json" "$out.unwrap" "$CODEV_DIR/codev-degraded-$agent" &&
+    date +%s > "$CODEV_DIR/codev-call-$agent"
   ) || { echo "⚠️ 无法准备 $agent 的输出/计量文件，未启动调用" >&2; return 1; }
 }
 

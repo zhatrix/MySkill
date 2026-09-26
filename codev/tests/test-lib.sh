@@ -387,7 +387,7 @@ GCD="$CODEV_DIR/gc3"; mkdir -p "$GCD/codev-sbox.ancient"; echo $$ > "$GCD/codev-
 ( TMPDIR="$GCD"; codev_sbox_gc >/dev/null ); [ -d "$GCD/codev-sbox.ancient" ] && bad "7 天以上的沙盒因 pid 活着未删" || ok "超 7 天沙盒不看 pid 直接删"; rm -rf "$GCD"
 
 echo "35. self（本 agent 的 fresh-subagent）走同一套翻牌与账本：codev_report self 记 ✔、模型取 CODEV_MODEL_self、probe 列出 self"
-mk self "## A. 已查证的结论
+codev_prepare_call self >/dev/null || bad "prepare self 失败"; mk self "## A. 已查证的结论
 P2 r1-self-01 …" ""; export CODEV_MODEL_self=claude-test-model
 r=$(report self 0); case "$r" in *"✔ self 完成"*) ok "self 翻牌 ✔";; *) bad "self 翻牌不对" "$r";; esac
 grep -q "	self	claude-test-model	ok	" "$CODEV_LEDGER" && ok "账本 agent=self 模型=CODEV_MODEL_self" || bad "self 未进账本" "$(tail -1 "$CODEV_LEDGER")"
@@ -922,7 +922,7 @@ mk gemini "" 'Error: {"error":{"message":"{\n  \"error\": {\n    \"code\": 503,\
   status: 503
 }'
 r=$(codev_classify gemini 1 "$CODEV_DIR/codev-out-gemini.txt" "$CODEV_DIR/codev-err-gemini.txt"); [ "$r" = quota ] && ok "gemini 503 → quota" || bad "gemini 503 判成 $r"
-mk self "" "API Error 529 Overloaded（两次重试均在产出前中断，无报告）"
+codev_prepare_call self >/dev/null || bad "prepare self 失败"; mk self "" "API Error 529 Overloaded（两次重试均在产出前中断，无报告）"
 r=$(codev_classify self 0 "$CODEV_DIR/codev-out-self.txt" "$CODEV_DIR/codev-err-self.txt"); [ "$r" = quota ] && ok "self 529 Overloaded → quota" || bad "529 判成 $r"
 r=$(report self 0); case "$r" in *"⛔"*过载*"529 Overloaded"*) ok "翻牌带过载与原句";; *) bad "翻牌缺过载/原句" "$r";; esac
 # 正文里讨论 503 的评审不能被误杀（同 429 的既有保护）
@@ -957,14 +957,14 @@ r=$(codev_round_trend ntms no-such-doc); case "$r" in *"没有任何轮次"*) ok
 codev_round_trend ntms 2>/dev/null && bad "缺参未被拒" || ok "round_trend 缺参拒收"
 # 43f self/check 漏落盘守卫：子 agent 返回了几万 token 的报告、编排器却没先 Write 进正文文件就 report → 旧版记成 empty
 # （9/11-9/25 六次）。有 token 数却没正文 = 漏落盘，拒绝记账；真正的空回复（token 0）仍照常归类。
-mk self "" ""
+codev_prepare_call self >/dev/null || bad "prepare self 失败"; mk self "" ""
 n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
 r=$(CODEV_TOKENS_self=183000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1); rc=$?
 case "$rc:$r" in 1:*"正文与错误文件都为空"*) ok "有 token、正文与错误都空 → 拒绝记账并提示落盘";; *) bad "漏落盘未被拦（rc=${rc}）" "$r";; esac
 [ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$n0" ] && ok "拒绝时账本不加行" || bad "拒绝时仍写了账本"
 r=$(CODEV_TOKENS_self=0 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
 case "$r" in *"空输出"*) ok "token 0 的真空回复仍记 empty";; *) bad "真空回复处理错" "$r";; esac
-mk self "## A. 已查证
+codev_prepare_call self >/dev/null || bad "prepare self 失败"; mk self "## A. 已查证
 - P2 x" ""
 r=$(CODEV_TOKENS_self=183000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
 case "$r" in *"✔ self"*"tokens 183000"*) ok "落盘后照常 ✔ 并带 token";; *) bad "落盘后未 ✔" "$r";; esac
@@ -1098,7 +1098,7 @@ rm -f "$CODEV_DIR/codev-prompt-zz.txt"; rm -rf "$AR"
 codev_finding_add ntms d45 1 "$(printf 'codex\nself claude-opus-5')" m id P1 A 采纳 成立 独家 x 2>/dev/null && bad "换行 agent 未被拒" || ok "拒收夹换行的 agent"
 codev_opinion_add ntms d45 1 "$(printf 'codex\nx')" m 评审 id 提出 P1 甲 - 2>/dev/null && bad "意见换行 agent 未被拒" || ok "意见记录拒收夹换行的 agent"
 # 45i self 以 529 结束：err 写了错误原句、token>0、无正文 → 照常记账并归 quota（不再被守卫拒绝）
-: > "$CODEV_DIR/codev-out-self.txt"; printf '%s\n' 'API Error 529 Overloaded' > "$CODEV_DIR/codev-err-self.txt"
+codev_prepare_call self >/dev/null || bad "prepare self 失败"; : > "$CODEV_DIR/codev-out-self.txt"; printf '%s\n' 'API Error 529 Overloaded' > "$CODEV_DIR/codev-err-self.txt"
 n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
 r=$(CODEV_TOKENS_self=45000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
 case "$r" in *"⛔ self"*过载*) ok "self 529 + token>0 → ⛔ 过载";; *) bad "self 529 未归过载" "$r";; esac
@@ -1109,6 +1109,98 @@ r=$( cd "$GITZ" && codev_bg_sandboxed fakezero sh -c 'echo "## A. 已查证"; ec
 case "$r" in *"副本内 0 个文件"*"✔ fakezero"*"没有代码视野"*) ok "0 文件副本 ✔ 后附无代码视野警告";; *) bad "0 文件副本未警告" "$r";; esac
 case "$(tail -n1 "$CODEV_LEDGER" | cut -f12)" in *"退化:无代码视野"*) ok "0 文件副本账本备注记退化";; *) bad "0 文件副本备注缺退化" "$(tail -n1 "$CODEV_LEDGER")";; esac
 chmod -R u+w "$GITZ" 2>/dev/null; rm -rf "$GITZ"
+
+echo "46. 5861656 评审回流：self/check 调用戳、真实错误格式、stdout 错误句式、codex 只认 ERROR:、分诊规则叠加、轮次协议、回流 diff、闸门链接"
+cls46() { printf '%s' "$2" > "$CODEV_DIR/codev-out-$1.txt"; printf '%s\n' "$3" > "$CODEV_DIR/codev-err-$1.txt"; codev_classify "$1" "$4" "$CODEV_DIR/codev-out-$1.txt" "$CODEV_DIR/codev-err-$1.txt"; }
+# 46a 多轮复用 CODEV_DIR：第 1 轮 self 成功，第 2 轮撞 529 只写 err → 不得出现 ✔，且旧正文被清掉
+codev_prepare_call self >/dev/null; printf '## A. 已查证\n- P2 第一轮的发现\n' > "$CODEV_DIR/codev-out-self.txt"
+CODEV_TOKENS_self=100 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" >/dev/null 2>&1
+r=$(printf '%s\n' 'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}' > "$CODEV_DIR/codev-err-self.txt"; CODEV_TOKENS_self=45000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1); rc=$?
+case "$rc:$r" in 1:*"没有本轮调用戳"*) ok "第 2 轮漏 prepare → 拒绝记账（不会把第 1 轮报告当 ✔）";; *) bad "漏 prepare 未被拦（rc=${rc}）" "$r";; esac
+codev_prepare_call self >/dev/null; [ -s "$CODEV_DIR/codev-out-self.txt" ] && bad "prepare 未清旧正文" || ok "prepare 清掉上一轮正文"
+printf '%s\n' 'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}' > "$CODEV_DIR/codev-err-self.txt"
+r=$(CODEV_TOKENS_self=45000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1)
+case "$r" in *"⛔ self"*过载*"API Error: 529"*) ok "按流程走：带冒号 529 → ⛔ 过载";; *) bad "带冒号 529 未归过载" "$r";; esac
+r=$(CODEV_TOKENS_self=45000 codev_report self 0 "$CODEV_DIR/codev-err-self.txt" 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "同一份文件不能记第二次（戳已消费）" || bad "戳未消费，重复记账"
+# 46b 真实错误格式（stderr）
+[ "$(cls46 x '' 'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}' 0)" = quota ] && ok "API Error: 529 {…} → quota" || bad "带冒号 529 未归 quota"
+[ "$(cls46 gemini '' '[API Error: {"error":{"code":503,"message":"Unavailable"}}]' 1)" = quota ] && ok "[API Error: {code:503}] → quota" || bad "gemini 包装 503 掉出 quota"
+[ "$(cls46 gemini '' '{"error":{"code":429,"message":"Resource has been exhausted"}}' 1)" = quota ] && ok "行首 {\"error\":{code:429}} → quota" || bad "单行 JSON 429 掉出 quota"
+[ "$(cls46 x '' '  { "code": 200, "msg": "ok" }' 0)" = empty ] && ok "code 200 夹具不算错误" || bad "code 200 被当错误"
+# 46c stdout 本身是错误句式（rc=0）→ quota；讨论过载的正常短回复 → ok
+[ "$(cls46 x 'API Error: 529 overloaded_error' '' 0)" = quota ] && ok "stdout 'API Error: 529 …' → quota" || bad "stdout 529 被判 ✔"
+[ "$(cls46 x 'The service is currently unavailable' '' 0)" = quota ] && ok "stdout '服务不可用' 句 → quota" || bad "stdout unavailable 被判 ✔"
+[ "$(cls46 x 'Error: request failed' '' 0)" = error ] && ok "stdout 'Error: …' 其它错误 → error（不当评审）" || bad "stdout Error: 被判 ✔"
+[ "$(cls46 x 'Yes. When the connection pool is overloaded the worker returns 503 and the client backs off; that path looks correct to me.' '' 0)" = ok ] && ok "讨论过载的正常短回复仍 ok" || bad "正常短回复被误杀"
+[ "$(cls46 x 'The API is unavailable to anonymous users by design, which matches the spec.' '' 0)" = ok ] && ok "含 unavailable 的正常句不误杀" || bad "正常句被判 quota"
+# 46d 非 codex：行号回显不是状态行；真状态行保留
+[ "$(cls46 reasonix '' '413:  const x = 1' 0)" = empty ] && ok "413: 源码回显 → 不抽" || bad "413: 被当状态行"
+[ "$(cls46 reasonix '' '503:  return overloaded' 0)" = empty ] && ok "503: 源码回显不判 quota" || bad "503: 被判 quota"
+[ "$(cls46 codebuddy '' '401 {"error":"unauthorized"}' 1)" = auth ] && ok "401 {…} 仍 auth" || bad "401 {…} 丢失"
+[ "$(cls46 codebuddy '' '429 (Too Many Requests)' 1)" = quota ] && ok "429 (…) 仍 quota" || bad "429 (…) 丢失"
+[ "$(cls46 reasonix '' 'src/x.ts: const s = "context canceled";' 0)" = empty ] && ok "非 codex 源码里的 context canceled 字面量不算" || bad "context canceled 字面量被抽"
+[ "$(cls46 reasonix '' '错误： context canceled' 1)" = error ] && ok "reasonix 真实 context canceled 仍抽出" || bad "真 context canceled 丢失"
+[ "$(cls46 codebuddy '' 'Max turns (12) exceeded' 1)" = turns ] && ok "Max turns (12) exceeded 仍 turns" || bad "真 Max turns 丢失"
+# 46e codex：只认行首 ERROR:；回显的源码/夹具一概不认
+[ "$(cls46 codex '' '12: const s = "context canceled";' 0)" = empty ] && ok "codex 回显 context canceled → 不抽" || bad "codex 回显 context canceled 被抽"
+[ "$(cls46 codex '' '12: const s = "Max turns";' 0)" = empty ] && ok "codex 回显 Max turns → 不判 turns" || bad "codex 回显判成 turns"
+[ "$(cls46 codex '' '  error: "quota",' 0)" = empty ] && ok "codex 回显 error: 夹具 → 不判 quota" || bad "codex 回显 error: 被判 quota"
+[ "$(cls46 codex '' "ERROR: You've hit your usage limit. Upgrade to Pro or try again at 2:15 PM." 1)" = quota ] && ok "codex 真实 ERROR: usage limit → quota" || bad "codex 真实额度错误丢失"
+# 46f 分诊：叠加规则的正例（rc=3）与负例（rc=0）
+tri46() { printf '%s\n' "$1" | codev_scan_triage >/dev/null 2>&1; echo $?; }
+for l in "a.sh:1:export GITHUB_TOKEN=ghp_$(printf 'A%.0s' $(seq 36))" "1:STRIPE_SECRET_KEY=sk_live_$(printf 'A%.0s' $(seq 24))" \
+  's.py:1:SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-8f#k2abcdef")' 'm.go:1:	apiKey := "sk_live_abcdefghijklmnop"' \
+  'Makefile:3:API_KEY := sk-live-abcdefghijklmnopqrstu' 'r.sh:1:DB_PASSWORD=${DB_PASSWORD:-hunter2prod}' \
+  'a.py:1:password = os.environ["PASSWORD"]; api_key = "sk_live_abcdefghijklmnopqrstuv"' 'cfg/.env:4:DB_PASSWORD=Sup3r!S3cret#2024' \
+  'deploy/app.yml:7:  password: "environment-prod-2024"'; do
+  [ "$(tri46 "$l")" = 3 ] && ok "高置信：${l%%:*}" || bad "漏报：$l"
+done
+for l in 'config.json:3:  "max_tokens": 4096' 'app.yml:2:token_ttl: 3600' 'package-lock.json:9:    "js-tokens": "^4.0.0"' \
+  'a.ts:4:const token = await getToken();' 'k.ts:1:  tokenType: "Bearer"' 'a.yml:1:secret_name: my-prod-secret' \
+  'src/a.py:12:    password = settings.DATABASE_PASSWORD_VALUE' 'x.py:1:SECRET_KEY = os.getenv("SECRET_KEY")' 'k8s/x.yml:4:  password: ${DB_PASSWORD}' \
+  'src/d.py:9:  if password == "":' 'a.py:2:def get_token(self, token: str) -> str:'; do
+  [ "$(tri46 "$l")" = 0 ] && ok "非高置信：${l%%:*}" || bad "误报：$l"
+done
+long="x.py:1:note_token = compute($(printf 'a%.0s' $(seq 170))) + 'TAILVALUE'"
+r=$(printf '%s\n' "$long" | codev_scan_triage); case "$r" in *TAILVALUE*) ok "其余原文不截断（第 161 字符后可见）";; *) bad "原文被截断" "$r";; esac
+r=$(for i in $(seq 205); do echo "f.py:$i:token_name_$i = x"; done | codev_scan_triage); rc=$?
+case "$rc:$r" in 4:*"还有 5 行没列出"*) ok "超过 200 行 → rc=4 检查未完成";; *) bad "超量原文未标未完成（rc=${rc}）" "$(printf '%s' "$r" | tail -2)";; esac
+# 46g 轮次协议：opinions 非法筛选拒收、非法历史行阻断结论；commit_round 写规范轮次；prev_round_commit 归一
+export CODEV_OPINIONS="$CODEV_DIR/o46.tsv"
+codev_opinion_add ntms d46 1 claude m 判断 i46 采纳 P1 甲 - >/dev/null 2>&1; codev_opinion_add ntms d46 2 claude m 判断 i46 采纳 P1 甲 - >/dev/null 2>&1
+for bad_r in r 0 r0 abc; do codev_opinions i46 ntms d46 "$bad_r" >/dev/null 2>&1 && bad "非法筛选 $bad_r 被接受" || ok "非法轮次筛选 $bad_r 拒收"; done
+r=$(codev_opinions i46 ntms d46); case "$r" in *"r1 "*"r2 "*) ok "空筛选才回放全部轮次";; *) bad "空筛选回放错" "$r";; esac
+printf '2026-09-01T00:00\tntms\td46\tabc\tclaude\tm\t判断\ti46\t采纳\tP1\t甲\t-\tt\n' >> "$CODEV_OPINIONS"
+r=$(codev_opinions i46 ntms d46 2>&1); rc=$?
+case "$rc:$r" in 1:*"损坏"*) ok "非法历史轮次计为损坏行、不给执行结论";; *) bad "非法历史轮次未阻断（rc=${rc}）" "$r";; esac
+RR=$(mktemp -d -t codevrnd.XXXXXX)
+( cd "$RR" && git init -q && git config user.email t@t && git config user.name t && echo a > f && git add f && git commit -qm i \
+  && echo b >> f && codev_commit_round f r3 x 0 - s >/dev/null 2>&1 && git log -1 --format=%B | grep -qx 'Codev-Round: 3' ) \
+  && ok "commit_round r3 → trailer 写 3" || bad "trailer 未归一"
+( cd "$RR" && echo c >> f && codev_commit_round f 08 x 0 - s >/dev/null 2>&1 && git log -1 --format=%B | grep -qx 'Codev-Round: 8' ) \
+  && ok "commit_round 08 → trailer 写 8" || bad "08 trailer 未归一"
+( cd "$RR" && [ -n "$(codev_prev_round_commit f 4)" ] && [ -n "$(codev_prev_round_commit f r9)" ] && [ -n "$(codev_prev_round_commit f 09)" ] ) \
+  && ok "prev_round_commit 接受 4 / r9 / 09" || bad "prev_round_commit 归一失败"
+( cd "$RR" && git commit -q --allow-empty -m "old
+    
+Codev-Round: r5" && echo d >> f && git commit -qam "old2
+
+Codev-Round: 06" && [ "$(codev_prev_round_commit f 7)" = "$(git rev-parse HEAD)" ] ) \
+  && ok "历史 trailer 06 能被第 7 轮找到" || bad "历史 trailer 前导零匹配失败"
+( cd "$RR" && codev_prev_round_commit f x >/dev/null 2>&1 ) && bad "非法轮次未拒" || ok "prev_round_commit 非法轮次返回非零"
+# 46h 回流 diff：回流已提交且工作树干净时，git diff "$PREV^" 仍包含那次回流
+( cd "$RR" && echo e > d.md && git add d.md && git commit -qm base && echo f >> d.md && codev_commit_round d.md 1 x 0 - s >/dev/null 2>&1 \
+  && P=$(codev_prev_round_commit d.md 2) && [ -z "$(git diff "$P" -- d.md)" ] && git diff "$P^" -- d.md | grep -q '^+f' ) \
+  && ok "git diff \$PREV^ 含上一轮回流（\$PREV 本身为空）" || bad "回流 diff 写法验证失败"
+rm -rf "$RR"
+# 46i 闸门：符号链接按目标算、断链报错
+GD=$(mktemp -d -t codevgd.XXXXXX); head -c 60000 /dev/zero > "$GD/big.txt"
+r=$( CODEV_DIR="$GD"; printf 'x' > "$GD/codev-prompt-codex.txt"; ln -s "$GD/big.txt" "$GD/codev-prompt-reasonix.txt"; codev_prompt_gate 2>&1 ); rc=$?
+case "$rc:$r" in 1:*"✘ reasonix"*) ok "超限符号链接提示词被检出";; *) bad "符号链接被跳过（rc=${rc}）" "$r";; esac
+r=$( CODEV_DIR="$GD"; rm -f "$GD/big.txt"; codev_prompt_gate 2>&1 ); rc=$?
+case "$rc:$r" in 1:*"断链"*) ok "断链提示词报 ✘";; *) bad "断链未报（rc=${rc}）" "$r";; esac
+rm -rf "$GD"
 
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"

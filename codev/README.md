@@ -182,10 +182,10 @@ brainstorm → 编码 → review → 小结，**每个阶段之间会停下等�
 | opencode 迟迟不返回 | 本机实测极慢（早期未加超时封装时，最小任务 15 分钟仍未返回）。现在走后台 + `timeout 600`，超时即被斩并标 `⏭ 跳过`。当可选 agent 用，不阻塞综合 |
 | agent 说"无法验证 / 前提不可知" | 不应再频繁出现——沙盒里有 `./repo` 只读副本可查。若仍出现，Claude 会在综合前逐条替它查证（事实核查回填），不会直接判 FAIL |
 | 磁盘里堆了 `codev-sbox.*` | 进程被杀时收尾没跑到留下的；下次 `/codev` 启动会自动清理超 60 分钟且 owner 进程已死的，超 7 天的不看进程一律清（会话目录 `codev.*` 则是超 24 小时且无文件活动） |
-| gemini 报 503 / 过载 | 翻牌为 `⛔ 额度/限流/过载`（503/529 与 429 同类处置）：本轮无效、隔几分钟重试一次，再失败换 agent。别再钉 `-m gemini-2.5-pro`（已下线） |
-| self / check 翻牌成"空输出" | 多半是没先把 subagent 的回复 Write 进 `codev-out-self.txt` 就 `codev_report`；有 token 数时库会拒绝记账并提示先落盘 |
+| gemini 报 503 / 过载 | 翻牌为 `⛔ 额度/限流/过载`（`status: 503`、`[API Error: {"error":{"code":503…}}]`、`API Error: 529 {…}` 与 429 同类处置）：本轮无效、隔几分钟重试一次，再失败换 agent。别再钉 `-m gemini-2.5-pro`（已下线） |
+| self / check 翻牌成"空输出"或提示"没有本轮调用戳" | 发出前要 `codev_prepare_call self`（清上一轮文件并写调用戳）；收到后先落盘——有报告写 `codev-out-self.txt`，以错误结束把错误原句写 `codev-err-self.txt`——再 `codev_report`。漏了任一步库会拒绝记账并提示 |
 | review 说 base 无效 | 初始提交/浅克隆时会停下，让你指定 base 或确认用 `git diff --root HEAD` |
-| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型。命中多时把 grep 结果接给 `codev_scan_triage`：按文件聚合、单列"像真密钥"的行、打出其余原文；它是启发式，返回 0 也要看完原文 |
+| 命中 secret 扫描 | 会停下让你确认继续/脱敏/缩小范围——**不要**把真实 token/密钥发给外部模型。命中多时把 grep 结果接给 `codev_scan_triage`：按文件聚合、单列"像真密钥"的行、打出其余原文；它是启发式，返回 0 也要看完原文；返回 4 表示原文太多没列全，按命中处理 |
 | `⛔ <agent> 未启动：母本与已扫描版本不一致` | secret 扫描之后工作区又被改了，沙盒 agent 不会退回空目录硬跑；重扫并钉住新母本后再发 |
 | worktree 隔离会话里 codev 命令被宿主拒绝 | 把 Step 0 与后台调用写成 scratchpad 里的脚本文件再 `bash <文件>`；`CODEV_DIR` 仍用 mktemp（见 SKILL Step 0） |
 | 只想让一家看一眼 | `/codev review --agents codex`（或口头"让 codex 看一眼"）走轻量单家复审：不弹问、不起自查自评，保留扫描/翻牌/账本/逐字呈现/亲验 |
