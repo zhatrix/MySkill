@@ -1202,6 +1202,53 @@ r=$( CODEV_DIR="$GD"; rm -f "$GD/big.txt"; codev_prompt_gate 2>&1 ); rc=$?
 case "$rc:$r" in 1:*"断链"*) ok "断链提示词报 ✘";; *) bad "断链未报（rc=${rc}）" "$r";; esac
 rm -rf "$GD"
 
+echo "47. 只读参数守卫（2026-09-26 各家 CLI 只读实测矩阵）：缺必备参数或带放行参数 → 不启动"
+ro_ok()  { if codev_readonly_argv_check "$@" >/dev/null; then ok "放行：$*"; else bad "应放行却被拒：$*" "$(codev_readonly_argv_check "$@")"; fi; }
+ro_bad() { if codev_readonly_argv_check "$@" >/dev/null; then bad "应拒绝却放行：$*"; else ok "拒绝：$*"; fi; }
+# skill 里的正确写法（均实测三项写入被拒）
+ro_ok codex codex exec PROMPT -s read-only -c 'model_reasoning_effort="medium"'
+ro_ok codex codex review PROMPT -c 'model_reasoning_effort="medium"'
+ro_ok gemini env GEMINI_CLI_TRUST_WORKSPACE=true gemini -p PROMPT --approval-mode plan
+ro_ok reasonix reasonix run PROMPT --effort high --permission-mode read-only --metrics m.json -p
+ro_ok pi pi -p --provider deepseek --model deepseek-v4-pro --thinking high --no-session --no-context-files --tools read,grep,find,ls -- PROMPT
+ro_ok codebuddy codebuddy --effort minimal --max-turns 64 --tools "Read,Glob,Grep" --output-format json -p PROMPT
+ro_ok qoderclicn qoderclicn --reasoning-effort medium --tools "Read,Glob,Grep" -p PROMPT
+ro_ok opencode opencode run --agent plan PROMPT
+ro_ok codebuddy codebuddy --tools "" -p PROMPT
+# 旧写法与缺参数（实测可写）
+ro_bad pi pi -p --no-session --exclude-tools edit,write -- PROMPT
+ro_bad reasonix reasonix run PROMPT --effort high -p
+ro_bad codex codex exec PROMPT -c 'model_reasoning_effort="medium"'
+ro_bad gemini env GEMINI_CLI_TRUST_WORKSPACE=true gemini -p PROMPT
+ro_bad codebuddy codebuddy --effort minimal -p PROMPT
+ro_bad opencode opencode run PROMPT
+# 白名单里混进写工具
+ro_bad pi pi -p --tools read,bash -- PROMPT
+ro_bad codebuddy codebuddy --tools "Read,Glob,Grep,Bash" -p PROMPT
+ro_bad qoderclicn qoderclicn --tools "Read,Write" -p PROMPT
+# 放行类参数（正向对照里都写到了仓库外）
+ro_bad codex codex exec PROMPT -s read-only --dangerously-bypass-approvals-and-sandbox
+ro_bad codex codex exec PROMPT -s workspace-write
+ro_bad gemini gemini -p PROMPT --approval-mode yolo
+ro_bad gemini gemini -p PROMPT --approval-mode plan --yolo
+ro_bad reasonix reasonix run PROMPT --permission-mode danger-full-access -p
+ro_bad codebuddy codebuddy --tools "Read,Glob,Grep" -y -p PROMPT
+ro_bad qoderclicn qoderclicn --tools "Read,Glob,Grep" --dangerously-skip-permissions -p PROMPT
+ro_bad opencode opencode run --agent plan --auto PROMPT
+# 提示词正文里出现这些字样不误判（整元素精确匹配）
+ro_ok gemini gemini -p "评审里提到 --yolo 与 -y 与 danger-full-access 的风险" --approval-mode plan
+# 未登记 agent 不校验
+ro_ok fakeagent true
+# 集成：不合规时不启动、不写账本、不留输出
+n0=$(wc -l < "$CODEV_LEDGER" | tr -d ' ')
+r=$(codev_bg_sandboxed pi sh -c 'echo SHOULD-NOT-RUN' --exclude-tools edit,write 2>&1)
+case "$r" in *"⛔ pi 未启动"*"只读参数不合规"*) ok "sandboxed：pi 旧写法 → ⛔ 未启动";; *) bad "sandboxed 未拦 pi 旧写法" "$r";; esac
+case "$r" in *SHOULD-NOT-RUN*|*"▶"*) bad "被拦后仍启动了" "$r";; *) ok "被拦后没有启动";; esac
+r=$(codev_bg_native gemini sh -c 'echo SHOULD-NOT-RUN' --approval-mode yolo 2>&1)
+case "$r" in *"⛔ gemini 未启动"*"放行类参数"*) ok "native：gemini yolo → ⛔ 未启动";; *) bad "native 未拦 yolo" "$r";; esac
+[ "$(wc -l < "$CODEV_LEDGER" | tr -d ' ')" = "$n0" ] && ok "被拦的调用不写账本" || bad "被拦的调用写了账本"
+[ -s "$CODEV_DIR/codev-out-gemini.txt" ] && bad "被拦后留下输出" || ok "被拦后输出文件为空"
+
 chmod -R u+w "$CODEV_DIR" 2>/dev/null; rm -rf "$CODEV_DIR"   # 母本是 a-w 的，先恢复写权限
 echo; echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

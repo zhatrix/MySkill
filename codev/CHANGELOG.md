@@ -40,6 +40,12 @@
 
 ### 🐛 Fixed
 
+- 2026-09-26 [C072 / 只读实测] `references/agents.md` pi 调用由 `--exclude-tools edit,write` 改为 `--tools read,grep,find,ls`，`SKILL.md` 骨架同步；实测旧写法三类写入全部写成、包括用绝对路径写到 cwd 之外（codev 沙盒里可 `cd` 到真实仓库改文件），白名单写法下写文件与 shell 工具都不存在。代价：pi 不能再跑命令核实
+- 2026-09-26 [C073 / 只读实测] reasonix 调用加 `--permission-mode read-only`（`references/agents.md`、`SKILL.md` 骨架）；v1.38.12 实测不带时默认 `workspace-write`，工作区内写文件、shell 写入与改已有文件都成功，带上后三类写入全被权限策略拒绝，读文件、`rg` 与 `--metrics` 照常。删去"无可用只读旗标 / `--permission-mode plan` 非交互不可用"的过时说法
+- 2026-09-26 [C074 / 只读实测] `bin/codev-lib.sh` 新增 `codev_readonly_argv_check`，`codev_bg_native` / `codev_bg_sandboxed` 启动前按 agent 核对必备只读参数并拒绝放行类参数（`--yolo`、`-y`、`--dangerously-*`、`--full-auto`、`--auto`、`--approval-mode yolo|auto_edit`、`--permission-mode danger-full-access|workspace-write|bypassPermissions|acceptEdits`、`-s/--sandbox workspace-write|danger-full-access`），不合规 `⛔ 未启动`、不记账、不启动；整元素精确匹配，提示词正文不误判，未登记 agent 不校验。实测正向对照里参数一放开，除 codex 外各家都能写到仓库外。回归：47（33 项）
+- 2026-09-26 [C075 / 只读实测] `bin/codev-lib.sh` 把紧贴全角标点的变量展开统一加花括号（`$t（`、`$why（` 等 8 处）；守卫新写的提示串在 bash 的 UTF-8 locale 下触发 `t�: unbound variable`，既有几处属同一隐患
+- 2026-09-26 [C076 / 只读实测] 只读保障文档按实测改写：只读风险表与 README 分档改为 codex OS 沙盒（`review` 实测默认即 read-only 沙盒）、gemini CLI 策略强制且无 OS 兜底（`--sandbox` 在交互登录下要求 `GEMINI_API_KEY`）、reasonix/pi/codebuddy CLI 层只读、opencode 最弱（plan 下 bash 可用，写入只靠模型自拒；配置 `bash: deny` 与本机免费模型不兼容、`bash: ask` 首次调用即中止会话）；codebuddy 记录 MCP 工具被 `--tools` 挡住（实测），qoderclicn 因额度耗尽未复测。新增 `tests/readonly-probe.sh`（真调外部 CLI 的手动实测脚本，含 `--control` 正向对照）与 TESTING.md §1b
+
 - 2026-09-26 [C065 / 评审修复 / 5861656] `bin/codev-lib.sh` self/check 调用戳：`codev_prepare_call` 清空上一轮正文/err/状态后写 `codev-call-<agent>`，`codev_report self|check` 无戳即拒绝记账，记账后消费戳；`SKILL.md` G1/G2 发出前片段加 `codev_prepare_call`。此前 `--auto` 复用会话目录时，本轮 subagent 撞 529 只写 err，上一轮报告被当成本轮 ✔（复现）。已修改 10 处既有 self 测试按真实流程先准备。回归：46a
 - 2026-09-26 [C066 / 评审修复 / 5861656] `codev_err_lines` 按 agent 重写：codex 只认行首不缩进的 `ERROR:`（ntms 归档 12 条真实错误全为此格式）与 `API Error` 行，回显的 `context canceled` / `Max turns` / `error:` 夹具不再抽出；其它 agent 认 `API Error:`（Claude Code 真实格式带冒号）、`[API Error: …]`、行首单行 JSON `{"error":…}`、4xx/5xx 后接空格的状态行（不认 `413:` 行号回显）、行尾 `context canceled`、`Max turns (N) exceeded`。回归：46b/46d/46e
 - 2026-09-26 [C067 / 评审修复 / 5861656] `codev_classify` 短 stdout 按错误句式认：以 `API Error` / `[API Error` / `ERROR:` / `Error:` 开头时启用过载词（529/503 → quota，其它 → error），整段只是"service/model is (currently) unavailable/overloaded" → quota；讨论过载的正常短回复仍 ok。此前 stdout 里的 `API Error: 529 …`、`The service is currently unavailable` 被判 ✔ 当评审呈现（复现）。回归：46c

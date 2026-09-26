@@ -28,8 +28,11 @@ allowed-tools:
 **铁律**
 - Claude 是**唯一改文件的人**。外部 agent 一律**只读**运行，只输出方案 / 评审 / 质疑，
   绝不让它们改仓库文件。**只读靠分级保障**：
-  - **沙盒级只读的两个**（codex `-s read-only`、gemini `--approval-mode plan`）→ `codev_bg_native`，
-    在**真实仓库根**跑，自己读文件、跑 `git diff`。
+  - **原生只读的两个**（codex `exec -s read-only` / `review`：OS 沙盒；gemini `--approval-mode plan`：CLI 策略强制，无 OS 兜底）
+    → `codev_bg_native`，在**真实仓库根**跑，自己读文件、跑 `git diff`。
+  - **两个调用入口启动前都会核对只读参数**（`codev_readonly_argv_check`，按 2026-09-26 各家实测定规则，见 `agents.md`
+    「只读实测」）：缺必备参数或带 `--yolo` / `-y` / `--dangerously-*` / `--auto` 等放行参数，打 `⛔ 未启动` 不记账。
+    实测里除 codex 外，参数一错各家都能写到仓库外——别绕过它，照 agents.md 的命令抄。
   - **其余五个**（reasonix / qoderclicn / opencode / codebuddy / pi）→ `codev_bg_sandboxed`，在
     **隔离沙盒**里跑：cwd 是 `mktemp -d` 出来的沙盒，真实仓库**不在**里面，但沙盒内铺了一份
     `./repo` —— 工作区（含未提交改动）的**只读副本**。它们既能读全部代码，写入默认只落到副本上、
@@ -271,16 +274,19 @@ cd "$(git rev-parse --show-toplevel)"   # 【必须】铺母本靠 cwd 定位仓
                                         # 漏了这行会静默退回空目录模式（agent 重新变瞎，且 ▶ 行才看得出来）
 PROMPT="$CODEV_DIR/codev-prompt-reasonix.txt"            # 提示词文件（前一步已写好，含「工作副本」段）
 export CODEV_TIMEOUT=1200               # 核实型/大文档任务才加；普通 diff 评审用默认 600
-codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
+codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --permission-mode read-only --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
 # 首参是 agent 标签，其后是该 agent 的完整命令 argv（换成 agents.md 里目标 agent 的精确命令即可）。
 # ⚠️ 各 agent 的必备旗标不同，务必照 agents.md 抄，别省：
-#   reasonix   --effort high --metrics <json> -p （medium 会直接报错退出，它是"默认 medium"的例外；metrics 给 token）
+#   reasonix   --effort high --permission-mode read-only --metrics <json> -p （medium 会直接报错退出，它是"默认 medium"的例外；
+#              不带 --permission-mode read-only 时默认 workspace-write，实测可写；metrics 给 token）
+#   pi         -p --provider deepseek --model deepseek-v4-pro --thinking high --no-session --no-context-files --tools read,grep,find,ls -- "…"
+#              （只读白名单；旧写法 --exclude-tools edit,write 实测三项全能写、包括写到沙盒外）
 #   qoderclicn --tools "Read,Glob,Grep" -p "…"   （只读工具白名单；别用 --tools ""，那会连读也禁掉）
 #   codebuddy  --effort minimal --max-turns 64 --tools "Read,Glob,Grep" --output-format json -p "…"（核实型 64；纯咨询 12）
 #              ⚠️ --output-format json 是【计量必需】：codebuddy 无 --metrics，只有 json 输出的末元素带
 #              usage/total_cost_usd。库的 codev_unwrap_result 会自动把 .result 还原成正文再归一化用量，
 #              逐字呈现不受影响；去掉它就回到"token 恒记 0"的盲区。
-#   opencode   run --agent plan          （很慢，务必后台）
+#   opencode   run --agent plan          （很慢，务必后台；bash 实际可用、写入只靠模型自觉拒绝——最弱一档，只在用户点名时用）
 # 库函数自动：▶启动行 / 无-timeout 跳过并清空旧输出 / mktemp 沙盒 + ./repo 只读副本 /
 #            umask 077(子shell内) / 捕 agent 退出码 / 收尾删沙盒 / ✔或⚠️上报。
 # 副本超体积闸门（默认 100MB，CODEV_MAX_COPY_KB 可调、上限 1GB）或非 git 仓库时自动退回空目录模式，▶ 行会标出；

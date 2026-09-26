@@ -28,10 +28,21 @@ shasum 坏时 cksum 兜底、未跟踪 FIFO 不挂死签名、沙盒超 7 天不
 探针 rmdir 失败仍判不安全、扫描钉住的母本与当前不一致时拒铺副本、复用可写母本时补 a-w、长额度页翻牌带开头、
 散文里的 quota limit 词不误杀；全库自审回归覆盖未跟踪内容边界、初始仓库和 textconv 签名、哈希失败传播、字面文件提交、归档复制失败和路径参数、重复调用清理 metrics、输出及 JSON 解包权限、结构化错误优先级与坏 usage；第二轮补充结构化状态重复读取、空白/对象 JSON、科学计数法和大整数、缺失计量、并发短/长记录、损坏意见拒绝放行及不可覆盖归档。
 第三轮补充计量保存故障后的原文保留与重试、metrics 权限、解析器缺失/损坏、方括号正文兼容、GC 路径别名/尾斜杠/父目录保护、半行意见写入期间的回放一致性、四个读取入口的错误传播及空白主体/问题编号拒收。
-9/25 使用审计回流（第 43、44 节）：503/529 过载归 quota 且正文含 503 不误杀、裸 `default` 模型名归一、轮次 `r12`/`12` 归一与非数字拒收、agent 列只收小写标签、`codev_round_trend` 计数与 ≥5 轮提示、self/check 有 token 无正文时拒绝记账、退化空目录的 ✔ 警告与账本备注及 prepare_call 清标记、codex 带行号源码不算错误行而 4xx/5xx 仍算、钉子不匹配时 `codev_bg_sandboxed` 不启动（rc=2）且不写账本、会话目录名缺随机后缀告警、`codev_prompt_gate` 三档阈值、`codev_scan_triage` 聚合与高置信形态、probe 列出 pi。f2ef64a 评审回流（第 45 节）：短回复谈过载不误杀、`401 {…}`/`403 - …`/`429 (…)` 状态行恢复、200 不算错误行、codex 回显 4xx/5xx 源码与夹具不算错误行且 ERROR 行照常、闸门在 zsh 无提示词时不中断、分诊不放过特殊字符/短值/配置裸值密钥且不把引用当真、无文件名输入聚合、轮次前导零/读取端 r 前缀/归档 rN、换行 agent 拒收、self 529 记 quota、0 文件副本打退化。5861656 评审回流（第 46 节）：self/check 调用戳与多轮 529、真实错误格式（`API Error:`、`[API Error: {…}]`、单行 JSON）、stdout 错误句式与正常短回复、非 codex 行号回显与真状态行、codex 只认行首 `ERROR:`、分诊 9 个正例与 11 个负例及原文不截断/超量 rc=4、轮次筛选拒收与非法历史行、trailer 归一与 prev_round_commit、`$PREV^` 回流 diff、闸门符号链接与断链。子测试用当前 shell（`TEST_SH`）与探测到的 `CODEV_TO` 起子进程。
+9/25 使用审计回流（第 43、44 节）：503/529 过载归 quota 且正文含 503 不误杀、裸 `default` 模型名归一、轮次 `r12`/`12` 归一与非数字拒收、agent 列只收小写标签、`codev_round_trend` 计数与 ≥5 轮提示、self/check 有 token 无正文时拒绝记账、退化空目录的 ✔ 警告与账本备注及 prepare_call 清标记、codex 带行号源码不算错误行而 4xx/5xx 仍算、钉子不匹配时 `codev_bg_sandboxed` 不启动（rc=2）且不写账本、会话目录名缺随机后缀告警、`codev_prompt_gate` 三档阈值、`codev_scan_triage` 聚合与高置信形态、probe 列出 pi。f2ef64a 评审回流（第 45 节）：短回复谈过载不误杀、`401 {…}`/`403 - …`/`429 (…)` 状态行恢复、200 不算错误行、codex 回显 4xx/5xx 源码与夹具不算错误行且 ERROR 行照常、闸门在 zsh 无提示词时不中断、分诊不放过特殊字符/短值/配置裸值密钥且不把引用当真、无文件名输入聚合、轮次前导零/读取端 r 前缀/归档 rN、换行 agent 拒收、self 529 记 quota、0 文件副本打退化。5861656 评审回流（第 46 节）：self/check 调用戳与多轮 529、真实错误格式（`API Error:`、`[API Error: {…}]`、单行 JSON）、stdout 错误句式与正常短回复、非 codex 行号回显与真状态行、codex 只认行首 `ERROR:`、分诊 9 个正例与 11 个负例及原文不截断/超量 rc=4、轮次筛选拒收与非法历史行、trailer 归一与 prev_round_commit、`$PREV^` 回流 diff、闸门符号链接与断链。只读参数守卫（第 47 节）：各家 skill 写法放行、旧写法（pi `--exclude-tools`、reasonix 不带 `--permission-mode read-only`）与缺参拒绝、白名单混入写工具拒绝、九种放行类参数拒绝、提示词正文含这些字样不误判、未登记 agent 不校验、两个调用入口被拦时不启动不记账不留输出。子测试用当前 shell（`TEST_SH`）与探测到的 `CODEV_TO` 起子进程。
 
 **加功能先加测试**：先写夹具让它红，再改库。历史上三个 bug 都是测试抓的：`$var` 紧邻全角字符被 bash 当变量名、
 metrics JSON 重复键把 token 串接成天文数字、macOS awk 在 UTF-8 下 `"不成立"=="成立"` 判真。
+
+## 1b. 各家 CLI 只读实测（CLI 升级后必跑，真调外部 agent、耗额度）
+
+```bash
+bash tests/readonly-probe.sh --control            # 全部 agent，含正向对照
+bash tests/readonly-probe.sh reasonix pi          # 只测指定几家
+```
+每个场景用一次性临时仓库，要求 agent 真的发起三种写入（写文件工具 / shell 仓库内 / shell 仓库外）。判读：非 control 行
+三项都应是 `-` 且 `existing=hello`；control 行三项都应 `WRITTEN`（否则说明提示词没让它动手，结论无效）。
+`-` 只说明没写成：是 CLI 拦截还是模型自拒，要看输出目录里 `<label>.out` 的逐条报告。结果变了就同步
+`references/agents.md`「只读实测」与库的 `codev_readonly_argv_check`，并在 `tests/test-lib.sh` 第 47 节改对应断言。
 
 ## 2. 文案微测试（改 SKILL.md / prompts.md / synthesis.md 时跑）
 
@@ -79,3 +90,4 @@ tests/microtest/score.sh <out_root>/<label>-*                                   
 | 2026-09-25 | 使用审计回流 | 302/302（bash/zsh） | 未跑（本轮只改流程文案与库守卫，微测试场景未覆盖新增项） | 未跑 | `reports/2026-09-25-usage-audit.md`；真机待验：⛔ 未启动、self 漏落盘拦截、pi 调用形态、轻量单家复审 |
 | 2026-09-25 | f2ef64a 评审修复 | 329/329（bash/zsh；新增 27 项在 f2ef64a 库上 bash 27 / zsh 28 败） | 未跑 | 未跑 | 15 条评审发现全部修复，见 CHANGELOG C057-C064 |
 | 2026-09-26 | 5861656 评审修复（分支 fix/codev-review-5861656） | 389/389（bash/zsh；第 46 节在 5861656 库上 bash 44 / zsh 43 败） | 未跑 | 未跑 | /code-review 13 条 + codex 12 条合并去重后全部复现成立并修复，见 CHANGELOG C065-C071 |
+| 2026-09-26 | 各家 CLI 只读实测回流（分支 fix/codev-agent-readonly） | 422/422（bash/zsh；第 47 节 33 项） | 未跑 | readonly-probe：codex/gemini/reasonix/pi/codebuddy/opencode 已测，qoderclicn 额度耗尽未测 | 守卫 + pi/reasonix 调用改只读参数，见 CHANGELOG C072-C076 |

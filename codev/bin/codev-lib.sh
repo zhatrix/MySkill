@@ -842,7 +842,7 @@ codev_commit_round() {
   case "$probe" in
     ' '*|"$nl"*|*' '|*'  '*|*" $nl"*|*"$nl "*|*"$nl$nl"*)
       # 变量【不能紧贴全角字符】：UTF-8 locale 下 bash 会把 `files」` 一起当变量名（set -u 直接报
-      # unbound variable）。同 codev_report 的 $extra 与 codev_bg_sandboxed 的 $mode，一律用 printf %s 传。
+      # unbound variable）。同 codev_report 的 $extra 与 codev_bg_sandboxed 的 ${mode}，一律用 printf %s 传。
       echo "⚠️ 文件清单里有空白占位（开头/结尾空白或连续两个空白）：多半是某个变量没绑定展开成了空串。" >&2
       printf '   收到的首参：「%s」。空 token 会被静默丢弃、只提交剩下的文件却报成功——先把变量绑好再回流。\n' "$files" >&2
       return 1 ;;   # 此时还没 mktemp 出 msg，没有临时文件要清
@@ -904,7 +904,7 @@ $t"; done
 # 别写 `git diff "$PREV"`——回流已经提交，工作树与它相同时 diff 恒为空。
 # 用途：第 N 轮提示词里内联 `git diff <该 commit> -- <path>`，让 agent 看到两版之间的真实差异而不是手写的"改动章节"。
 codev_prev_round_commit() {
-  local f="$1" round prev                      # 变量名不能叫 path：zsh 里它绑定 $PATH，见 codev_commit_round 的注释
+  local f="$1" round prev                      # 变量名不能叫 path：zsh 里它绑定 ${PATH}，见 codev_commit_round 的注释
   # 先归一再算术：r5 在算术里是未定义变量（得 -1、静默返回空），08 在 bash 里是非法八进制（中断调用方）。
   round=$(codev_key_round "$2" codev_prev_round_commit) || return 1
   prev=$((round - 1)); [ "$prev" -ge 1 ] || return 0
@@ -1004,7 +1004,7 @@ codev_report() {
   # 报 "extra（: unbound variable"）。先用普通赋值把括号包好，再以 %s 传给 printf。
   [ -n "$extra" ] && extra="（${extra}）"
   lines=$(codev_err_lines "$err" "$agent")
-  # 用 printf %s 传变量（不要写 "exit=$rc："——UTF-8 locale 下 bash 会把紧跟的全角字符与变量展开
+  # 用 printf %s 传变量（不要写 "exit=${rc}："——UTF-8 locale 下 bash 会把紧跟的全角字符与变量展开
   # 一起误扫，吞掉退出码；ASCII 冒号 + printf 稳）。
   case "$cls" in
     ok)      printf '✔ %s 完成 exit=0%s\n' "$agent" "$extra"
@@ -1063,7 +1063,7 @@ CODEV_MASTER="$CODEV_DIR/codev-master-repo"
 # shasum 存在但跑不动（perl 环境坏）时也要能退到 cksum：先把 stdin 落到临时文件，依次尝试，谁先有输出用谁。
 codev_hash() {
   # 临时文件放会话目录：输入含 git diff + 未跟踪文件全文，放 $TMPDIR 的话进程被杀就永久留一份工作区内容，GC 也不收它；
-  # 会话目录随收尾 / 24h GC 一起删。CODEV_DIR 不可写时才退到 $TMPDIR。
+  # 会话目录随收尾 / 24h GC 一起删。CODEV_DIR 不可写时才退到 ${TMPDIR}。
   local t h; t=$(mktemp "$CODEV_DIR/codev-hash.XXXXXX" 2>/dev/null || mktemp -t codev-hash.XXXXXX) || return 1
   cat > "$t" || { rm -f "$t"; return 1; }
   if h=$(shasum < "$t" 2>/dev/null); then h=$(printf '%s' "$h" | cut -c1-40)
@@ -1117,7 +1117,7 @@ codev_master_path() {
   return 0
 }
 
-# codev_repo_master — 把工作区铺成【母本】 $CODEV_MASTER（每个签名只做一次，已存在就直接复用；建成后 chmod -R a-w）。
+# codev_repo_master — 把工作区铺成【母本】 ${CODEV_MASTER}（每个签名只做一次，已存在就直接复用；建成后 chmod -R a-w）。
 # 返回 0=可用，1=不可用（非 git / 超闸门 / 失败）。
 codev_repo_master() {
   codev_master_path || return 1     # 先按仓库+工作区状态定母本路径，避免复用到别的树
@@ -1375,6 +1375,57 @@ codev_repo_copy() {
 }
 
 # codev_prepare_call <agent> — 清理本轮输出与计量；在提前跳过路径之前执行，不改变调用者 umask。
+# codev_readonly_argv_check <agent> <argv...> — 启动前核对各家 CLI 的只读参数（2026-09-26 实测矩阵，见 agents.md「只读实测」）：
+# 缺必备参数或出现放行类参数就输出原因并返回 1，调用方不启动 CLI。实测里除 codex 外，参数一错各家都能写到仓库外
+# （pi 的 --exclude-tools edit,write、reasonix 的默认 workspace-write 都曾在 skill 的写法里）。
+# 只做整元素精确匹配：提示词是一个长 argv 元素，正文里出现 "--yolo" 之类的字样不会误判。
+# 未登记的 agent 标签不校验（库不认识它的参数），由调用方自负。
+codev_readonly_argv_check() {
+  local agent="$1"; shift
+  local a prev="" req="" have=0 tools="" tools_seen=0 sub=""
+  for a in "$@"; do
+    case "$a" in
+      --yolo|-y|--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|--full-auto|--auto|--dangerously-skip-permissions=*)
+        echo "放行类参数 $a"; return 1 ;;
+    esac
+    case "$prev:$a" in
+      --approval-mode:yolo|--approval-mode:auto_edit|--permission-mode:danger-full-access|--permission-mode:workspace-write|--permission-mode:bypassPermissions|--permission-mode:bypass_permissions|--permission-mode:acceptEdits|-s:workspace-write|-s:danger-full-access|--sandbox:workspace-write|--sandbox:danger-full-access)
+        echo "放行类参数 $prev $a"; return 1 ;;
+    esac
+    case "$a" in --approval-mode=yolo|--approval-mode=auto_edit|--permission-mode=danger-full-access|--permission-mode=workspace-write|--sandbox=workspace-write|--sandbox=danger-full-access)
+      echo "放行类参数 $a"; return 1 ;;
+    esac
+    case "$agent" in
+      codex)
+        [ -z "$sub" ] && case "$a" in exec|review) sub="$a";; esac
+        case "$prev:$a" in -s:read-only|--sandbox:read-only) have=1;; esac
+        case "$a" in --sandbox=read-only|-s=read-only) have=1;; esac ;;
+      gemini)   case "$prev:$a" in --approval-mode:plan) have=1;; esac; [ "$a" = --approval-mode=plan ] && have=1 ;;
+      reasonix) case "$prev:$a" in --permission-mode:read-only) have=1;; esac; [ "$a" = --permission-mode=read-only ] && have=1 ;;
+      opencode) case "$prev:$a" in --agent:plan) have=1;; esac; [ "$a" = --agent=plan ] && have=1 ;;
+      pi|codebuddy|qoderclicn)
+        case "$prev" in --tools|-t) tools_seen=1; tools="$tools,$a";; esac ;;
+    esac
+    prev="$a"
+  done
+  case "$agent" in
+    codex)
+      [ "$sub" = review ] && return 0                         # review 子命令实测默认 read-only 沙盒（不吃 -s）
+      [ "$have" = 1 ] || { echo "codex exec 缺 -s read-only"; return 1; } ;;
+    gemini)   [ "$have" = 1 ] || { echo "gemini 缺 --approval-mode plan"; return 1; } ;;
+    reasonix) [ "$have" = 1 ] || { echo "reasonix 缺 --permission-mode read-only（不带时默认 workspace-write，实测可写工作区）"; return 1; } ;;
+    opencode) [ "$have" = 1 ] || { echo "opencode 缺 --agent plan"; return 1; } ;;
+    pi|codebuddy|qoderclicn)
+      [ "$tools_seen" = 1 ] || { echo "$agent 缺只读工具白名单 --tools（pi 的 --exclude-tools edit,write 实测挡不住 bash 写入）"; return 1; }
+      local t ok
+      case "$agent" in pi) ok=' read grep find ls ';; *) ok=' Read Glob Grep ';; esac
+      for t in $(printf '%s' "$tools" | tr ', ' '\n\n'); do
+        case "$ok" in *" $t "*) ;; *) echo "$agent 的 --tools 含非只读工具 ${t}（只允许${ok% }）"; return 1;; esac
+      done ;;
+  esac
+  return 0
+}
+
 codev_prepare_call() {
   local agent="$1" out="$CODEV_DIR/codev-out-$1.txt" err="$CODEV_DIR/codev-err-$1.txt"
   case "$agent" in ''|*[!A-Za-z0-9_-]*) echo "⚠️ 无效 agent 标签" >&2; return 1;; esac
@@ -1396,7 +1447,7 @@ codev_prepare_call() {
 codev_bg_sandboxed() {
   local agent="$1"; shift
   local out="$CODEV_DIR/codev-out-$agent.txt" err="$CODEV_DIR/codev-err-$agent.txt"
-  # 【任何提前返回之前就清空】：Claude 按字面路径读 $out，若本轮没跑成而文件还留着上一轮的
+  # 【任何提前返回之前就清空】：Claude 按字面路径读 ${out}，若本轮没跑成而文件还留着上一轮的
   # 评审正文，那份陈旧内容会被当成本轮结论逐字呈现（最坏情况：上一轮说 FAIL 的问题已修好，
   # 这轮却又拿旧文本判一次 FAIL）。所以清空必须在 timeout 缺失、mktemp 失败等所有出口之前。
   codev_prepare_call "$agent" || return 1
@@ -1404,7 +1455,10 @@ codev_bg_sandboxed() {
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
   fi
-  local sbox rc mode
+  local sbox rc mode why
+  if ! why=$(codev_readonly_argv_check "$agent" "$@"); then
+    echo "⛔ $agent 未启动：只读参数不合规——${why}（照 agents.md 该 agent 的调用命令补齐）"; return 1
+  fi
   sbox=$(mktemp -d -t codev-sbox.XXXXXX) || { echo "⚠️ $agent mktemp 失败"; return 1; }
   # owner 标记：codev_sbox_gc 删 60 分钟以上的沙盒前先 kill -0 这个 pid，活着的沙盒不删。
   # 光靠 mtime 不够——母本等待/构建阶段没有 timeout 管，加上 CODEV_TIMEOUT 最大 3000s，是能拖过 60 分钟的。
@@ -1443,8 +1497,8 @@ codev_bg_sandboxed() {
     # 留个标记让 codev_report 在 ✔ 后追加警告并写进账本备注；用户显式 text 模式不算退化。
     [ "$CODEV_SANDBOX_MODE" = repo ] && printf '%s' "副本没铺成，退回隔离空目录（超闸门 / 非 git / 铺失败）" > "$CODEV_DIR/codev-degraded-$agent" 2>/dev/null
   fi
-  # 用 printf 传 $mode：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
-  # （实测 echo "…（$mode）" 只输出到"启动（"就截断）。同 codev_report 里 $rc 的处理。
+  # 用 printf 传 ${mode}：变量展开【紧邻全角字符】时 bash 在 UTF-8 locale 下会误扫、吞掉后半行
+  # （实测 echo "…（${mode}）" 只输出到"启动（"就截断）。同 codev_report 里 $rc 的处理。
   printf '▶ %s 启动: %s\n' "$agent" "$mode"
   # umask 077 放进子 shell：输出含 diff/可能密钥仅本人可读，且【不把 umask 泄漏给调用方 shell】。
   CODEV_T0=$(date +%s)
@@ -1466,6 +1520,10 @@ codev_bg_native() {
   if [ -z "$CODEV_TO" ]; then
     echo "⏭ $agent 跳过（无 timeout，后台无兜底）→ 改前台串行或先 brew install coreutils"
     return 0
+  fi
+  local why
+  if ! why=$(codev_readonly_argv_check "$agent" "$@"); then
+    echo "⛔ $agent 未启动：只读参数不合规——${why}（它在真实仓库里跑，参数错了就是可写的）"; return 1
   fi
   echo "▶ $agent 启动（原生只读，真实仓库 cwd）"
   local rc

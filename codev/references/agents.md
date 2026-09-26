@@ -34,7 +34,8 @@
 | `codev_bg_sandboxed <agent> <cmd…>` | 非原生只读 agent：`mktemp` 隔离沙盒（含 `umask 077`，收进子 shell 不外泄）+ **默认铺一份只读仓库副本 `./repo`**（见下）+ 捕 agent 退出码（非 rm）+ 无 timeout 自动跳过 + `codev_report`。与 `codev_bg_native` 均在任何提前返回前清空旧 stdout/stderr、删除旧 metrics，并把输出权限设为 0600；准备失败不启动 CLI。首参 agent 标签，其后是完整命令 argv。 |
 | `codev_repo_master` | 把工作区（tracked + 未忽略的 untracked，含未提交改动，不含 `.git`，过滤密钥文件）铺成**母本** `$CODEV_DIR/codev-master-repo.<签名>`（签名 = 仓库根 + HEAD + 脏文件内容，见 `codev_master_path`），**每个签名只做一次**，同会话改了代码再评自动换新母本；建成后 `chmod -R a-w`。带 `mkdir` 原子锁（并发 fan-out 时只有一个铺、其余等待复用）+ `.partial` 原子改名（中途被杀不会留下半个仓库被误当"已铺好"）+ 陈旧锁回收（`kill -0` 判持锁进程是否存活，确认已死才回收；mtime 兜底阈值 `-mmin +2` 因 find 按整分钟截断，实际是 **≥3 分钟**）。 |
 | `codev_repo_copy <sbox>` | 从母本给该 agent clone 一份**独立**副本到 `<sbox>/repo` 并 `chmod -R a-w`。用 `cp -c`（APFS clonefile 写时复制：秒级、几乎不占额外磁盘，但各 agent 互不影响），不支持时退回 `cp -R`。非 git 仓库 / 超体积闸门 / 失败时返回 1，调用方自动退回空目录模式。 |
-| `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑（只读性由调用方 argv `-s read-only`/`--approval-mode plan` 保证，函数不校验）。 |
+| `codev_bg_native <agent> <cmd…>` | 原生只读 agent（codex/gemini）：同上但**不建沙盒**、在当前 cwd（仓库根）跑。启动前经 `codev_readonly_argv_check` 核对只读参数（codex `exec` 须 `-s read-only`、gemini 须 `--approval-mode plan`，放行类参数一律拒绝），不合规 `⛔ 未启动`。 |
+| `codev_readonly_argv_check <agent> <argv…>` | 两个调用入口共用的启动守卫，规则见文末「只读实测（2026-09-26）与启动守卫」。合规返回 0；不合规输出原因、返回 1。 |
 | `codev_report <agent> <rc> <errfile>` | 完成行，按 `codev_classify` 的七类翻牌：`✔ ok` / `⏭ timeout` / `⛔ quota`（额度/限流：429/402 与额度短语；**过载**：503/529、"overloaded"、"experiencing high demand"——过载词只对错误句式生效：stderr 错误行，或以 `API Error` / `ERROR:` / `Error:` 开头、整段只是"服务不可用"的短 stdout；讨论过载的正常短回复不误杀；附错误行原句含重置时间）/ `⛔ auth` / `⚠️ turns`（Max turns）/ `⚠️ empty`（exit 0 但零输出）/ `⚠️ error`。**两道守卫**：① `self`/`check`：没有本轮调用戳（发出前没 `codev_prepare_call self|check`，它清掉上一轮正文/err 并写戳，记账后戳被消费）→ 拒绝记账；`CODEV_TOKENS_<agent>` > 0 而正文与 err 文件都为空 → 判定漏落盘，不记账、返回 1，提示先 Write 正文（有报告）或把错误原句写进 err（以 529 等错误结束）再 report（09-11 至 09-25 六次有报告的 G2 被记成 empty 都是这一步漏了）；② 沙盒 agent 没有代码视野（副本没铺成：超闸门 / 非 git / 铺失败；或副本建成但 0 个文件）→ ✔ 后追加"没有代码视野（原因）"警告，账本备注记 `退化:无代码视野`（用户显式 `CODEV_SANDBOX_MODE=text` 不算退化；母本≠已扫描版本则根本不启动，见 `codev_bg_sandboxed`）。错误行抽取 `codev_err_lines <err> [agent]`：对 codex 只认行首不缩进的 `ERROR:`（ntms 归档里它的运行错误全是这个格式）与 `API Error` 行，其 stderr 里回显的源码、夹具一概不认；其它 agent 认 ERROR/错误 前缀行、`API Error` / `API Error:` / `[API Error: …]`、行首的 `{"error":…}` 单行 JSON、`4xx/5xx` 后接一个空格再接内容的状态行（`401 {…}`、`403 - …`、`429 (…)`；不认 `413:  const x` 这类行号回显）、`status: 4xx/5xx`、行尾的 `context canceled`、`Max turns (N) exceeded`。**不只看退出码**：qoderclicn 额度耗尽写在 stdout 且 exit 0、codex 用量上限在 1MB stderr 尾部、reasonix `context canceled` 都实测过被旧版判成 ✔/无提示。附用时（库计时）与 tokens（codex stderr / reasonix `--metrics`）。每次追加一行到跨会话账本。 |
 | `codev_classify <agent> <rc> <out> <err>` | 归类（见上）。误报防护：stdout 只在 <600 字节时才拿去匹配额度模式；短 stdout 若**本身是一句错误**（以 `API Error` / `[API Error` / `ERROR:` / `Error:` 开头，或整段只是"service/model is (currently) unavailable/overloaded"）才启用过载词，讨论过载的正常短回复不受影响；stderr 只看 `codev_err_lines` 抽出的错误行。 |
 | `codev_tokens <agent>` | 能取到才输出 `tokens N`：优先 `CODEV_TOKENS_<agent>`（self/check 的来源，只认纯数字）；codex 取 stderr "tokens used"；其它取完整 metrics JSON 的顶层 prompt+completion，两项均须为非负整数，用 Python 整数相加。缺项、坏 JSON 或坏类型输出空串，不把缺项当零、不取嵌套 provider 冒充总量。 |
@@ -295,8 +296,11 @@ fi
   ```bash
   CODEV_DIR=<会话目录>; source "$CODEV_DIR/codev-lib.sh"
   root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1   # 铺母本靠 cwd 定位仓库，漏了会静默退回空目录
-  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
+  codev_bg_sandboxed reasonix reasonix run "$(cat "$PROMPT")" --effort high --permission-mode read-only --metrics "$CODEV_DIR/codev-metrics-reasonix.json" -p
   ```
+  `--permission-mode read-only` **必带**（库的只读守卫会拒绝没带它的调用）：不带时默认是 `workspace-write`，2026-09-26 实测
+  写文件与 shell 在工作区内都能写、改已有文件（工作区外被它自带的 OS 沙盒拦住）；带上后三类写入全部被权限策略拒绝，
+  读文件、`rg` 递归搜索与 `--metrics` 照常可用（v1.38.12 实测）。
   `--metrics <path>` 写一份 JSON（prompt_tokens / completion_tokens / steps / cost CNY，v1.35 实测可用），
   `codev_report` 据此附 tokens。可选 `--max-steps <n>` 限工具调用轮数、`--model <id>` 指定模型。
   `-p` 只打印最终回答（省掉工具调用流水，逐字呈现更干净）。
@@ -313,10 +317,10 @@ fi
 - **⚠️ `--effort medium` 在 DeepSeek thinking 模型上会直接报错退出**（实测 exit=1：
   `provider "deepseek-pro" uses DeepSeek thinking; effort must be high, max, or disabled`）。
   **reasonix 是全局"默认 medium"规则的例外**：给它 `high`（或 `max`/不传）。传 medium 等于白跑一轮。
-- **⚠️ `--permission-mode plan` 非交互不可用**（v1.35 复测仍 exit=2：`requires an interactive session`），
-  别照搬 gemini 的 plan 模式思路。非交互下用默认 `ask` 模式（无人应答即不放行写操作）。
-- **只读保证**：**无可用的非交互只读旗标** → 靠 `codev_bg_sandboxed` 沙盒（真仓库不在 cwd、
-  `./repo` 副本 `chmod a-w`）+ 提示词强约束，且不给它 auto-approve / `bypassPermissions`。
+- **只读保证**：`--permission-mode read-only`（v1.38 起的取值是 `read-only | workspace-write | danger-full-access`，
+  旧版的 `plan` 取值已不存在）+ `codev_bg_sandboxed` 沙盒 + 提示词。实测三类写入均被拒（"current constraints forbid
+  state mutation"），拦截发生在 CLI 权限策略层；它另有只放行 cwd 的 OS 沙盒（默认模式下工作区外写入报
+  `Operation not permitted`）。绝不要给 `danger-full-access` / `workspace-write`——守卫会拒绝。
 - **推理强度**：`--effort low|high|max`（**跳过 medium**，见上）；`--xhigh` 用 `max`。
 - **鉴权**：`reasonix setup` 配置 API key。
 - **角色**：低成本、高性价比推理，适合快速多方案头脑风暴。
@@ -365,7 +369,13 @@ fi
   这不是 codex `-s read-only` 那种沙盒级保证。而且这张权限表来自**用户本地 opencode 配置**
   （实测里含用户自定义的 `external_directory` 放行项），不是 CLI 的固有不变量，随配置漂移。
   → 结论：opencode 留在 `codev_bg_sandboxed`，`--agent plan` 只当**纵深防御的一层**。
-  另注：`--auto`（auto-approve）默认关闭，**绝不要加**。
+  另注：`--auto`（auto-approve）默认关闭，**绝不要加**（守卫会拒绝）。
+  **2026-09-26 实测（1.18.14）**：plan agent 下模型会用 bash 跑 `ls -la` 等读命令；让它写文件时是**模型自己按系统提示词
+  拒绝**，根本没发起写调用——测不到也谈不上 CLI 强制。想在 CLI 层禁 bash 的三条路都走不通：
+  ① 配置里 `bash: deny`（`opencode.json` 或 `OPENCODE_CONFIG_CONTENT` 都一样）→ 本机免费模型的服务端直接拒绝请求
+  （`OpenCode's free tier can only be used from within OpenCode`），只禁 `edit` 则正常；② `bash: ask` → 非交互下
+  第一次 bash 调用就被自动拒绝并**中止整个会话**（输出 56 字节），而它开场就会跑 `ls`，评审必然失败；
+  ③ 换非免费模型（本机 `zhipuai/glm-4.5`）→ 令牌已过期。→ 维持"只在用户点名时用"，并按最弱一档对待。
 - **鉴权**：`opencode auth`（providers）。`opencode models` 查可用模型。
 - **角色**：灵活切换多家模型，做交叉对比很方便。
 
@@ -378,12 +388,15 @@ fi
   root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && cd "$root" || exit 1
   export CODEV_MODEL_pi=deepseek-v4-pro
   codev_bg_sandboxed pi pi -p --provider deepseek --model deepseek-v4-pro --thinking high --no-session --no-context-files \
-    --exclude-tools edit,write -- "$(cat "$PROMPT")"
+    --tools read,grep,find,ls -- "$(cat "$PROMPT")"
   ```
+  **必须用 `--tools read,grep,find,ls` 白名单**（库的只读守卫会拒绝其它写法）：2026-09-26 实测旧写法
+  `--exclude-tools edit,write` 三类写入**全部成功**，包括用绝对路径写到工作目录之外——在 codev 沙盒里它能
+  `cd` 到真实仓库去改文件，副本的 `a-w` 挡不住。白名单写法下写文件与 shell 工具都不存在，三类写入全部做不到。
   `--no-session`：不落会话文件；`--no-context-files`：不读 cwd 的 AGENTS.md/CLAUDE.md（沙盒里本来也没有，防它顺着路径找）；
   `--thinking high|xhigh|max` 是推理强度（`--xhigh` 用 `max`）。
-- **只读保证**：**弱**（同 opencode）：`--exclude-tools edit,write` 禁了写工具但 `bash` 还在，能绕过；靠沙盒 + 副本 `a-w`。
-  想要 harness 级就用 `--tools read`（白名单只留 read，但它就没有 grep/find 了，核实型评审会变钝）。
+- **只读保证**：**CLI 工具白名单**（`--tools read,grep,find,ls`，0.87.1 实测）+ 沙盒。代价：没有 bash，
+  不能跑测试/命令做核实，只能读和搜；需要它跑命令的场景不再支持。
 - **计量**：没有 `--metrics`，账本 tokens 恒为 `-`；`--mode json` 是否带 usage **未实测**，验过再改这一行。
 - **⚠️ 超时安全网一次没兜住**：2026-09-15 一次 `CODEV_TIMEOUT=1800` 的调用跑了 6904s 才以 rc=124 结束（原因未查明：
   `timeout -k 15` 应在 1815s 内结束）。对它要用 `Monitor` 盯输出文件，超过上限 10 分钟还没翻牌就手动 `pkill -f 'pi -p'`。
@@ -431,6 +444,9 @@ fi
   写 `default` 库会归一成同名，写 unknown/漏写会把同一家拆成三桶，`codev_stats` 每桶都凑不够 20 条样本）。
 - **超时基线**：2026-09-11 至 09-25 共 56 次，6 次在 1200-1800s 撞超时零输出（提示词都已在 4-11KB、核实清单已收窄），
   1 次结构化 is_error。收窄提示词能降但不能消掉超时；核实型任务给它 3 条以内，或第 2 轮起换 codex + self。
+- **MCP 工具**：启动事件里列着用户配置的 MCP 工具（本机 chrome-devtools 30 个），但带 `--tools "Read,Glob,Grep"`
+  时模型看不到也调不了它们（2026-09-26 实测诱导调用 `mcp__chrome-devtools__list_pages` 失败）；
+  `--strict-mcp-config` 可让它们连加载都不加载，属可选的纵深防御。
 - **鉴权**：`codebuddy`（交互登录）。
 - **角色**：中文语境下的代码评审。
 
@@ -456,22 +472,49 @@ fi
 
 | agent | 只读保障级别 | 实测旗标 | 运行位置 |
 |---|---|---|---|
-| codex | **沙盒级**（进程被限制） | `-s read-only`（`review` 子命令天然只读，不吃 `-s`） | 真实仓库 `codev_bg_native` |
+| codex | **OS 沙盒**（shell 写入报 `Operation not permitted`，2026-09-26 实测） | `exec -s read-only`；`review` 子命令默认即 read-only 沙盒（实测同样三项全拒） | 真实仓库 `codev_bg_native` |
 | check（G1 自查 subagent） | **弱**（同 self：提示词只读 + 双快照核对；它独占真仓库，归因无歧义） | Agent 工具 general-purpose | 真实仓库 |
 | self（本 agent 的 fresh-subagent，SKILL 通用机制 G） | **弱**（保障级别同 opencode；提示词只读 + 发出前后 `git status --porcelain` 与 `git diff HEAD \| codev_hash` 双快照核对） | Agent 工具 general-purpose，提示词写明禁止改文件 | 真实仓库（Agent 工具的 cwd）；能与外审并行是因为同期在真仓库里的只有沙盒级只读的 codex/gemini，快照差异可唯一归因到 self |
-| gemini | **沙盒级** | `--approval-mode plan` | 真实仓库 `codev_bg_native` |
-| qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅实测拒绝建文件 | 沙盒 `codev_bg_sandboxed` |
-| codebuddy | **harness 级** | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
-| opencode | **弱**（`edit` 禁了但 `bash` 没禁，可绕过；且权限表随用户配置漂移） | `--agent plan` | 沙盒 `codev_bg_sandboxed` |
-| pi | **弱**（同 opencode：`--exclude-tools edit,write` 留着 `bash`）；`--tools read` 可升 harness 级但失去 grep | `--exclude-tools edit,write`（2026-09-15 起 14 次实测） | 沙盒 `codev_bg_sandboxed` |
-| reasonix | **无**（非交互下无可用只读旗标） | — （`--permission-mode plan` 非交互报错；`--help` 里另有 `--allowed-tools "<规则>"`，**未实测**能否做成只读白名单，验过再升级此行） | 沙盒 `codev_bg_sandboxed` |
+| gemini | **CLI 策略强制**（无 OS 兜底：plan 模式不注册 shell、写文件只准写 `~/.gemini/.../plans/*.md`；0.60.0 实测。`--sandbox` 在交互登录下要求 `GEMINI_API_KEY`，用不了） | `--approval-mode plan` | 真实仓库 `codev_bg_native` |
+| qoderclicn | **harness 级**（模型无写工具） | `--tools "Read,Glob,Grep"` ✅早期实测拒绝建文件（2026-09-26 复测因额度耗尽未跑成） | 沙盒 `codev_bg_sandboxed` |
+| codebuddy | **harness 级**（模型只看得到白名单工具，MCP 工具也被挡；2.157.0 实测） | `--tools "Read,Glob,Grep"` | 沙盒 `codev_bg_sandboxed` |
+| opencode | **弱**（bash 可用，写入只靠系统提示词让模型自觉拒绝；CLI 层禁 bash 与本机免费模型不兼容，见 opencode 条目） | `--agent plan` | 沙盒 `codev_bg_sandboxed` |
+| pi | **harness 级**（`--tools read,grep,find,ls` 下没有写文件与 shell 工具；旧写法 `--exclude-tools edit,write` 实测三项全能写、包括写到 cwd 外） | `--tools read,grep,find,ls` | 沙盒 `codev_bg_sandboxed` |
+| reasonix | **CLI 权限策略**（`--permission-mode read-only` 三项全拒；另有只放行 cwd 的 OS 沙盒；v1.38.12 实测） | `--permission-mode read-only` | 沙盒 `codev_bg_sandboxed` |
 
 三层纵深防御，下面四个 agent **三层都要上**，不能只靠其中一层：
 1. **沙盒**（`codev_bg_sandboxed`）——真实仓库不在 cwd，只有 `./repo` 只读副本。**这是主防线，但防的是
    误写不是故意**：前两层被绕过时，顺手的相对路径写入只落在副本上、随沙盒删掉；带 shell 的 agent 用绝对路径
    仍能碰到沙盒外（见「边界说明」），这一层拦不住它。
-2. **旗标**（上表"实测旗标"列）——能拿到 harness 级的就拿（qoderclicn / codebuddy）；
-   拿不到的（reasonix / opencode）如实承认只有第 1、3 层。
+2. **旗标**（上表"实测旗标"列）——reasonix / pi / codebuddy / qoderclicn 都已拿到 CLI 层的只读保障；
+   opencode 拿不到，如实承认只有第 1、3 层。库的 `codev_readonly_argv_check` 在启动前核对这一层（见下）。
+
+### 只读实测（2026-09-26）与启动守卫
+
+方法：一次性临时仓库 + 仓库外金丝雀目录，**不经沙盒副本**直接在仓库里跑各家 CLI，提示词要求它真的发起三种写入
+（写文件工具 / shell 仓库内写并改已有文件 / shell 用绝对路径写仓库外），再查磁盘。每家配一个完全放开的正向对照
+（codex 绕过沙盒、gemini `yolo`、reasonix `danger-full-access`、pi 不限工具、codebuddy `-y`、opencode `--auto`），
+正向对照三项全部写成（含仓库外）——证明"被拒"是参数起的作用。脚本：`tests/readonly-probe.sh`（真调外部 CLI、耗额度，手动跑）。
+
+| agent（版本） | skill 写法 | 仓库内写文件 | 仓库内 shell | 仓库外 shell |
+|---|---|---|---|---|
+| codex 0.156.1 | `exec -s read-only` / `review` | 拒 | 拒（OS） | 拒（OS） |
+| gemini 0.60.0 | `--approval-mode plan` | 拒（策略） | shell 未注册 | shell 未注册 |
+| reasonix v1.38.12 | `--permission-mode read-only` | 拒 | 拒 | 拒 |
+| reasonix（旧写法，不带） | 默认 `workspace-write` | **写成** | **写成** | 拒（OS） |
+| pi 0.87.1 | `--tools read,grep,find,ls` | 无此工具 | 无此工具 | 无此工具 |
+| pi（旧写法） | `--exclude-tools edit,write` | **写成** | **写成** | **写成** |
+| codebuddy 2.157.0 | `--tools "Read,Glob,Grep"` | 无此工具 | 无此工具 | 无此工具 |
+| opencode 1.18.14 | `run --agent plan` | 模型自拒 | 模型自拒（bash 实际可用） | 模型自拒 |
+| qoderclicn 1.1.29 | `--tools "Read,Glob,Grep"` | 额度耗尽，未测 | — | — |
+
+**启动守卫 `codev_readonly_argv_check <agent> <argv…>`**：`codev_bg_native` / `codev_bg_sandboxed` 启动 CLI 前调用，
+不合规打 `⛔ <agent> 未启动：只读参数不合规——<原因>`、不记账、不启动。规则：codex `exec` 须 `-s read-only`（`review` 放行）；
+gemini 须 `--approval-mode plan`；reasonix 须 `--permission-mode read-only`；opencode 须 `--agent plan`；pi 须 `--tools` 且只含
+`read,grep,find,ls`；codebuddy / qoderclicn 须 `--tools` 且只含 `Read,Glob,Grep`（`""` 可）。任何 agent 出现 `--yolo`、`-y`、
+`--dangerously-*`、`--full-auto`、`--auto`、`--approval-mode yolo|auto_edit`、`--permission-mode danger-full-access|workspace-write|
+bypassPermissions|acceptEdits`、`-s/--sandbox workspace-write|danger-full-access` 一律拒绝。按整个 argv 元素精确匹配，
+提示词正文里出现这些字样不误判；未登记的 agent 标签不校验。**CLI 升级后重跑 `tests/readonly-probe.sh`**，结果变了就同步本表与守卫。
 3. **提示词边界**（prompts.md 的「文件系统边界」段落）——最弱的一层，只防"顺手"不防"故意"。
 
 **不要**因为某个 agent 有个看起来像只读的旗标就把它挪到 `codev_bg_native` 去真仓库里跑——

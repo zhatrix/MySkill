@@ -219,15 +219,18 @@ codev/
 
 ## 9. 隔离沙盒与只读仓库副本
 
-七个外部 agent 按只读保障分四档跑（后三档都在隔离沙盒里）。此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
+七个外部 agent 按只读保障分三档跑（后两档都在隔离沙盒里）。此外 Claude 自己的 fresh-subagent（`self`）也作为评审方
 参与：保障级别与 opencode 同为"弱"（提示词只读 + 前后快照核对），但它跑在真实仓库而不是沙盒：
 
 | 档 | agent | 只读保障 | 跑在哪 |
 |---|---|---|---|
-| **沙盒级只读** | codex、gemini | CLI 自带进程级限制（`-s read-only` / `--approval-mode plan`） | 真实仓库根 |
-| **隔离沙盒** | qoderclicn、codebuddy | 沙盒 + 只读工具白名单（harness 级）+ 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
-| **隔离沙盒（旗标弱）** | opencode | 沙盒 + `--agent plan`（`edit` 禁了但 `bash` 没禁，可绕过）+ 提示词边界 | 同上 |
-| **隔离沙盒（仅沙盒兜底）** | reasonix | 只有沙盒 + 提示词边界——它**没有**可用的只读旗标（`--permission-mode plan` 非交互下报错退出） | 同上 |
+| **原生只读** | codex、gemini | codex：OS 沙盒（`exec -s read-only`，`review` 默认即只读）；gemini：CLI 策略强制（`--approval-mode plan`，不注册 shell，无 OS 兜底） | 真实仓库根 |
+| **隔离沙盒** | qoderclicn、codebuddy、pi、reasonix | 沙盒 + CLI 层只读（前三家工具白名单，reasonix `--permission-mode read-only`）+ 提示词边界 | `mktemp -d` 沙盒，内含 `./repo` 只读副本 |
+| **隔离沙盒（旗标弱）** | opencode | 沙盒 + `--agent plan`（bash 实际可用，写入只靠模型按系统提示词自觉拒绝；CLI 层禁 bash 与免费模型不兼容）+ 提示词边界 | 同上 |
+
+两档调用启动前都会核对只读参数：缺必备参数（如 reasonix 没带 `--permission-mode read-only`、pi 没用 `--tools` 白名单）或带
+`--yolo` / `-y` / `--dangerously-*` / `--auto` 等放行参数，直接 `⛔ 未启动`。依据是 2026-09-26 的各家只读实测（`references/agents.md`
+「只读实测」，脚本 `tests/readonly-probe.sh`）。
 
 沙盒里的 `./repo` 是**工作区（含未提交改动）的只读副本**：`chmod -R a-w`，不含 `.git`，
 并已排除常见密钥文件：`.env` / `*.env` / `.env.*` / `.envrc`、`*.pem` / `*.key` / `*.p12` / `*.pfx`、
